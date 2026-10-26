@@ -1,0 +1,35 @@
+[package]
+name = "ferrotype-app"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+ab_glyph = "0.2"
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "x11", "wayland", "clipboard", "accesskit"] }
+image = "0.25"
+jxl-oxide = { version = "0.12.6", features = ["image"] }
+libloading = "0.8"
+flate2 = "1"
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["load-dynamic", "std"] }
+rawler = "0.8"
+rayon = "1.12.0"
+rfd = "0.17"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+ureq = { version = "3", features = ["platform-verifier"] }
+zip = { version = "9.1.2", default-features = false, features = ["deflate-flate2"] }
+wgpu = "30"
+pollster = "1.0.1"
+
+[[bin]]
+name = "ferrotype"
+path = "src/main.rs"
+
+[profile.release]
+lto = "thin"
+strip = true
+
+[profile.dev]
+opt-level = 2
