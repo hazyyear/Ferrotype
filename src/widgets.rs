@@ -2,21 +2,28 @@
 use eframe::egui;
 use egui::{Align2, Color32, CornerRadius, FontFamily, FontId, Rect, RichText, Sense, Stroke, Ui, pos2, vec2};
 
-pub const BG: Color32 = hex(0x161618);
-pub const PANEL: Color32 = hex(0x1B1B1E);
-pub const CANVAS: Color32 = hex(0x121214);
-pub const BAR: Color32 = hex(0x18181B);
-pub const BORDER: Color32 = hex(0x2A2A2F);
-pub const DIVIDER: Color32 = hex(0x26262A);
-pub const CARD: Color32 = hex(0x232327);
-pub const SEL: Color32 = hex(0x2C2C31);
-pub const BTN_BORDER: Color32 = hex(0x4D4D55); // 3:1 against the panel
-pub const TEXT: Color32 = hex(0xECECEE);
-pub const TEXT2: Color32 = hex(0xA1A1A8);
-pub const TEXT3: Color32 = hex(0x8A8A92);
-pub const LABEL: Color32 = hex(0xC9C9CF);
-pub const ACCENT: Color32 = hex(0xF0A43A);
-const TRACK: Color32 = hex(0x4A4A52); // 3:1 against the panel
+// Brand palette (ferrotype brand kit, direction F). There is no accent colour: emphasis is bone,
+// selection is shown by inverting (ink on bone). Colour belongs to the photograph.
+pub const INK: Color32 = hex(0x141416);
+pub const BONE: Color32 = hex(0xECE8E1);
+pub const BG: Color32 = INK;
+pub const PANEL: Color32 = hex(0x1C1C1F);
+pub const CANVAS: Color32 = hex(0x0E0E10);
+pub const BAR: Color32 = PANEL;
+pub const BORDER: Color32 = hex(0x2A2A2E); // "line"
+pub const DIVIDER: Color32 = BORDER;
+pub const CARD: Color32 = hex(0x242428); // "raised"
+pub const SEL: Color32 = hex(0x2E2E33); // hover surface
+pub const BTN_BORDER: Color32 = hex(0x4E4C49); // 3:1 against the panel
+pub const TEXT: Color32 = BONE;
+pub const TEXT2: Color32 = hex(0xB5B1AA); // "mid"
+pub const TEXT3: Color32 = hex(0x8A877F); // "dim": secondary labels and metadata only
+pub const LABEL: Color32 = TEXT2;
+/// Kept as a name for "emphasis"; in this brand it is bone, never a hue.
+pub const ACCENT: Color32 = BONE;
+/// Secondary text on a bone (selected) surface.
+pub const ON_BONE: Color32 = hex(0x5A5752);
+const TRACK: Color32 = hex(0x4A4846); // 3:1 against the panel
 
 pub const fn hex(rgb: u32) -> Color32 {
     Color32::from_rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8)
@@ -41,16 +48,21 @@ pub fn hsv(h: f32, s: f32, v: f32) -> Color32 {
 pub fn install_style(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     for (name, bytes) in [
-        ("inter", &include_bytes!("../assets/fonts/Inter-400.ttf")[..]),
-        ("inter-semi", &include_bytes!("../assets/fonts/Inter-600.ttf")[..]),
-        ("mono", &include_bytes!("../assets/fonts/JetBrainsMono-sub.ttf")[..]),
+        ("plex", &include_bytes!("../assets/fonts/IBMPlexSans-400.ttf")[..]),
+        ("plex-500", &include_bytes!("../assets/fonts/IBMPlexSans-500.ttf")[..]),
+        ("plex-mono", &include_bytes!("../assets/fonts/IBMPlexMono-400.ttf")[..]),
+        ("plex-mono-500", &include_bytes!("../assets/fonts/IBMPlexMono-500.ttf")[..]),
+        ("bricolage", &include_bytes!("../assets/fonts/BricolageGrotesque-700.ttf")[..]),
     ] {
         fonts.font_data.insert(name.into(), std::sync::Arc::new(egui::FontData::from_static(bytes)));
     }
     let fallback = fonts.families[&FontFamily::Proportional].clone();
-    fonts.families.get_mut(&FontFamily::Proportional).unwrap().insert(0, "inter".into());
-    fonts.families.get_mut(&FontFamily::Monospace).unwrap().insert(0, "mono".into());
-    fonts.families.insert(FontFamily::Name("semi".into()), [vec!["inter-semi".to_string()], fallback].concat());
+    let mono_fallback = fonts.families[&FontFamily::Monospace].clone();
+    fonts.families.get_mut(&FontFamily::Proportional).unwrap().insert(0, "plex".into());
+    fonts.families.get_mut(&FontFamily::Monospace).unwrap().insert(0, "plex-mono".into());
+    fonts.families.insert(FontFamily::Name("semi".into()), [vec!["plex-500".to_string()], fallback.clone()].concat());
+    fonts.families.insert(FontFamily::Name("mono-500".into()), [vec!["plex-mono-500".to_string()], mono_fallback].concat());
+    fonts.families.insert(FontFamily::Name("display".into()), [vec!["bricolage".to_string()], fallback].concat());
     ctx.set_fonts(fonts);
 
     ctx.options_mut(|o| o.theme_preference = egui::ThemePreference::Dark);
@@ -75,17 +87,21 @@ pub fn install_style(ctx: &egui::Context) {
         v.extreme_bg_color = DIVIDER; // text fields
         v.faint_bg_color = CARD;
         v.override_text_color = Some(TEXT);
-        v.selection.bg_fill = SEL;
-        v.selection.stroke = Stroke::new(1.0, TEXT);
-        v.text_cursor.stroke = Stroke::new(1.5, ACCENT);
-        v.hyperlink_color = ACCENT;
-        v.window_corner_radius = CornerRadius::same(8);
-        v.menu_corner_radius = CornerRadius::same(8);
-        let r = CornerRadius::same(6);
+        v.window_stroke = Stroke::new(1.0, BORDER);
+        v.window_shadow = egui::Shadow::NONE; // flat, 1 px, no shadows
+        v.popup_shadow = egui::Shadow::NONE;
+        // Selected text and selected widgets invert: ink on bone.
+        v.selection.bg_fill = BONE;
+        v.selection.stroke = Stroke::new(1.0, INK);
+        v.text_cursor.stroke = Stroke::new(1.5, BONE);
+        v.hyperlink_color = BONE;
+        v.window_corner_radius = CornerRadius::same(4);
+        v.menu_corner_radius = CornerRadius::same(4);
+        let r = CornerRadius::same(3);
         let w = &mut v.widgets;
         w.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
         w.noninteractive.fg_stroke = Stroke::new(1.0, TEXT2);
-        for (st, fill, border) in [(&mut w.inactive, CARD, BTN_BORDER), (&mut w.hovered, SEL, hex(0x3A3A40)), (&mut w.active, hex(0x34343A), hex(0x45454C)), (&mut w.open, SEL, BTN_BORDER)] {
+        for (st, fill, border) in [(&mut w.inactive, CARD, BTN_BORDER), (&mut w.hovered, SEL, hex(0x6A6762)), (&mut w.active, hex(0x38383D), TEXT3), (&mut w.open, SEL, BTN_BORDER)] {
             st.bg_fill = fill;
             st.weak_bg_fill = fill;
             st.bg_stroke = Stroke::new(1.0, border);
@@ -97,52 +113,88 @@ pub fn install_style(ctx: &egui::Context) {
     });
 }
 
+/// IBM Plex Sans 500: emphasised labels and dialog titles.
+/// The bare brand mark (assets/brand/mark.svg): a filled frame and an outlined frame, offset down and right.
+/// Axis-aligned, two frames, one colour, at any size.
+pub fn paint_mark(p: &egui::Painter, r: Rect, color: Color32) {
+    let k = r.width().min(r.height()) / 72.0;
+    let at = |x: f32, y: f32, w: f32| Rect::from_min_size(r.min + vec2(x, y) * k, vec2(w, w) * k);
+    let rad = 9.0 * k;
+    p.rect_filled(at(2.0, 2.0, 44.0), rad, color);
+    let stroke = (4.0 * k).max(1.25);
+    p.rect_stroke(at(26.0, 26.0, 44.0), rad, Stroke::new(stroke, color), egui::StrokeKind::Middle);
+}
+
 pub fn semi() -> FontFamily {
     FontFamily::Name("semi".into())
 }
 
-/// Small uppercase group title, e.g. "WHITE BALANCE".
+/// IBM Plex Mono 500: section labels, values.
+pub fn mono500() -> FontFamily {
+    FontFamily::Name("mono-500".into())
+}
+
+/// Bricolage Grotesque 700: the wordmark, one title per view and empty-state headlines. Never in a panel, button or menu.
+pub fn display() -> FontFamily {
+    FontFamily::Name("display".into())
+}
+
+/// Section label in the brand's mono caps, e.g. "WHITE BALANCE".
 pub fn caps(text: &str) -> RichText {
-    RichText::new(text.to_uppercase()).size(10.5).color(TEXT3).family(semi()).extra_letter_spacing(0.7)
+    RichText::new(text.to_uppercase()).size(10.5).color(TEXT3).family(mono500()).extra_letter_spacing(1.6)
 }
 
+/// The screen's one primary action: inverted, ink on bone.
 pub fn primary(ui: &mut Ui, text: &str, enabled: bool) -> egui::Response {
-    ui.add_enabled(enabled, egui::Button::new(RichText::new(text).color(hex(0x1B1B1E)).family(semi())).fill(ACCENT).stroke(Stroke::NONE))
+    ui.add_enabled(enabled, egui::Button::new(RichText::new(text).color(INK).family(semi())).fill(BONE).stroke(Stroke::NONE))
 }
 
-/// Borderless text button; `on` gives it the selected surface.
+/// Borderless text button; `on` inverts it (ink on bone).
 pub fn ghost(ui: &mut Ui, text: &str, on: bool) -> egui::Response {
-    ui.add(egui::Button::new(RichText::new(text).color(if on { TEXT } else { TEXT2 })).fill(if on { SEL } else { Color32::TRANSPARENT }).stroke(Stroke::NONE))
+    ui.add(egui::Button::new(RichText::new(text).color(if on { INK } else { TEXT2 })).fill(if on { BONE } else { Color32::TRANSPARENT }).stroke(Stroke::NONE))
 }
 
-/// Pill-shaped filter chip.
+/// Top-bar view tab, as in the brand UI: dim text, the current one bone with a 2 px bone underline.
+pub fn tab(ui: &mut Ui, text: &str, on: bool) -> egui::Response {
+    let resp = ui.add(egui::Button::new(RichText::new(text).size(13.0).color(if on { BONE } else { TEXT3 }))
+        .fill(Color32::TRANSPARENT).stroke(Stroke::NONE).min_size(vec2(0.0, 28.0)));
+    let r = resp.rect;
+    if on {
+        ui.painter().hline(r.x_range().shrink(4.0), r.bottom() + 1.0, Stroke::new(2.0, BONE));
+    } else if resp.hovered() {
+        ui.painter().hline(r.x_range().shrink(4.0), r.bottom() + 1.0, Stroke::new(1.0, TEXT3));
+    }
+    resp
+}
+
+/// Filter chip: hairline outline, inverted when on.
 pub fn chip(ui: &mut Ui, text: &str, on: bool) -> egui::Response {
-    ui.add(egui::Button::new(RichText::new(text).size(11.5).color(if on { TEXT } else { TEXT2 }))
-        .fill(if on { SEL } else { Color32::TRANSPARENT })
-        .stroke(Stroke::new(1.0, if on { hex(0x3A3A40) } else { BORDER }))
-        .corner_radius(12)
+    ui.add(egui::Button::new(RichText::new(text).size(11.5).color(if on { INK } else { TEXT2 }))
+        .fill(if on { BONE } else { Color32::TRANSPARENT })
+        .stroke(Stroke::new(1.0, if on { BONE } else { BORDER }))
+        .corner_radius(3)
         .min_size(vec2(0.0, 24.0)))
 }
 
-/// Toggle button used in grids (looks, sources): fills the given width.
+/// Toggle button used in grids (looks, sources): fills the given width; inverted when on.
 pub fn tile(ui: &mut Ui, text: &str, on: bool, width: f32) -> egui::Response {
-    ui.add(egui::Button::new(RichText::new(text).size(12.0).color(if on { TEXT } else { TEXT2 }))
-        .fill(if on { SEL } else { Color32::TRANSPARENT })
-        .stroke(Stroke::new(1.0, if on { ACCENT.gamma_multiply(0.7) } else { BTN_BORDER }))
+    ui.add(egui::Button::new(RichText::new(text).size(12.0).color(if on { INK } else { TEXT2 }))
+        .fill(if on { BONE } else { Color32::TRANSPARENT })
+        .stroke(Stroke::new(1.0, if on { BONE } else { BORDER }))
         .min_size(vec2(width, 30.0)))
 }
 
-/// Segmented control: one rounded well with the active option raised.
+/// Segmented control: one flat well with the active option inverted.
 pub fn segmented(ui: &mut Ui, value: &mut usize, options: &[&str]) {
-    egui::Frame::new().fill(hex(0x232327)).corner_radius(7).inner_margin(2.0).show(ui, |ui| {
+    egui::Frame::new().fill(INK).stroke(Stroke::new(1.0, BORDER)).corner_radius(3).inner_margin(2.0).show(ui, |ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
         ui.horizontal(|ui| {
             for (i, o) in options.iter().enumerate() {
                 let on = *value == i;
-                let b = egui::Button::new(RichText::new(*o).size(12.0).color(if on { TEXT } else { TEXT2 }))
-                    .fill(if on { hex(0x3A3A40) } else { Color32::TRANSPARENT })
+                let b = egui::Button::new(RichText::new(*o).size(12.0).color(if on { INK } else { TEXT2 }))
+                    .fill(if on { BONE } else { Color32::TRANSPARENT })
                     .stroke(Stroke::NONE)
-                    .corner_radius(5)
+                    .corner_radius(2)
                     .min_size(vec2(0.0, 24.0));
                 if ui.add(b).clicked() {
                     *value = i;
@@ -152,7 +204,7 @@ pub fn segmented(ui: &mut Ui, value: &mut usize, options: &[&str]) {
     });
 }
 
-/// iOS-style on/off switch.
+/// On/off switch: a hairline well that fills with bone when on.
 pub fn switch(ui: &mut Ui, on: &mut bool) -> egui::Response {
     // 24 px tall hit area (the minimum target size), 17 px tall drawing.
     let (hit, resp) = ui.allocate_exact_size(vec2(30.0, 24.0), Sense::click());
@@ -163,12 +215,13 @@ pub fn switch(ui: &mut Ui, on: &mut bool) -> egui::Response {
     resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Switch, true, *on, ""));
     let t = ui.ctx().animate_bool(resp.id, *on);
     let p = ui.painter();
-    p.rect_filled(rect, 8.5, Color32::from_gray(0x3A).lerp_to_gamma(ACCENT, t));
-    p.circle_filled(pos2(rect.left() + 8.5 + t * 13.0, rect.center().y), 6.5, TEXT);
+    p.rect_filled(rect, 8.5, INK.lerp_to_gamma(BONE, t));
+    p.rect_stroke(rect, 8.5, Stroke::new(1.0, BTN_BORDER.lerp_to_gamma(BONE, t)), egui::StrokeKind::Inside);
+    p.circle_filled(pos2(rect.left() + 8.5 + t * 13.0, rect.center().y), 5.5, TEXT2.lerp_to_gamma(INK, t));
     resp
 }
 
-/// Collapsible panel section in the mockup's style: 40 px header, "+"/"−" on the right, hairline below.
+/// Collapsible panel section: 40 px header, "+"/"−" on the right, hairline below.
 pub fn section(ui: &mut Ui, title: &str, open: &mut bool, body: impl FnOnce(&mut Ui)) {
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::click());
     if resp.clicked() {
@@ -176,9 +229,10 @@ pub fn section(ui: &mut Ui, title: &str, open: &mut bool, body: impl FnOnce(&mut
     }
     let p = ui.painter();
     if resp.hovered() {
-        p.rect_filled(rect, 0.0, hex(0x1F1F23));
+        p.rect_filled(rect, 0.0, hex(0x202024));
     }
-    p.text(pos2(rect.left() + 16.0, rect.center().y), Align2::LEFT_CENTER, title, FontId::new(13.0, semi()), TEXT);
+    // Panel titles in Plex Sans 500; the mono caps are kept for the groups inside.
+    p.text(pos2(rect.left() + 16.0, rect.center().y), Align2::LEFT_CENTER, title, FontId::new(13.0, semi()), if *open || resp.hovered() { TEXT } else { TEXT2 });
     p.text(pos2(rect.right() - 16.0, rect.center().y), Align2::RIGHT_CENTER, if *open { "−" } else { "+" }, FontId::proportional(14.0), TEXT3);
     if *open {
         egui::Frame::new().inner_margin(egui::Margin { left: 16, right: 16, top: 0, bottom: 14 }).show(ui, |ui| {
@@ -269,14 +323,18 @@ pub fn slider_ex(ui: &mut Ui, label: &str, swatch: Option<Color32>, v: &mut f32,
             }
             // Tick at the default when it is not an end.
             if default > min && default < max {
-                p.vline(a, (thin.center().y - 3.0)..=(thin.center().y + 3.0), Stroke::new(1.0, hex(0x4A4A52)));
+                p.vline(a, (thin.center().y - 3.0)..=(thin.center().y + 3.0), Stroke::new(1.0, TEXT3));
             }
         }
     }
     let knob = pos2(track.left() + track.width() * frac(*v), track.center().y);
     let active = resp.hovered() || resp.dragged();
-    p.circle_filled(knob + vec2(0.0, 1.0), 7.0, Color32::from_black_alpha(90));
-    p.circle(knob, if active { 7.0 } else { 6.0 }, TEXT, Stroke::new(if grad.is_some() { 1.5 } else { 0.0 }, hex(0x161618)));
+    // Flat bone tick, as in the brand UI; an ink outline keeps it visible on colour tracks.
+    let knob_r = Rect::from_center_size(knob, if active { vec2(4.0, 16.0) } else { vec2(3.0, 13.0) });
+    if grad.is_some() {
+        p.rect_filled(knob_r.expand(1.5), 1.5, INK);
+    }
+    p.rect_filled(knob_r, 1.0, BONE);
 
     if resp.has_focus() {
         p.rect_stroke(rect.expand(1.0), 4.0, Stroke::new(1.5, ACCENT), egui::StrokeKind::Outside);

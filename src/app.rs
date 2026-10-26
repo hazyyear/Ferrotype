@@ -305,7 +305,7 @@ pub struct App {
 
 pub fn run(start: Option<PathBuf>) -> eframe::Result {
     let opts = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1440.0, 900.0]).with_min_inner_size([1100.0, 640.0]).with_title("Ferrotype"),
+        viewport: egui::ViewportBuilder::default().with_inner_size([1440.0, 900.0]).with_min_inner_size([1100.0, 640.0]).with_title("ferrotype").with_icon(app_icon()),
         ..Default::default()
     };
     eframe::run_native("Ferrotype", opts, Box::new(move |cc| {
@@ -316,6 +316,15 @@ pub fn run(start: Option<PathBuf>) -> eframe::Result {
         }
         Ok(Box::new(app))
     }))
+}
+
+/// The window and taskbar icon: the brand's light tile (assets/brand/icon.svg rendered to 256 px).
+fn app_icon() -> std::sync::Arc<egui::IconData> {
+    let img = image::load_from_memory(include_bytes!("../assets/brand/png/ferrotype-256.png")).map(|i| i.to_rgba8());
+    std::sync::Arc::new(match img {
+        Ok(i) => egui::IconData { width: i.width(), height: i.height(), rgba: i.into_raw() },
+        Err(_) => egui::IconData::default(),
+    })
 }
 
 fn user_preset_dir() -> Option<PathBuf> {
@@ -1017,11 +1026,11 @@ impl App {
         let name = if load::is_raw(load::copy_of(cur).as_deref().unwrap_or(cur)) || !self.export.name.trim().is_empty() { format!("{stem}.{ext}") } else { format!("{stem}-edit.{ext}") };
         let Some(out) = rfd::FileDialog::new().set_file_name(name).add_filter(ext.to_uppercase(), &[ext]).save_file() else { return };
         if out.canonicalize().ok() == cur.canonicalize().ok() {
-            self.status = "Export needs a different name: that is the original photo".into();
+            self.status = "Print needs a different name: that is the original frame".into();
             return;
         }
         let (orig, delta, params, tx, o, cur) = (photo.orig.clone(), photo.delta.clone(), self.params.clone(), self.tx.clone(), self.export.clone(), cur.clone());
-        self.status = "Exporting…".into();
+        self.status = "Printing…".into();
         std::thread::spawn(move || {
             let src = match (&delta, params.ai_nr > 0.0) {
                 (Some(d), true) => Ok(denoise::apply_delta(&orig, d, params.ai_nr / 100.0)),
@@ -1029,12 +1038,12 @@ impl App {
                 _ => Ok((*orig).clone()),
             };
             let r = src.and_then(|src| write_export(&src, &params, &o, &out, &cur));
-            let _ = tx.send(Msg::Status(match r { Ok(()) => format!("Exported {}", out.file_name().unwrap_or_default().to_string_lossy()), Err(e) => format!("Export failed: {e}") }));
+            let _ = tx.send(Msg::Status(match r { Ok(()) => format!("Printed {}", out.file_name().unwrap_or_default().to_string_lossy()), Err(e) => format!("Print failed: {e}") }));
         });
     }
 
     fn export_all(&mut self) {
-        let Some(dir) = rfd::FileDialog::new().set_title("Export all photos to…").pick_folder() else { return };
+        let Some(dir) = rfd::FileDialog::new().set_title("Print all frames to…").pick_folder() else { return };
         self.commit();
         // Each photo with the folder it goes into: subfolders mirrored when asked for.
         let jobs: Vec<(PathBuf, PathBuf)> = match (&self.folder, self.export_sel.is_empty() && self.export.tree) {
@@ -1051,17 +1060,17 @@ impl App {
                 let out = &jobs[i].0;
                 let r = std::fs::create_dir_all(out).map_err(|e| e.to_string()).and_then(|_| export_file(f, out, &o, i + 1, |_| {}));
                 let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                let _ = tx.send(Msg::Status(format!("Exported {n}/{}", files.len())));
+                let _ = tx.send(Msg::Status(format!("Printed {n}/{}", files.len())));
                 r.err().map(|e| format!("{}: {e}", f.display()))
             }).collect();
-            let _ = tx.send(Msg::Status(if failed.is_empty() { format!("Exported {} photos", files.len()) } else { format!("{} failed, first: {}", failed.len(), failed[0]) }));
+            let _ = tx.send(Msg::Status(if failed.is_empty() { format!("Printed {} frames", files.len()) } else { format!("{} failed, first: {}", failed.len(), failed[0]) }));
         });
     }
 
     /// One click, several destinations: each chosen set (Instagram 4:5, Story 9:16, Portfolio 2048 px) into its own
     /// subfolder, for this photo, the library selection or the whole folder.
     fn export_set_files(&mut self, files: Vec<PathBuf>) {
-        let Some(dir) = rfd::FileDialog::new().set_title("Export sets to…").pick_folder() else { return };
+        let Some(dir) = rfd::FileDialog::new().set_title("Print sets to…").pick_folder() else { return };
         self.commit();
         let sets: Vec<_> = crate::output::SETS.iter().zip(self.export_sets).filter(|(_, on)| *on).map(|(s, _)| *s).collect();
         let (tx, base) = (self.tx.clone(), self.export.clone());
@@ -1081,10 +1090,10 @@ impl App {
                         failed += 1;
                     }
                     done += 1;
-                    let _ = tx.send(Msg::Status(format!("Exported {done}/{total}")));
+                    let _ = tx.send(Msg::Status(format!("Printed {done}/{total}")));
                 }
             }
-            let _ = tx.send(Msg::Status(if failed == 0 { format!("Exported {total} files into {} folders", sets.len()) } else { format!("{failed} of {total} exports failed") }));
+            let _ = tx.send(Msg::Status(if failed == 0 { format!("Printed {total} files into {} folders", sets.len()) } else { format!("{failed} of {total} prints failed") }));
         });
     }
 
@@ -1160,7 +1169,7 @@ impl App {
     fn export_window(&mut self, ctx: &egui::Context) {
         let Some(all) = self.export_dialog else { return };
         let (mut open, mut go) = (true, false);
-        egui::Window::new(if !all { "Export".to_string() } else if self.export_sel.is_empty() { "Export all photos".to_string() } else { format!("Export {} photos", self.export_sel.len()) }).collapsible(false).resizable(false)
+        egui::Window::new(if !all { "Print".to_string() } else if self.export_sel.is_empty() { "Print all frames".to_string() } else { format!("Print {} frames", self.export_sel.len()) }).collapsible(false).resizable(false)
             .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0)).open(&mut open).show(ctx, |ui| {
                 ui.set_width(320.0);
                 ui.spacing_mut().item_spacing.y = 8.0;
@@ -1248,17 +1257,17 @@ impl App {
                 if all && self.export_sel.is_empty() {
                     switch_row(ui, "Include subfolders, keep the folder tree", &mut o.tree);
                 }
-                egui::CollapsingHeader::new(RichText::new("Export sets").size(12.5)).id_salt("sets").show(ui, |ui| {
+                egui::CollapsingHeader::new(RichText::new("Print sets").size(12.5)).id_salt("sets").show(ui, |ui| {
                     for (k, (name, canvas, long, _)) in crate::output::SETS.iter().enumerate() {
                         let what = if canvas[0] > 0 { format!("{name}  {}×{}", canvas[0], canvas[1]) } else { format!("{name}  {long} px") };
                         ui.checkbox(&mut self.export_sets[k], what);
                     }
                     ui.label(RichText::new("One click makes each set in its own subfolder, padded to shape with the border colour.").size(11.5).color(TEXT2));
                 });
-                ui.label(RichText::new("Exports hold pixels only unless you add the details above: never GPS or serial numbers.").size(11.5).color(TEXT2));
+                ui.label(RichText::new("Prints hold pixels only unless you add the details above: never GPS or serial numbers.").size(11.5).color(TEXT2));
                 ui.add_space(4.0);
                 let sets = self.export_sets.iter().any(|b| *b);
-                go = primary(ui, if sets { "Export sets to folder…" } else if all { "Choose folder…" } else { "Choose file…" }, true).clicked();
+                go = primary(ui, if sets { "Print sets to folder…" } else if all { "Choose folder…" } else { "Choose file…" }, true).clicked();
             });
         if go || !open {
             self.export_dialog = None;
@@ -1720,7 +1729,7 @@ impl App {
             self.lib_sel = vis.first().cloned();
         }
         let Some(sel) = self.lib_sel.clone() else {
-            ui.centered_and_justified(|ui| ui.label(RichText::new("No photos to cull").color(TEXT3)));
+            ui.centered_and_justified(|ui| ui.label(RichText::new("No frames to cull").color(TEXT3)));
             return;
         };
         let i = vis.iter().position(|f| *f == sel).unwrap_or(0);
@@ -1845,40 +1854,40 @@ impl App {
 
     fn top_bar(&mut self, ui: &mut Ui) {
         ui.horizontal_centered(|ui| {
-            // Logo: amber rounded square with a dark plate, as in the mockup.
-            let (r, _) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
-            ui.painter().rect_filled(r.shrink(1.0), 5.0, ACCENT);
-            ui.painter().rect_filled(Rect::from_center_size(r.center(), vec2(10.0, 10.0)), 2.0, PANEL);
-            ui.label(RichText::new("Ferrotype").family(semi()).size(15.0));
+            // Brand lockup: the bare mark and the lowercase wordmark in Bricolage, both bone.
+            ui.spacing_mut().item_spacing.x = 8.0;
+            let (r, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
+            paint_mark(ui.painter(), r, BONE);
+            ui.label(RichText::new("ferrotype").family(display()).size(17.0).color(BONE).extra_letter_spacing(0.3));
             ui.add_space(18.0);
-            ui.spacing_mut().item_spacing.x = 4.0;
+            ui.spacing_mut().item_spacing.x = 2.0;
             for (m, name) in [(Module::Library, "Library"), (Module::Cull, "Cull"), (Module::Develop, "Develop"), (Module::Negative, "Negative")] {
-                if ghost(ui, name, self.module == m).clicked() {
+                if tab(ui, name, self.module == m).clicked() {
                     self.module = m; // opening the tab doesn't convert: pick a stock or use the switch
                     self.tool = Tool::None;
                 }
             }
             ui.add_space(8.0);
-            if ghost(ui, "Shortcuts", self.keys_open).clicked() {
+            if tab(ui, "Shortcuts", self.keys_open).clicked() {
                 self.keys_open = !self.keys_open;
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
                 if matches!(self.module, Module::Library | Module::Cull) {
                     // Secondary here: "Open in Develop" is the screen's one primary action.
-                    if ui.add(egui::Button::new("Open folder…").min_size(vec2(0.0, 28.0))).clicked()
+                    if ui.add(egui::Button::new("Open roll…").min_size(vec2(0.0, 28.0))).on_hover_text("Open a folder of frames").clicked()
                         && let Some(d) = rfd::FileDialog::new().pick_folder()
                     {
                         self.open_path(ui.ctx(), &d);
                     }
                     ui.add(egui::TextEdit::singleline(&mut self.lib_query).hint_text("Search file names").desired_width(240.0).margin(vec2(10.0, 6.0)));
                 } else {
-                    if primary(ui, "Export", self.photo.is_some()).clicked() {
+                    if primary(ui, "Print", self.photo.is_some()).on_hover_text("Export this frame").clicked() {
                         self.export_dialog = Some(false);
                     }
                     let name = self.current.as_ref().and_then(|c| c.file_name()).map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
                     let line = [name, self.status.clone()].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ");
-                    ui.label(RichText::new(line).color(TEXT2).size(12.0));
+                    ui.label(RichText::new(line).monospace().color(TEXT3).size(11.0));
                 }
             });
         });
@@ -1980,7 +1989,7 @@ impl App {
         let avail = ui.available_rect_before_wrap().shrink(24.0);
         let (Some(tex), Some(before)) = (self.tex.clone(), self.before_tex.clone()) else {
             ui.centered_and_justified(|ui| {
-                if self.loading { ui.spinner(); } else { ui.label(RichText::new("Pick a photo in the Library").color(TEXT3)); }
+                if self.loading { ui.spinner(); } else { ui.label(RichText::new("Pick a frame in the Library").color(TEXT3)); }
             });
             return;
         };
@@ -2245,7 +2254,7 @@ impl App {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| switch(ui, v));
             });
         };
-        toggle(ui, "Pick up new photos", &mut self.watch, "For a scanner or tethered camera saving into this folder: new files appear within two seconds");
+        toggle(ui, "Pick up new frames", &mut self.watch, "For a scanner or tethered camera saving into this folder: new files appear within two seconds");
         if self.watch {
             toggle(ui, "Open each new photo", &mut self.watch_open, "Jump straight to the newest arrival");
             toggle(ui, "Give it these settings", &mut self.watch_apply, "New frames get the open photo's look and film conversion (handy when scanning a roll)");
@@ -2272,7 +2281,7 @@ impl App {
                 }
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.add_enabled(!self.files.is_empty(), egui::Button::new("Export all…")).clicked() {
+                if ui.add_enabled(!self.files.is_empty(), egui::Button::new("Print all…")).clicked() {
                     self.export_sel.clear();
                     self.export_dialog = Some(true);
                 }
@@ -2294,11 +2303,14 @@ impl App {
         if self.files.is_empty() {
             ui.centered_and_justified(|ui| {
                 ui.vertical_centered(|ui| {
-                    ui.add_space(ui.available_height() / 2.0 - 60.0);
-                    ui.label(RichText::new("No photos yet").family(semi()).size(16.0));
-                    ui.label(RichText::new("Open a folder of RAW, JPEG or TIFF files, or drop photos here.").color(TEXT2));
+                    ui.add_space(ui.available_height() / 2.0 - 110.0);
+                    let (r, _) = ui.allocate_exact_size(vec2(56.0, 56.0), Sense::hover());
+                    paint_mark(ui.painter(), r, TEXT3);
+                    ui.add_space(10.0);
+                    ui.label(RichText::new("No roll yet").family(display()).size(30.0).color(BONE).extra_letter_spacing(-0.4));
+                    ui.label(RichText::new("Open a folder of RAW, JPEG or TIFF frames, or drop them here.").color(TEXT2));
                     ui.add_space(8.0);
-                    if primary(ui, "Open folder…", true).clicked()
+                    if primary(ui, "Open roll…", true).clicked()
                         && let Some(d) = rfd::FileDialog::new().pick_folder()
                     {
                         self.open_path(ui.ctx(), &d);
@@ -2367,7 +2379,7 @@ impl App {
                             let pano_busy = self.pano_busy;
                             resp.context_menu(|ui| {
                                 if multi >= 2 && in_multi {
-                                    if ui.button(format!("Export {multi} photos…")).clicked() {
+                                    if ui.button(format!("Print {multi} frames…")).clicked() {
                                         export_sel = true;
                                         ui.close();
                                     }
@@ -2515,7 +2527,7 @@ impl App {
 
     fn library_info(&mut self, ui: &mut Ui) {
         let Some(f) = self.lib_sel.clone() else {
-            ui.label(RichText::new("Select a photo").color(TEXT3));
+            ui.label(RichText::new("Select a frame").color(TEXT3));
             return;
         };
         let w = ui.available_width();
@@ -2597,7 +2609,7 @@ impl App {
             }
             c[1].scope(|ui| {
                 ui.spacing_mut().interact_size.x = ui.available_width();
-                if ui.add(egui::Button::new(RichText::new("Open in Develop").color(hex(0x1B1B1E)).family(semi())).fill(ACCENT).stroke(Stroke::NONE).min_size(vec2(ui.available_width(), 32.0))).clicked() {
+                if ui.add(egui::Button::new(RichText::new("Open in Develop").color(INK).family(semi())).fill(BONE).stroke(Stroke::NONE).min_size(vec2(ui.available_width(), 32.0))).clicked() {
                     self.module = Module::Develop;
                     self.select(ui.ctx(), f.clone());
                 }
@@ -2616,7 +2628,7 @@ impl App {
             let on = self.last_preset == Some(i);
             let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::click());
             if on || resp.hovered() {
-                ui.painter().rect_filled(r, 6.0, if on { SEL } else { hex(0x222226) });
+                ui.painter().rect_filled(r, 3.0, if on { BONE } else { CARD });
             }
             let th = Rect::from_min_size(r.min + vec2(4.0, 4.0), vec2(40.0, 28.0));
             match self.preset_tex.get(i) {
@@ -2625,7 +2637,7 @@ impl App {
                     ui.painter().rect_filled(th, 4.0, CARD);
                 }
             }
-            ui.painter().text(pos2(th.right() + 10.0, r.center().y), Align2::LEFT_CENTER, name, FontId::proportional(13.0), TEXT);
+            ui.painter().text(pos2(th.right() + 10.0, r.center().y), Align2::LEFT_CENTER, name, FontId::proportional(13.0), if on { INK } else { TEXT });
             if resp.clicked() {
                 apply = Some(i);
             }
@@ -2738,10 +2750,10 @@ impl App {
         egui::ScrollArea::vertical().id_salt("hist").auto_shrink([false, false]).show(ui, |ui| {
             for i in (0..self.history.len()).rev() {
                 let (label, val) = if i == 0 { ("Opened".to_string(), String::new()) } else { describe_change(&self.history[i - 1], &self.history[i]) };
-                let fg = if i == self.hist_pos { TEXT } else if i > self.hist_pos { TEXT3 } else { TEXT2 };
+                let fg = if i == self.hist_pos { INK } else if i > self.hist_pos { TEXT3 } else { TEXT2 };
                 let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::click());
                 if i == self.hist_pos || resp.hovered() {
-                    ui.painter().rect_filled(r, 5.0, if i == self.hist_pos { SEL } else { hex(0x222226) });
+                    ui.painter().rect_filled(r, 3.0, if i == self.hist_pos { BONE } else { CARD });
                 }
                 ui.painter().text(pos2(r.left() + 6.0, r.center().y), Align2::LEFT_CENTER, label, FontId::proportional(12.0), fg);
                 ui.painter().text(pos2(r.right() - 6.0, r.center().y), Align2::RIGHT_CENTER, val, FontId::monospace(11.0), fg);
@@ -3349,13 +3361,13 @@ impl App {
                     let on = self.params.neg.stock == s.id;
                     let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::click());
                     if on || resp.hovered() {
-                        ui.painter().rect_filled(r, 6.0, if on { SEL } else { hex(0x222226) });
+                        ui.painter().rect_filled(r, 3.0, if on { BONE } else { CARD });
                     }
                     let chip_r = Rect::from_min_size(pos2(r.left() + 8.0, r.center().y - 11.0), vec2(14.0, 22.0));
                     ui.painter().rect_filled(chip_r, 2.0, stock_chip(s));
                     ui.painter().rect_stroke(chip_r, 2.0, Stroke::new(1.0, hex(0x3A3A40)), egui::StrokeKind::Inside);
-                    ui.painter().text(pos2(chip_r.right() + 10.0, r.center().y), Align2::LEFT_CENTER, s.name, FontId::proportional(13.0), TEXT);
-                    ui.painter().text(pos2(r.right() - 8.0, r.center().y), Align2::RIGHT_CENTER, stock_iso(s), FontId::monospace(11.0), TEXT3);
+                    ui.painter().text(pos2(chip_r.right() + 10.0, r.center().y), Align2::LEFT_CENTER, s.name, FontId::proportional(13.0), if on { INK } else { TEXT });
+                    ui.painter().text(pos2(r.right() - 8.0, r.center().y), Align2::RIGHT_CENTER, stock_iso(s), FontId::monospace(11.0), if on { ON_BONE } else { TEXT3 });
                     if resp.clicked() {
                         self.params.neg.stock = s.id.into();
                         self.params.neg.enabled = true;
@@ -3566,7 +3578,7 @@ impl App {
             if c[0].add(egui::Button::new("Reset").min_size(vec2(c[0].available_width(), 32.0))).clicked() {
                 self.params.neg = negative::NegParams { enabled: true, stock: self.params.neg.stock.clone(), ..Default::default() };
             }
-            if c[1].add(egui::Button::new(RichText::new("Open in Develop").color(hex(0x1B1B1E)).family(semi())).fill(ACCENT).stroke(Stroke::NONE).min_size(vec2(c[1].available_width(), 32.0))).clicked() {
+            if c[1].add(egui::Button::new(RichText::new("Open in Develop").color(INK).family(semi())).fill(BONE).stroke(Stroke::NONE).min_size(vec2(c[1].available_width(), 32.0))).clicked() {
                 self.module = Module::Develop;
             }
         });
@@ -3785,10 +3797,10 @@ fn paint_flag(p: &egui::Painter, c: egui::Pos2, col: Color32) {
 fn list_row(ui: &mut Ui, text: &str, count: &str, on: bool) -> egui::Response {
     let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::click());
     if on || resp.hovered() {
-        ui.painter().rect_filled(r, 6.0, if on { SEL } else { hex(0x222226) });
+        ui.painter().rect_filled(r, 3.0, if on { BONE } else { CARD });
     }
-    ui.painter().text(pos2(r.left() + 8.0, r.center().y), Align2::LEFT_CENTER, text, FontId::proportional(13.0), TEXT);
-    ui.painter().text(pos2(r.right() - 8.0, r.center().y), Align2::RIGHT_CENTER, count, FontId::monospace(11.5), if on { TEXT2 } else { TEXT3 });
+    ui.painter().text(pos2(r.left() + 8.0, r.center().y), Align2::LEFT_CENTER, text, FontId::proportional(13.0), if on { INK } else { TEXT });
+    ui.painter().text(pos2(r.right() - 8.0, r.center().y), Align2::RIGHT_CENTER, count, FontId::monospace(11.5), if on { ON_BONE } else { TEXT3 });
     resp
 }
 
