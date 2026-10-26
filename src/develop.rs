@@ -456,10 +456,10 @@ pub fn add_border(img: Rgb32FImage, b: &Border) -> Rgb32FImage {
     out
 }
 
-/// Anti-aliased single-line text, centred on (cx, cy), in the bundled Inter font.
+/// Anti-aliased single-line text, centred on (cx, cy), in the bundled IBM Plex Sans.
 pub fn draw_text(img: &mut Rgb32FImage, text: &str, cx: f32, cy: f32, px: f32, ink: f32) {
     use ab_glyph::{Font, FontRef, PxScale, ScaleFont, point};
-    let Ok(font) = FontRef::try_from_slice(include_bytes!("../assets/fonts/Inter-400.ttf")) else { return };
+    let Ok(font) = FontRef::try_from_slice(include_bytes!("../assets/fonts/IBMPlexSans-400.ttf")) else { return };
     let sf = font.as_scaled(PxScale::from(px));
     let mut x = 0.0;
     let mut prev = None;

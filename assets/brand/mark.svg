@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="72" height="72" viewBox="0 0 72 72" role="img" aria-label="Ferrotype">
+  <!-- bare mark, no tile. Use currentColor so it takes the text colour it sits next to. -->
+  <rect x="2" y="2" width="44" height="44" rx="9" fill="currentColor"/>
+  <rect x="26" y="26" width="44" height="44" rx="9" fill="none" stroke="currentColor" stroke-width="4"/>
+</svg>

@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 100 100">
+  <!-- 16/24 px app icon: the tile with mark-16's heavier stroke so the outline frame survives -->
+  <rect width="100" height="100" rx="18" fill="#ECE8E1"/>
+  <rect x="12" y="12" width="54" height="54" rx="10" fill="#141416"/>
+  <rect x="38" y="38" width="50" height="50" rx="10" fill="#ECE8E1" stroke="#141416" stroke-width="9"/>
+</svg>
