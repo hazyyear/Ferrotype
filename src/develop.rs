@@ -664,10 +664,51 @@ pub fn solve_wb(c: [f32; 3]) -> (f32, f32) {
     ((best.1 / 10.0).round() * 10.0, best.2)
 }
 
+/// `x` raised to `p` for x ≥ 0, through fast log2/exp2 (relative error about 1e-6). Hot per-pixel loops
+/// call powf several times a pixel; this is a good deal cheaper and well below what 16-bit output can show.
+#[inline]
+pub fn fpow(x: f32, p: f32) -> f32 {
+    if x <= 0.0 {
+        return if p == 0.0 { 1.0 } else { 0.0 };
+    }
+    if !x.is_finite() {
+        return x.powf(p);
+    }
+    exp2_fast(p * log2_fast(x))
+}
+
+#[inline]
+fn log2_fast(x: f32) -> f32 {
+    // x = m · 2^e with m in [√½, √2), then log2(m) from the atanh series in t = (m − 1)/(m + 1), |t| < 0.172.
+    let bits = x.to_bits();
+    let mut e = ((bits >> 23) & 0xff) as i32 - 127;
+    let mut m = f32::from_bits((bits & 0x007f_ffff) | 0x3f80_0000);
+    if e == -127 {
+        return x.log2(); // subnormal
+    }
+    if m > std::f32::consts::SQRT_2 {
+        m *= 0.5;
+        e += 1;
+    }
+    let t = (m - 1.0) / (m + 1.0);
+    let t2 = t * t;
+    e as f32 + t * (2.885_39 + t2 * (0.961_797_7 + t2 * (0.577_078 + t2 * 0.412_198)))
+}
+
+#[inline]
+fn exp2_fast(y: f32) -> f32 {
+    let y = y.clamp(-126.0, 127.0);
+    let i = y.floor();
+    let f = y - i;
+    // 2^f on [0, 1): degree-6 polynomial (Taylor of e^(f·ln2), error < 2e-7).
+    let p = 1.0 + f * (0.693_147_2 + f * (0.240_226_5 + f * (0.055_504_1 + f * (0.009_618_13 + f * (0.001_333_36 + f * 0.000_154_04)))));
+    p * f32::from_bits(((i as i32 + 127) as u32) << 23)
+}
+
 pub fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [f32; 3] {
-    let h = h.rem_euclid(360.0) / 60.0;
+    let h = if (0.0..360.0).contains(&h) { h } else { h.rem_euclid(360.0) } / 60.0;
     let c = v * s;
-    let x = c * (1.0 - (h % 2.0 - 1.0).abs());
+    let x = c * (1.0 - ((h - 2.0 * (h * 0.5).floor()) - 1.0).abs());
     let (r, g, b) = match h as u32 {
         0 => (c, x, 0.0), 1 => (x, c, 0.0), 2 => (0.0, c, x), 3 => (0.0, x, c), 4 => (x, 0.0, c), _ => (c, 0.0, x),
     };
@@ -678,7 +719,7 @@ pub fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [f32; 3] {
 pub fn rgb_to_hsv(c: [f32; 3]) -> (f32, f32, f32) {
     let (mx, mn) = (c[0].max(c[1]).max(c[2]), c[0].min(c[1]).min(c[2]));
     let d = mx - mn;
-    let h = if d <= 1e-6 { 0.0 } else if mx == c[0] { 60.0 * ((c[1] - c[2]) / d).rem_euclid(6.0) } else if mx == c[1] { 60.0 * ((c[2] - c[0]) / d + 2.0) } else { 60.0 * ((c[0] - c[1]) / d + 4.0) };
+    let h = if d <= 1e-6 { 0.0 } else if mx == c[0] { let q = (c[1] - c[2]) / d; 60.0 * if q < 0.0 { q + 6.0 } else { q } } else if mx == c[1] { 60.0 * ((c[2] - c[0]) / d + 2.0) } else { 60.0 * ((c[0] - c[1]) / d + 4.0) };
     (h, if mx <= 1e-6 { 0.0 } else { d / mx }, mx)
 }
 
@@ -687,7 +728,13 @@ fn band_weight(hue: f32, i: usize) -> f32 {
     let c = HUE_CENTERS[i];
     let prev = HUE_CENTERS[(i + 7) % 8];
     let next = HUE_CENTERS[(i + 1) % 8];
-    let d = (hue - c + 540.0).rem_euclid(360.0) - 180.0;
+    // hue and the centres are in 0..360, so one wrap brings the difference into -180..180.
+    let mut d = hue - c;
+    if d > 180.0 {
+        d -= 360.0;
+    } else if d < -180.0 {
+        d += 360.0;
+    }
     let span = if d < 0.0 { (c - prev).rem_euclid(360.0) } else { (next - c).rem_euclid(360.0) };
     (1.0 - d.abs() / span).max(0.0)
 }
@@ -725,28 +772,33 @@ fn calibration_matrix(p: &Params) -> M3 {
 
 // ---------- blur helpers (3x box ≈ gaussian, O(n) in radius) ----------
 
-fn box_rows(src: &[f32], w: usize, r: usize) -> Vec<f32> {
-    let mut out = vec![0.0; src.len()];
-    out.par_chunks_mut(w).zip(src.par_chunks(w)).for_each(|(o, s)| {
-        let n = (2 * r + 1) as f32;
-        let at = |i: isize| s[i.clamp(0, w as isize - 1) as usize];
-        let mut acc: f32 = (-(r as isize)..=r as isize).map(at).sum();
-        for x in 0..w {
-            o[x] = acc / n;
-            acc += at(x as isize + r as isize + 1) - at(x as isize - r as isize);
-        }
-    });
-    out
+/// One horizontal box pass of radius `r` over a row, edges clamped (running sum, O(1) per pixel).
+fn box_row(s: &[f32], o: &mut [f32], r: usize) {
+    let w = s.len();
+    let inv = 1.0 / (2 * r + 1) as f32;
+    let mut acc: f32 = (0..=2 * r).map(|i| s[i.saturating_sub(r).min(w - 1)]).sum();
+    for x in 0..w {
+        o[x] = acc * inv;
+        acc += s[(x + r + 1).min(w - 1)] - s[x.saturating_sub(r)];
+    }
 }
 
-fn transpose(src: &[f32], w: usize, h: usize) -> Vec<f32> {
-    let mut out = vec![0.0; src.len()];
-    out.par_chunks_mut(h).enumerate().for_each(|(x, col)| {
-        for y in 0..h {
-            col[y] = src[y * w + x];
+/// One vertical box pass of radius `r`, edges clamped. Each output row sums whole input rows, so it reads
+/// memory in order and vectorises (the old transpose-based pass was a third of a render).
+fn box_cols(src: &[f32], dst: &mut [f32], w: usize, h: usize, r: usize) {
+    let inv = 1.0 / (2 * r + 1) as f32;
+    dst.par_chunks_mut(w).enumerate().for_each(|(y, o)| {
+        o.copy_from_slice(&src[y.saturating_sub(r) * w..][..w]);
+        for k in 1..=2 * r {
+            let yy = (y + k).saturating_sub(r).min(h - 1);
+            for (a, b) in o.iter_mut().zip(&src[yy * w..][..w]) {
+                *a += *b;
+            }
+        }
+        for a in o.iter_mut() {
+            *a *= inv;
         }
     });
-    out
 }
 
 pub fn blur(src: &[f32], w: usize, h: usize, sigma: f32) -> Vec<f32> {
@@ -788,18 +840,21 @@ pub fn blur(src: &[f32], w: usize, h: usize, sigma: f32) -> Vec<f32> {
 
 fn blur_full(src: &[f32], w: usize, h: usize, sigma: f32) -> Vec<f32> {
     let r = (((4.0 * sigma * sigma + 1.0).sqrt() - 1.0) / 2.0).round() as usize;
-    if r == 0 {
+    if r == 0 || w == 0 || h == 0 {
         return src.to_vec();
     }
-    let mut b = src.to_vec();
-    for _ in 0..3 {
-        b = box_rows(&b, w, r);
-    }
-    let mut t = transpose(&b, w, h);
-    for _ in 0..3 {
-        t = box_rows(&t, h, r);
-    }
-    transpose(&t, h, w)
+    // Three box passes each way ≈ a gaussian.
+    let mut a = vec![0f32; w * h];
+    a.par_chunks_mut(w).zip(src.par_chunks(w)).for_each_init(|| (vec![0f32; w], vec![0f32; w]), |(t1, t2), (o, s)| {
+        box_row(s, t1, r);
+        box_row(t1, t2, r);
+        box_row(t2, o, r);
+    });
+    let mut b = vec![0f32; w * h];
+    box_cols(&a, &mut b, w, h, r);
+    box_cols(&b, &mut a, w, h, r);
+    box_cols(&a, &mut b, w, h, r);
+    b
 }
 
 // ---------- geometry ----------
@@ -1290,7 +1345,7 @@ fn finish(mut img: Rgb32FImage, p: &Params, scale: f32, full: (u32, u32), off: (
     }
 
     // Local-contrast inputs (only computed when used).
-    let lp: Vec<f32> = if p.clarity != 0.0 || p.texture != 0.0 { img.par_chunks(3).map(|c| luma([c[0], c[1], c[2]]).powf(1.0 / 2.2)).collect() } else { vec![] };
+    let lp: Vec<f32> = if p.clarity != 0.0 || p.texture != 0.0 { img.par_chunks(3).map(|c| fpow(luma([c[0], c[1], c[2]]), 1.0 / 2.2)).collect() } else { vec![] };
     let big = (p.clarity != 0.0).then(|| blur(&lp, w, h, big_w.max(big_h) / 60.0));
     let small = (p.texture != 0.0).then(|| blur(&lp, w, h, 4.0 * scale.max(0.25)));
     let haze = (p.dehaze != 0.0).then(|| {
@@ -1354,7 +1409,7 @@ fn finish(mut img: Rgb32FImage, p: &Params, scale: f32, full: (u32, u32), off: (
             // Tone on luminance, colour ratios preserved (skipped when it would change nothing).
             if tone_on {
             let y0 = luma(c);
-            let mut l = y0.max(0.0).powf(1.0 / 2.2);
+            let mut l = fpow(y0.max(0.0), 1.0 / 2.2);
             let midw = bump(l, 0.5, 0.6);
             if let Some(b) = &big {
                 l += p.clarity / 100.0 * 0.6 * (lp[i] - b[i]) * midw;
@@ -1363,7 +1418,7 @@ fn finish(mut img: Rgb32FImage, p: &Params, scale: f32, full: (u32, u32), off: (
                 l += p.texture / 100.0 * 1.2 * (lp[i] - b[i]);
             }
             l = tone(l, p);
-            let y1 = l.max(0.0).powf(2.2);
+            let y1 = fpow(l.max(0.0), 2.2);
             c = if y0 > 1e-6 { c.map(|v| v * y1 / y0) } else { [y1; 3] };
             }
             // Saturation / vibrance.
@@ -1399,8 +1454,8 @@ fn finish(mut img: Rgb32FImage, p: &Params, scale: f32, full: (u32, u32), off: (
             }
             if grade_on {
                 let le = luma(e).clamp(0.0, 1.0);
-                let ws = (1.0 - le / mid).clamp(0.0, 1.0).powf(g_exp);
-                let wh = ((le - mid) / (1.0 - mid)).clamp(0.0, 1.0).powf(g_exp);
+                let ws = fpow((1.0 - le / mid).clamp(0.0, 1.0), g_exp);
+                let wh = fpow(((le - mid) / (1.0 - mid)).clamp(0.0, 1.0), g_exp);
                 let wm = (1.0 - ws - wh).max(0.0);
                 for (z, wz) in [ws, wm, wh, 1.0].into_iter().enumerate() {
                     let lum = p.grade[z][2] / 100.0 * 0.2;
@@ -1419,7 +1474,7 @@ fn finish(mut img: Rgb32FImage, p: &Params, scale: f32, full: (u32, u32), off: (
                 let (ax, ay) = (1.0 + t * (big_w / big_h - 1.0).max(0.0), 1.0 + t * (big_h / big_w - 1.0).max(0.0));
                 let (ex, ey) = (nx * ax / ax.max(ay), ny * ay / ax.max(ay));
                 let pe = 2.0 - vr_round.min(0.0) * 4.0;
-                let r = (ex.abs().powf(pe) + ey.abs().powf(pe)).powf(1.0 / pe) / 2f32.powf(1.0 / pe);
+                let r = if pe == 2.0 { (ex * ex + ey * ey).sqrt() * std::f32::consts::FRAC_1_SQRT_2 } else { fpow(fpow(ex.abs(), pe) + fpow(ey.abs(), pe), 1.0 / pe) / 2f32.powf(1.0 / pe) };
                 let start = p.vig_mid / 100.0 * 0.9;
                 let m = smooth(start, start + 0.05 + p.vig_fea / 100.0 * 0.6, r);
                 let a = p.vig / 100.0;
@@ -1925,5 +1980,102 @@ mod tests {
         // Vignetting correction lifts the corners; nothing is pulled in from outside the frame.
         let (c, m) = (out.get_pixel(1, 1).0[1], out.get_pixel(150, 100).0[1]);
         assert!(c > m && c > 0.55 && (m - 0.5).abs() < 0.01, "corner {c} middle {m}");
+    }
+}
+
+#[cfg(test)]
+mod fast_math {
+    use super::fpow;
+    #[test]
+    fn fpow_matches_powf() {
+        for p in [1.0 / 2.2, 2.2, 0.5, 2.0, 3.7, 0.25] {
+            let mut x = 1e-7f32;
+            while x < 1e4 {
+                let (a, b) = (fpow(x, p), x.powf(p));
+                assert!(((a - b) / b).abs() < 2e-5, "{x}^{p}: {a} vs {b}");
+                x *= 1.013;
+            }
+        }
+        assert_eq!(fpow(0.0, 2.2), 0.0);
+        assert_eq!(fpow(-1.0, 2.2), 0.0);
+    }
+}
+
+/// Render timings on a real photo:
+/// `BENCH_FILE=photo.NEF cargo test --release bench_pipeline -- --ignored --nocapture`
+/// (BENCH_HEAVY=1 or BENCH_DEFAULT=1 repeat one case, for a profiler).
+#[cfg(test)]
+mod bench {
+    use super::*;
+    use std::time::Instant;
+    fn t<T>(name: &str, f: impl FnOnce() -> T) -> T { let s = Instant::now(); let r = f(); eprintln!("{name:<28} {:>8.1} ms", s.elapsed().as_secs_f64() * 1e3); r }
+    #[test]
+    #[ignore]
+    fn bench_pipeline() {
+        let path = std::env::var("BENCH_FILE").unwrap();
+        if std::env::var("BENCH_HEAVY").is_ok() {
+            let full = crate::load::load(std::path::Path::new(&path)).unwrap();
+            let prev = crate::load::fit(&full, 1400);
+            let mut p = Params::default();
+            p.exposure = 0.5; p.contrast = 20.0; p.highlights = -40.0; p.shadows = 30.0; p.texture = 20.0; p.clarity = 30.0; p.dehaze = 15.0;
+            p.vibrance = 20.0; p.sh_amt = 60.0; p.nr_lum = 30.0; p.nr_col = 25.0; p.gr_amt = 30.0; p.hal_amt = 30.0; p.vig = -20.0; p.t_rot = 2.0;
+            p.hsl[0] = [10.0, 10.0, 0.0]; p.grade[0] = [200.0, 20.0, 0.0];
+            let sc = prev.width() as f32 / full.width() as f32;
+            for _ in 0..30 { t("render 1400 heavy", || render(&prev, &p, sc)); }
+            return;
+        }
+        if std::env::var("BENCH_DEFAULT").is_ok() {
+            let full = crate::load::load(std::path::Path::new(&path)).unwrap();
+            for _ in 0..4 { t("render full default", || render(&full, &Params::default(), 1.0)); }
+            return;
+        }
+        let full = t("load full", || crate::load::load(std::path::Path::new(&path)).unwrap());
+        eprintln!("size {}x{}", full.width(), full.height());
+        let prev = t("fit 1400", || crate::load::fit(&full, 1400));
+        let p0 = Params::default();
+        for _ in 0..2 { t("render 1400 default", || render(&prev, &p0, prev.width() as f32 / full.width() as f32)); }
+        let mut p = Params::default();
+        p.exposure = 0.5; p.contrast = 20.0; p.highlights = -40.0; p.shadows = 30.0; p.texture = 20.0; p.clarity = 30.0; p.dehaze = 15.0;
+        p.vibrance = 20.0; p.sh_amt = 60.0; p.nr_lum = 30.0; p.nr_col = 25.0; p.gr_amt = 30.0; p.hal_amt = 30.0; p.vig = -20.0; p.t_rot = 2.0;
+        p.hsl[0] = [10.0, 10.0, 0.0]; p.grade[0] = [200.0, 20.0, 0.0];
+        let sc = prev.width() as f32 / full.width() as f32;
+        for _ in 0..2 { t("render 1400 heavy", || render(&prev, &p, sc)); }
+        let draft = crate::load::fit(&full, 700);
+        t("render 700 heavy (drag)", || render(&draft, &p, draft.width() as f32 / full.width() as f32));
+        t("render full heavy (export)", || render(&full, &p, 1.0));
+        t("render full default", || render(&full, &p0, 1.0));
+    }
+}
+
+#[cfg(test)]
+mod edge_fuzz {
+    use super::*;
+    /// Tiny frames and extreme settings must render without panics or NaNs.
+    #[test]
+    fn tiny_and_extreme() {
+        let mut variants: Vec<(&str, Params)> = vec![("default", Params::default())];
+        let mut p = Params::default();
+        p.clarity = 100.0; p.texture = 100.0; p.dehaze = 100.0; p.hal_amt = 100.0; p.gr_amt = 100.0; p.nr_lum = 100.0; p.nr_col = 100.0; p.o_fringe = 20.0; p.vig = -100.0; p.sh_amt = 150.0;
+        variants.push(("heavy", p.clone()));
+        let mut q = p.clone(); q.crop = [0.49, 0.49, 0.49, 0.49]; variants.push(("tiny crop", q));
+        let mut q = p.clone(); q.crop = [0.6, 0.0, 0.6, 0.0]; variants.push(("overlap crop", q));
+        let mut q = p.clone(); q.t_rot = 45.0; q.t_vert = 100.0; q.t_hor = -100.0; q.t_scale = 50.0; q.o_dist = 100.0; variants.push(("geometry", q));
+        let mut q = p.clone(); q.rot90 = 3; q.flip_h = true; variants.push(("rot90", q));
+        let mut q = p.clone(); q.border = Border { width: 100.0, white: true, aspect: 0.8, caption: "ferrotype".into() }; variants.push(("border", q));
+        let mut q = p.clone(); q.neg.enabled = true; variants.push(("negative", q));
+        let mut q = p.clone(); q.spots = vec![Spot { x: 0.5, y: 0.5, r: 0.5, sx: 0.9, sy: 0.1, path: vec![[0.1, 0.1], [0.9, 0.9]], clone: false, angle: 30.0 }]; variants.push(("spots", q));
+        let mut q = p.clone(); q.masks = vec![Mask { parts: vec![MaskPart { shape: Shape::Radial { c: [0.5, 0.5], rx: 0.0, ry: 0.0, angle: 0.0, feather: 100.0 }, op: MaskOp::Add, invert: false }, MaskPart { shape: Shape::Linear { a: [0.5, 0.5], b: [0.5, 0.5] }, op: MaskOp::Add, invert: false }, MaskPart { shape: Shape::Brush { dabs: vec![[0.5, 0.5, 0.0, 1.0]] }, op: MaskOp::Add, invert: false }, MaskPart { shape: Shape::Luminance { lo: 0.5, hi: 0.5, soft: 0.0 }, op: MaskOp::Intersect, invert: true }], opacity: 100.0, feather: 100.0, ..Default::default() }]; variants.push(("masks", q));
+        let mut q = p.clone(); q.curves = [vec![[0.5, 0.5]], vec![[0.0, 1.0], [1.0, 0.0]], vec![[0.3, 0.3], [0.3, 0.6]], vec![]]; variants.push(("curves", q));
+        let mut q = p.clone(); q.exposure = 5.0; q.temp = 50000.0; q.tint = 150.0; variants.push(("extreme wb", q));
+        let mut q = p.clone(); q.lut = "/nonexistent.cube".into(); q.lut_amt = 100.0; variants.push(("missing lut", q));
+        for (w, h) in [(1, 1), (1, 9), (9, 1), (2, 2), (3, 300), (300, 3), (17, 13)] {
+            let img = Rgb32FImage::from_fn(w, h, |x, y| image::Rgb([(x as f32 * 0.37).fract(), (y as f32 * 0.21).fract(), 0.5]));
+            for (name, p) in &variants {
+                for sc in [1.0, 0.05] {
+                    let o = render(&img, p, sc);
+                    assert!(o.iter().all(|v| v.is_finite()), "NaN in {w}x{h} {name} at scale {sc}");
+                }
+            }
+        }
     }
 }

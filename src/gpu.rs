@@ -34,11 +34,35 @@ pub fn on_cpu<R>(f: impl FnOnce() -> R) -> R {
 }
 
 static G: OnceLock<Option<Gpu>> = OnceLock::new();
+/// Set while `warm_up` is finding the GPU in the background; renders use the CPU until it is ready.
+static WARMING: AtomicBool = AtomicBool::new(false);
+
+/// Find and set up the GPU on a background thread (it can take seconds, most of all when there is none),
+/// so the first preview doesn't wait for it. Renders started meanwhile run on the CPU.
+pub fn warm_up() {
+    if G.get().is_some() || WARMING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    std::thread::spawn(|| {
+        let _ = setup();
+        WARMING.store(false, Ordering::Release);
+    });
+}
 
 fn gpu() -> Option<&'static Gpu> {
     if BROKEN.load(Ordering::Relaxed) || CPU_ONLY.with(|c| c.get()) {
         return None;
     }
+    if let Some(g) = G.get() {
+        return g.as_ref();
+    }
+    if WARMING.load(Ordering::Acquire) {
+        return None;
+    }
+    setup()
+}
+
+fn setup() -> Option<&'static Gpu> {
     G.get_or_init(|| {
         let mode = std::env::var("FERROTYPE_GPU").unwrap_or_default().to_lowercase();
         if mode == "off" || mode == "0" {

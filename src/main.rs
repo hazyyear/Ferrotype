@@ -278,6 +278,10 @@ pub fn export_stem(path: &Path) -> String {
 
 /// Render one file with its sidecar edits. `n` is its number in the batch (for `{n}` in the name pattern).
 pub fn export_file(path: &Path, out_dir: &Path, o: &ExportOpts, n: usize, overrides: impl Fn(&mut Params)) -> Result<PathBuf, String> {
+    // A damaged edits file would otherwise print the frame unedited, which looks like a success.
+    if sidecar_damaged(path) {
+        return Err("its edits file is damaged, so it was not printed unedited (open it in the app to start fresh)".into());
+    }
     let mut p = read_params(path).unwrap_or_default();
     overrides(&mut p);
     let img = denoise::prepare(load::load(path)?, path, &p)?;
@@ -468,6 +472,8 @@ mod tests {
         let photo = dir.join("b.NEF");
         std::fs::write(sidecar(&photo), "{ \"exposure\": 1.5, oops").unwrap();
         assert!(sidecar_damaged(&photo) && read_params(&photo).is_none());
+        // Printing it must fail rather than quietly print the frame unedited.
+        assert!(export_file(&photo, &dir, &ExportOpts::default(), 1, |_| {}).unwrap_err().contains("damaged"));
         write_params(&photo, &Params::default()).unwrap();
         let kept = std::fs::read_to_string(dir.join("b.NEF.ferrotype.json.damaged")).unwrap();
         assert!(kept.contains("oops") && !sidecar_damaged(&photo));
