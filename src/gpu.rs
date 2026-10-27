@@ -223,8 +223,13 @@ mod tests {
     fn gpu_matches_cpu() {
         // SAFETY: set before any GPU use; lets the test use a software GPU (lavapipe) when there is no real one.
         unsafe { std::env::set_var("FERROTYPE_GPU", "force") };
+        // gpu.wgsl repeats develop::finish, and this is the only check that the two still agree, so don't pass quietly.
         if super::gpu().is_none() {
-            eprintln!("no GPU adapter here, skipping");
+            assert!(
+                std::env::var_os("FERROTYPE_SKIP_GPU_TEST").is_some(),
+                "no GPU adapter: install a software one (Linux: mesa-vulkan-drivers) or set FERROTYPE_SKIP_GPU_TEST=1"
+            );
+            eprintln!("no GPU adapter here, skipped by FERROTYPE_SKIP_GPU_TEST");
             return;
         }
         let (w, h) = (640u32, 480u32);

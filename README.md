@@ -40,6 +40,8 @@ HEIC and AVIF use the system's libheif, loaded only when such a file is opened: 
 
 **GPU:** the tone and colour stage runs on the GPU through wgpu: Vulkan (AMD, NVIDIA, Intel, integrated graphics and APUs on Linux and Windows), Metal (every Mac, Apple Silicon included) and DirectX 12 (Windows). Without a usable GPU, or if the driver reports an error, it quietly renders on the CPU instead; Shortcuts shows which one is in use. `FERROTYPE_GPU=off` turns the GPU off, `FERROTYPE_GPU=force` also accepts software renderers (for testing).
 
+**Tests:** `cargo test`. `gpu_matches_cpu` checks that the GPU shader and the CPU code still give the same picture, so it fails when there is no GPU at all. On a machine without one, install a software GPU (Linux: `mesa-vulkan-drivers`) or set `FERROTYPE_SKIP_GPU_TEST=1`.
+
 ## Look
 
 The look follows the Ferrotype brand kit (direction F): flat 1 px panels in ink (#141416 base, #1C1C1F panels, #2A2A2E lines) with bone (#ECE8E1) text. There is no accent colour: the selected tab, stock, frame or button is shown by inverting it to ink on bone, so the only coloured pixels are in the photo and the histogram. Type is IBM Plex Sans for labels, IBM Plex Mono for section labels and values, and Bricolage Grotesque 700 for the wordmark and empty-state headlines, all bundled (subset) under the SIL Open Font License. Hold the mouse on the photo to see the original.

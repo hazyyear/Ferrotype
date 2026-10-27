@@ -47,12 +47,46 @@ fn path() -> Option<std::path::PathBuf> {
     Some(dirs_config()?.join("shortcuts.json"))
 }
 
-/// The per-user config folder (same place as presets).
+/// The per-user settings folder: shortcuts, presets, print settings and stocks all live here.
+/// Windows: `%APPDATA%\ferrotype`. Elsewhere: `$XDG_CONFIG_HOME/ferrotype` or `~/.config/ferrotype`.
 pub fn dirs_config() -> Option<std::path::PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from).or_else(|| {
-        if cfg!(windows) { std::env::var_os("APPDATA").map(Into::into) } else { std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")) }
-    })?;
+    let env = |k| std::env::var_os(k).map(std::path::PathBuf::from);
+    let home = |sub: &str| env("HOME").map(|h| h.join(sub));
+    let base = if cfg!(windows) { env("APPDATA") } else { env("XDG_CONFIG_HOME").or_else(|| home(".config")) }?;
     Some(base.join("ferrotype"))
+}
+
+/// The per-user cache folder (thumbnails, AI denoise results), which the OS or the user may clear at any time.
+pub fn dirs_cache() -> Option<std::path::PathBuf> {
+    let env = |k| std::env::var_os(k).map(std::path::PathBuf::from);
+    let home = |sub: &str| env("HOME").map(|h| h.join(sub));
+    let base = if cfg!(windows) {
+        env("LOCALAPPDATA")
+    } else if cfg!(target_os = "macos") {
+        home("Library/Caches")
+    } else {
+        env("XDG_CACHE_HOME").or_else(|| home(".cache"))
+    }?;
+    Some(base.join("ferrotype"))
+}
+
+/// Delete the least recently used files in `dir` until it holds at most `max_bytes`.
+pub fn trim_cache(dir: &std::path::Path, max_bytes: u64) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let mut files: Vec<_> = rd.flatten().filter_map(|e| {
+        let m = e.metadata().ok().filter(|m| m.is_file())?;
+        Some((m.modified().ok()?, m.len(), e.path()))
+    }).collect();
+    let mut total: u64 = files.iter().map(|f| f.1).sum();
+    files.sort();
+    for (_, len, path) in files {
+        if total <= max_bytes {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            total -= len;
+        }
+    }
 }
 
 impl Keymap {
@@ -67,7 +101,7 @@ impl Keymap {
     pub fn save(&self) -> Result<(), String> {
         let p = path().ok_or("no config folder")?;
         std::fs::create_dir_all(p.parent().unwrap()).map_err(|e| e.to_string())?;
-        std::fs::write(p, serde_json::to_string_pretty(&self.map).unwrap()).map_err(|e| e.to_string())
+        crate::write_atomic(&p, serde_json::to_string_pretty(&self.map).unwrap().as_bytes()).map_err(|e| e.to_string())
     }
 
     pub fn key(&self, id: &str) -> &str {
@@ -137,5 +171,21 @@ mod tests {
         m.reset();
         m.set("pick", "X".into());
         assert_eq!((m.key("pick"), m.key("reject")), ("X", ""));
+    }
+
+    #[test]
+    fn trim_cache_drops_oldest_first() {
+        let d = std::env::temp_dir().join(format!("ferrotype-trim-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let t = std::time::SystemTime::now();
+        for (i, name) in ["old", "mid", "new"].iter().enumerate() {
+            let f = std::fs::File::create(d.join(name)).unwrap();
+            f.set_len(100).unwrap();
+            f.set_modified(t - std::time::Duration::from_secs(1000 * (3 - i as u64))).unwrap();
+        }
+        trim_cache(&d, 250);
+        let left: Vec<_> = ["old", "mid", "new"].iter().map(|n| d.join(n).exists()).collect();
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(left, [false, true, true]);
     }
 }

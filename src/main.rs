@@ -92,7 +92,7 @@ pub fn contact_sheet(files: &[PathBuf], cols: u32) -> Rgb32FImage {
     sheet
 }
 
-/// Write to a temp file, then rename, so a crash mid-write never leaves a half-written sidecar.
+/// Save a photo's edits (atomically) and mirror rating and label into its XMP.
 pub fn write_params(path: &Path, p: &Params) -> std::io::Result<()> {
     let dest = sidecar(path);
     // Never write over edits we couldn't read: keep them as `….ferrotype.json.damaged` for repair by hand.
@@ -101,18 +101,26 @@ pub fn write_params(path: &Path, p: &Params) -> std::io::Result<()> {
         keep.push(".damaged");
         std::fs::rename(&dest, &keep)?;
     }
-    let mut tmp = dest.clone().into_os_string();
-    tmp.push(".tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(p)?)?;
-    std::fs::rename(&tmp, &dest)?;
+    write_atomic(&dest, serde_json::to_string_pretty(p)?.as_bytes())?;
     // Rating, reject and colour label also go to the standard XMP sidecar so other apps see them.
     let xp = xmp_path(path);
     if !xp.as_os_str().is_empty()
         && let Some(x) = xmp::with_rating_label(std::fs::read_to_string(&xp).ok().as_deref(), p)
     {
-        std::fs::write(&xp, x)?;
+        // Lightroom keeps all its edits for the photo in this file: never leave it half written.
+        write_atomic(&xp, x.as_bytes())?;
     }
     Ok(())
+}
+
+/// Write to `path.tmp`, then rename over `path`, so a crash or full disk never leaves a half-written file.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    std::fs::write(&tmp, bytes).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })?;
+    std::fs::rename(&tmp, path)
 }
 
 /// Export settings: file type, size, quality, and the finishing touches. Remembered between sessions.
@@ -216,6 +224,7 @@ fn render_export_with(full: &Rgb32FImage, p: &Params, o: &ExportOpts, render: im
 pub fn write_export(full: &Rgb32FImage, p: &Params, o: &ExportOpts, out: &Path, src: &Path) -> Result<(), String> {
     if o.ext == "jpg" && !o.hdr && (o.meta || o.print[0] > 0.0) {
         let img = render_export(full, p, o);
+        jpeg_fits(&img)?;
         let mut bytes = vec![];
         let mut enc = JpegEncoder::new_with_quality(&mut bytes, o.quality.clamp(1, 100));
         if o.print[0] > 0.0 && o.canvas[0] == 0 {
@@ -231,6 +240,7 @@ pub fn write_export(full: &Rgb32FImage, p: &Params, o: &ExportOpts, out: &Path, 
     }
     if o.hdr && o.ext == "jpg" {
         let sdr = render_export(full, p, o);
+        jpeg_fits(&sdr)?;
         let low = render_export(full, &Params { exposure: p.exposure - hdr::HEADROOM, ..p.clone() }, o);
         let bytes = hdr::encode_ultrahdr(&sdr, &hdr::gain_map(&sdr, &low), o.quality.clamp(1, 100))?;
         return std::fs::write(out, bytes).map_err(|e| e.to_string());
@@ -247,10 +257,19 @@ pub fn save_output(img: Rgb32FImage, out: &Path, quality: u8) -> Result<(), Stri
         "tif" | "tiff" => dynimg.to_rgb16().save(out).map_err(|e| e.to_string()),
         "png" => dynimg.to_rgb8().save(out).map_err(|e| e.to_string()),
         _ => {
+            jpeg_fits(dynimg.as_rgb32f().unwrap())?;
             let f = std::fs::File::create(out).map_err(|e| e.to_string())?;
             dynimg.to_rgb8().write_with_encoder(JpegEncoder::new_with_quality(std::io::BufWriter::new(f), quality.clamp(1, 100))).map_err(|e| e.to_string())
         }
     }
+}
+
+/// JPEG stores width and height in 16 bits: say so plainly instead of the encoder's error.
+fn jpeg_fits(img: &Rgb32FImage) -> Result<(), String> {
+    if img.width().max(img.height()) > 65_535 {
+        return Err(format!("{} × {} px is too big for JPEG (65,535 px at most): print it as TIFF or PNG, or set a long edge", img.width(), img.height()));
+    }
+    Ok(())
 }
 
 /// Claim `dir/stem.ext`, or `stem-2.ext`, `stem-3.ext`… when taken. Never replaces a file (an original
@@ -395,7 +414,7 @@ fn cli_export(args: &[String]) -> Result<(), String> {
                 let k = if cm { 1.0 / 2.54 } else { 1.0 };
                 o.print = [a.min(b) * k, a.max(b) * k, o.print[2]];
             }
-            "--dpi" => o.print[2] = it.next().and_then(|v| v.parse().ok()).ok_or("--dpi needs a number")?,
+            "--dpi" => o.print[2] = it.next().and_then(|v| v.parse().ok()).filter(|d: &f32| (1.0..=4800.0).contains(d)).ok_or("--dpi needs a number from 1 to 4800")?,
             "--set" => {
                 let v = it.next().ok_or("--set needs instagram, story or portfolio")?;
                 let (_, canvas, long, q) = output::SETS.iter().find(|s| s.0.eq_ignore_ascii_case(v)).ok_or("--set is instagram, story or portfolio")?;

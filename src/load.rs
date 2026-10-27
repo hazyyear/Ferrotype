@@ -51,8 +51,10 @@ fn load_other(path: &Path, linearize: bool) -> Result<Rgb32FImage, String> {
         return crate::heif::load(path).map(|r| r.0);
     }
     jxl_hook();
-    let mut dec = ImageReader::open(path).map_err(|e| e.to_string())?.with_guessed_format().map_err(|e| e.to_string())?
-        .into_decoder().map_err(|e| e.to_string())?;
+    let mut r = ImageReader::open(path).map_err(|e| e.to_string())?.with_guessed_format().map_err(|e| e.to_string())?;
+    // The default 512 MB cap refuses our own panoramas and HDR merges.
+    r.no_limits();
+    let mut dec = r.into_decoder().map_err(|e| e.to_string())?;
     let orient = dec.orientation().unwrap_or(Orientation::NoTransforms);
     let mut img = DynamicImage::from_decoder(dec).map_err(|e| e.to_string())?;
     img.apply_orientation(orient);
@@ -75,7 +77,7 @@ fn jxl_hook() {
 /// The EXIF block (TIFF structure) of a non-RAW file, for lens detection.
 pub fn exif_block(path: &Path) -> Option<Vec<u8>> {
     if crate::heif::EXT.contains(&ext(path).as_str()) {
-        return crate::heif::load(path).ok()?.1;
+        return crate::heif::exif(path);
     }
     jxl_hook();
     let mut dec = ImageReader::open(path).ok()?.with_guessed_format().ok()?.into_decoder().ok()?;
