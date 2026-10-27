@@ -155,7 +155,9 @@ enum View {
 
 enum Msg {
     Thumb(usize, PathBuf, ColorImage), // folder generation, so thumbs of a folder you left are dropped
-    Loaded(PathBuf, Result<(Rgb32FImage, Option<Vec<f32>>), String>),
+    Loaded(PathBuf, Result<Box<Opened>, String>),
+    /// A preview render finished on the render thread.
+    Rendered(Box<RenderOut>),
     Status(String),
     Cull(PathBuf, Option<CullData>),
     Denoised(PathBuf, Result<Vec<f32>, String>),
@@ -186,6 +188,30 @@ struct RenameDlg {
     previewed: (String, String),
 }
 
+/// A photo read on the loader thread, with its preview sizes already made, so opening doesn't stall the UI.
+struct Opened {
+    full: Rgb32FImage,
+    delta: Option<Vec<f32>>,
+    preview: Rgb32FImage,
+    draft: Rgb32FImage,
+    before: ColorImage,
+    auto_base: [f32; 3],
+}
+
+type RenderKey = (Params, bool, bool, usize, Option<usize>);
+
+/// What the render thread hands back for the preview.
+struct RenderOut {
+    /// Which photo this is for (see `App::photo_gen`) and the settings it shows.
+    generation: usize,
+    key: RenderKey,
+    image: ColorImage,
+    bins: [[f32; 128]; 3],
+    view_map: [f32; 8],
+    photo_wh: [f32; 2],
+    tex_scale: f32,
+}
+
 struct Photo {
     /// What renders use: `orig` with AI denoise applied at `nr_applied` strength.
     full: Arc<Rgb32FImage>,
@@ -193,8 +219,8 @@ struct Photo {
     /// AI denoise result as a difference from `orig`, once computed.
     delta: Option<Arc<Vec<f32>>>,
     nr_applied: f32,
-    preview: Rgb32FImage,
-    draft: Rgb32FImage,
+    preview: Arc<Rgb32FImage>,
+    draft: Arc<Rgb32FImage>,
     auto_base: [f32; 3],
 }
 
@@ -218,7 +244,11 @@ pub struct App {
     loading: bool,
     params: Params,
     prev_params: Option<Params>,
-    rendered: Option<(Params, bool, bool, usize, Option<usize>)>,
+    rendered: Option<RenderKey>,
+    /// A preview render is running on the render thread (only one at a time; the newest settings go next).
+    render_busy: bool,
+    /// Counts photos opened, so a render of the previous photo that finishes late is dropped.
+    photo_gen: usize,
     tex_scale: f32,
     tex: Option<TextureHandle>,
     before_tex: Option<TextureHandle>,
@@ -308,6 +338,7 @@ pub fn run(start: Option<PathBuf>) -> eframe::Result {
         viewport: egui::ViewportBuilder::default().with_inner_size([1440.0, 900.0]).with_min_inner_size([1100.0, 640.0]).with_title("ferrotype").with_icon(app_icon()),
         ..Default::default()
     };
+    crate::gpu::warm_up();
     eframe::run_native("Ferrotype", opts, Box::new(move |cc| {
         install_style(&cc.egui_ctx);
         let mut app = App::new();
@@ -344,6 +375,52 @@ fn builtin_presets() -> Vec<(String, Params)> {
         ("B&W classic".into(), Params { saturation: -100.0, contrast: 30.0, clarity: 20.0, gr_amt: 15.0, ..d.clone() }),
         ("B&W high key".into(), Params { saturation: -100.0, exposure: 0.6, highlights: -40.0, whites: 20.0, contrast: -10.0, ..d }),
     ]
+}
+
+/// The preview as shown: the photo rendered, the mask overlay and clipping marks, the border, the paper proof.
+/// Runs on the render thread; `key` and `generation` are filled in by the caller.
+fn render_preview(src: &Rgb32FImage, full_w: u32, shown: &Params, overlay: Option<usize>, clip_view: bool, proof: usize) -> RenderOut {
+    let tex_scale = src.width() as f32 / full_w as f32;
+    // Histogram from the photo alone; the border is added afterwards so it does not skew it.
+    let out = develop::render(src, &Params { border: Default::default(), ..shown.clone() }, tex_scale);
+    let (w, h) = out.dimensions();
+    let (cw, ch, ox, oy, _) = develop::border_layout(w, h, &shown.border);
+    let (fw, fh, fox, foy) = develop::frame_of(shown, w as usize, h as usize);
+    let bins = histogram_bins(&out);
+    let mut out = out;
+    // The selected mask in red, like Lightroom's overlay.
+    if let Some(m) = overlay.and_then(|i| shown.masks.get(i)) {
+        let wts = develop::mask_weights(m, shown, &out, (w, h), (0, 0));
+        out.par_chunks_mut(3).zip(wts.par_iter()).for_each(|(px, wt)| {
+            let a = wt * 0.5;
+            for (k, red) in [0.95, 0.15, 0.15].into_iter().enumerate() {
+                px[k] = px[k] * (1.0 - a) + red * a;
+            }
+        });
+    }
+    if clip_view {
+        // Mark clipping on the photo only, so a white or black border is not flagged.
+        out.par_chunks_mut(3).for_each(|p| {
+            if p.iter().any(|v| *v >= 254.5 / 255.0) {
+                p.copy_from_slice(&[1.0, 0.16, 0.16]);
+            } else if p.iter().all(|v| *v < 0.5 / 255.0) {
+                p.copy_from_slice(&[0.16, 0.35, 1.0]);
+            }
+        });
+    }
+    let mut out = develop::add_border(out, &shown.border);
+    if proof > 0 {
+        crate::output::proof(&mut out, proof - 1);
+    }
+    RenderOut {
+        generation: 0,
+        key: (Params::default(), false, false, 0, None),
+        image: to_color_image(&out),
+        bins,
+        view_map: [cw as f32, ch as f32, ox as f32, oy as f32, fw, fh, fox, foy],
+        photo_wh: [w as f32, h as f32],
+        tex_scale,
+    }
 }
 
 fn to_color_image(img: &Rgb32FImage) -> ColorImage {
@@ -482,7 +559,7 @@ impl App {
             module: Module::Library, folder: None, files: vec![], thumbs: Default::default(), thumb_gen: Default::default(), meta: Default::default(), lib_rating: 0,
             subdirs: vec![], tex_scale: 1.0, thumb_size: 190.0, lib_sel: None, lib_query: String::new(),
             lib_filter: [true, true, true, true, false], current: None, photo: None, loading: false, params: Params::default(), prev_params: None,
-            rendered: None, tex: None, before_tex: None, last_rgb: None, hover_rgb: None, shown_w: 0.0, bins: [[0.0; 128]; 3], clip_view: false,
+            rendered: None, render_busy: false, photo_gen: 0, tex: None, before_tex: None, last_rgb: None, hover_rgb: None, shown_w: 0.0, bins: [[0.0; 128]; 3], clip_view: false,
             history: vec![Params::default()], hist_pos: 0, copied: None, view: View::After, holding_before: false, picking_base: false,
             status: String::new(), presets, preset_tex: vec![], last_preset: None, preset_mix: None, preset_amt: 100.0, preset_name: String::new(), stock_query: String::new(), my_stocks: negative::custom_stocks(), my_stock_name: String::new(), proof: 0,
             stock_tab: 0, mixer_tab: 0, open: [true, false, false, false, false, false, false, false, false, false, false, false, false, false], tool: Tool::None,
@@ -570,9 +647,11 @@ impl App {
         ctx.request_repaint_after(std::time::Duration::from_secs(2));
         let Some(dir) = self.folder.clone() else { return };
         let mut ready = vec![];
+        // A set, not `files.contains`: this runs every two seconds and big folders made it quadratic.
+        let known: std::collections::HashSet<&PathBuf> = self.files.iter().collect();
         for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
             let f = e.path();
-            if !f.is_file() || !load::is_supported(&f) || self.files.contains(&f) {
+            if known.contains(&f) || !f.is_file() || !load::is_supported(&f) {
                 continue;
             }
             let size = e.metadata().map(|m| m.len()).unwrap_or(0);
@@ -582,6 +661,7 @@ impl App {
                 self.watch_sizes.insert(f, size);
             }
         }
+        drop(known);
         if ready.is_empty() {
             return;
         }
@@ -637,9 +717,13 @@ impl App {
         let nr = self.params.ai_nr > 0.0;
         std::thread::spawn(move || {
             // A finished AI denoise is read back from its cache rather than run again.
-            let r = load::load(&path).map(|img| {
-                let d = if nr { denoise::cached_delta(&path, img.len()) } else { None };
-                (img, d)
+            let r = load::load(&path).map(|full| {
+                let delta = if nr { denoise::cached_delta(&path, full.len()) } else { None };
+                let preview = load::fit(&full, PREVIEW);
+                let draft = load::fit(&preview, DRAFT);
+                let before = to_color_image(&encode(&preview));
+                let auto_base = negative::auto_base(&preview);
+                Box::new(Opened { full, delta, preview, draft, before, auto_base })
             });
             let _ = tx.send(Msg::Loaded(path, r));
             ctx2.request_repaint();
@@ -668,20 +752,27 @@ impl App {
                 Msg::Loaded(p, r) if Some(&p) == self.current.as_ref() => {
                     self.loading = false;
                     match r {
-                        Ok((full, delta)) => {
-                            let preview = load::fit(&full, PREVIEW);
-                            let draft = load::fit(&preview, DRAFT);
-                            self.before_tex = Some(ctx.load_texture("before", to_color_image(&encode(&preview)), TextureOptions::LINEAR));
+                        Ok(o) => {
+                            let Opened { full, delta, preview, draft, before, auto_base } = *o;
+                            self.before_tex = Some(ctx.load_texture("before", before, TextureOptions::LINEAR));
                             self.status = format!("{} × {}", full.width(), full.height());
-                            let auto_base = negative::auto_base(&preview);
                             let full = Arc::new(full);
-                            self.photo = Some(Photo { full: full.clone(), orig: full, delta: delta.map(Arc::new), nr_applied: 0.0, preview, draft, auto_base });
+                            self.photo = Some(Photo { full: full.clone(), orig: full, delta: delta.map(Arc::new), nr_applied: 0.0, preview: Arc::new(preview), draft: Arc::new(draft), auto_base });
+                            // The previous photo's picture must not show under this one's name.
+                            self.tex = None;
+                            self.photo_gen += 1;
                             self.preset_tex.clear();
                         }
                         Err(e) => self.status = format!("Could not open: {e}"),
                     }
                 }
                 Msg::Loaded(..) => {}
+                Msg::Rendered(r) => {
+                    self.render_busy = false;
+                    if r.generation == self.photo_gen && self.photo.is_some() {
+                        self.apply_render(ctx, *r);
+                    }
+                }
                 Msg::Status(s) => self.status = s,
                 Msg::Cull(p, d) => {
                     self.cull.pending.remove(&p);
@@ -832,48 +923,35 @@ impl App {
         if self.rendered.as_ref() == Some(&key) {
             return;
         }
-        let src = if draft { &photo.draft } else { &photo.preview };
-        self.tex_scale = src.width() as f32 / photo.full.width() as f32;
-        // Histogram from the photo alone; the border is added afterwards so it does not skew it.
-        let out = develop::render(src, &Params { border: Default::default(), ..shown.clone() }, self.tex_scale);
-        let (w, h) = out.dimensions();
-        let (cw, ch, ox, oy, _) = develop::border_layout(w, h, &shown.border);
-        let (fw, fh, fox, foy) = develop::frame_of(&shown, w as usize, h as usize);
-        self.view_map = [cw as f32, ch as f32, ox as f32, oy as f32, fw, fh, fox, foy];
-        self.photo_wh = [w as f32, h as f32];
-        self.bins = histogram_bins(&out);
-        let mut out = out;
-        // The selected mask in red, like Lightroom's overlay.
-        if let Some(m) = overlay.and_then(|i| shown.masks.get(i)) {
-            let wts = develop::mask_weights(m, &shown, &out, (w, h), (0, 0));
-            out.par_chunks_mut(3).zip(wts.par_iter()).for_each(|(px, wt)| {
-                let a = wt * 0.5;
-                for (k, red) in [0.95, 0.15, 0.15].into_iter().enumerate() {
-                    px[k] = px[k] * (1.0 - a) + red * a;
-                }
-            });
+        // One render at a time, off the UI thread, so sliders and panning never wait for it. When it
+        // lands, the next frame sees whether the settings moved on meanwhile and starts the newest.
+        if self.render_busy {
+            return;
         }
-        if self.clip_view {
-            // Mark clipping on the photo only, so a white or black border is not flagged.
-            out.par_chunks_mut(3).for_each(|p| {
-                if p.iter().any(|v| *v >= 254.5 / 255.0) {
-                    p.copy_from_slice(&[1.0, 0.16, 0.16]);
-                } else if p.iter().all(|v| *v < 0.5 / 255.0) {
-                    p.copy_from_slice(&[0.16, 0.35, 1.0]);
-                }
-            });
-        }
-        let mut out = develop::add_border(out, &shown.border);
-        if self.proof > 0 {
-            crate::output::proof(&mut out, self.proof - 1);
-        }
-        let ci = to_color_image(&out);
+        self.render_busy = true;
+        let src = if draft { photo.draft.clone() } else { photo.preview.clone() };
+        let full_w = photo.full.width();
+        let (proof, clip_view, generation, tx, ctx2) = (self.proof, self.clip_view, self.photo_gen, self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let out = render_preview(&src, full_w, &shown, overlay, clip_view, proof);
+            let _ = tx.send(Msg::Rendered(Box::new(RenderOut { generation, key, ..out })));
+            ctx2.request_repaint();
+        });
+    }
+
+    fn apply_render(&mut self, ctx: &egui::Context, r: RenderOut) {
+        let draft = r.key.2;
+        let overlay = r.key.4;
+        self.tex_scale = r.tex_scale;
+        self.view_map = r.view_map;
+        self.photo_wh = r.photo_wh;
+        self.bins = r.bins;
         match &mut self.tex {
-            Some(t) => t.set(ci.clone(), TextureOptions::LINEAR),
-            None => self.tex = Some(ctx.load_texture("preview", ci.clone(), TextureOptions::LINEAR)),
+            Some(t) => t.set(r.image.clone(), TextureOptions::LINEAR),
+            None => self.tex = Some(ctx.load_texture("preview", r.image.clone(), TextureOptions::LINEAR)),
         }
-        self.last_rgb = Some(ci);
-        self.rendered = Some(key);
+        self.last_rgb = Some(r.image);
+        self.rendered = Some(r.key);
         if self.thumb_due && !draft && self.tool != Tool::Crop && overlay.is_none() {
             self.refresh_thumb();
         }
@@ -905,8 +983,8 @@ impl App {
                 Some(d) if want > 0.0 => Arc::new(denoise::apply_delta(&ph.orig, d, want / 100.0)),
                 _ => ph.orig.clone(),
             };
-            ph.preview = load::fit(&ph.full, PREVIEW);
-            ph.draft = load::fit(&ph.preview, DRAFT);
+            ph.preview = Arc::new(load::fit(&ph.full, PREVIEW));
+            ph.draft = Arc::new(load::fit(&ph.preview, DRAFT));
             ph.nr_applied = want;
             self.rendered = None;
             if let Some(z) = &mut self.zoom {
