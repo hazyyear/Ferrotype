@@ -14,7 +14,7 @@ pub const BORDER: Color32 = hex(0x2A2A2E); // "line"
 pub const DIVIDER: Color32 = BORDER;
 pub const CARD: Color32 = hex(0x242428); // "raised"
 pub const SEL: Color32 = hex(0x2E2E33); // hover surface
-pub const BTN_BORDER: Color32 = hex(0x4E4C49); // 3:1 against the panel
+pub const BTN_BORDER: Color32 = hex(0x75726C); // 3.5:1 on the panel, 3.2:1 on raised cards (WCAG 1.4.11)
 pub const TEXT: Color32 = BONE;
 pub const TEXT2: Color32 = hex(0xB5B1AA); // "mid"
 pub const TEXT3: Color32 = hex(0x8A877F); // "dim": secondary labels and metadata only
@@ -96,12 +96,14 @@ pub fn install_style(ctx: &egui::Context) {
         v.text_cursor.stroke = Stroke::new(1.5, BONE);
         v.hyperlink_color = BONE;
         v.window_corner_radius = CornerRadius::same(4);
+        // Disabled controls must look clearly off, not just a shade darker.
+        v.disabled_alpha = 0.35;
         v.menu_corner_radius = CornerRadius::same(4);
         let r = CornerRadius::same(3);
         let w = &mut v.widgets;
         w.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
         w.noninteractive.fg_stroke = Stroke::new(1.0, TEXT2);
-        for (st, fill, border) in [(&mut w.inactive, CARD, BTN_BORDER), (&mut w.hovered, SEL, hex(0x6A6762)), (&mut w.active, hex(0x38383D), TEXT3), (&mut w.open, SEL, BTN_BORDER)] {
+        for (st, fill, border) in [(&mut w.inactive, CARD, BTN_BORDER), (&mut w.hovered, SEL, TEXT3), (&mut w.active, hex(0x38383D), TEXT2), (&mut w.open, SEL, BTN_BORDER)] {
             st.bg_fill = fill;
             st.weak_bg_fill = fill;
             st.bg_stroke = Stroke::new(1.0, border);
@@ -165,6 +167,37 @@ pub fn tab(ui: &mut Ui, text: &str, on: bool) -> egui::Response {
         ui.painter().hline(r.x_range().shrink(4.0), r.bottom() + 1.0, Stroke::new(1.0, TEXT3));
     }
     resp
+}
+
+/// Multi-select filter chip (several can be on): bone outline and bone text when on, dim hairline when off.
+/// Calmer than the inverted `chip`, so a row of them doesn't outshine the photos.
+pub fn filter_chip(ui: &mut Ui, text: &str, on: bool) -> egui::Response {
+    ui.add(egui::Button::new(RichText::new(text).size(11.5).color(if on { BONE } else { TEXT3 }))
+        .fill(if on { CARD } else { Color32::TRANSPARENT })
+        .stroke(Stroke::new(1.0, if on { BONE } else { BORDER }))
+        .corner_radius(3)
+        .min_size(vec2(0.0, 24.0)))
+}
+
+/// A dialog: one at a time, over a dimmed page, closed by Esc, a click outside or ×.
+/// Title in Plex Sans 500 on the left, as panels are. Returns false once it should close.
+pub fn dialog(ctx: &egui::Context, id: &str, title: &str, width: f32, body: impl FnOnce(&mut Ui)) -> bool {
+    let frame = egui::Frame::new().fill(PANEL).stroke(Stroke::new(1.0, BORDER)).corner_radius(6).inner_margin(egui::Margin::same(18));
+    let r = egui::Modal::new(egui::Id::unique(("dialog", id))).frame(frame).backdrop_color(Color32::from_rgba_unmultiplied(8, 8, 9, 160)).show(ctx, |ui| {
+        ui.set_width(width);
+        let mut close = false;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(title).size(15.0).family(semi()).color(TEXT));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                close = ui.add(egui::Button::new(RichText::new("×").size(16.0).color(TEXT2)).fill(Color32::TRANSPARENT).stroke(Stroke::NONE).min_size(vec2(24.0, 24.0)))
+                    .on_hover_text("Close (Esc)").clicked();
+            });
+        });
+        ui.add_space(8.0);
+        body(ui);
+        close
+    });
+    !(r.inner || r.should_close())
 }
 
 /// Filter chip: hairline outline, inverted when on.
@@ -454,7 +487,11 @@ fn paint_gradient_track(ui: &Ui, track: Rect, min: f32, max: f32, g: Grad) {
                 let cx = px.clamp(r, w as f32 - r);
                 let d = ((px - cx).powi(2) + (py - r).powi(2)).sqrt();
                 let a = (r - d + 0.5).clamp(0.0, 1.0);
-                let c = cols[x];
+                let mut c = cols[x];
+                // Dark-to-light tone tracks read as half filled at 0: dim them, keep colour tracks as they are.
+                if c.r().max(c.g()).max(c.b()) - c.r().min(c.g()).min(c.b()) < 24 {
+                    c = c.gamma_multiply(0.62);
+                }
                 img.pixels[y * w + x] = Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), (a * 255.0) as u8);
             }
         }

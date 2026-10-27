@@ -1281,8 +1281,9 @@ impl App {
             let name = |p: &Path| p.file_name().unwrap_or_default().to_string_lossy().to_string();
             d.preview = crate::rename::plan(&first, &d.pattern, &d.roll).into_iter().filter(|(a, _)| first.contains(a)).map(|(a, b)| (name(&a), name(&b))).collect();
         }
-        let (mut open, mut go) = (true, false);
-        egui::Window::new(format!("Rename {} photo{}", d.files.len(), if d.files.len() == 1 { "" } else { "s" })).open(&mut open).collapsible(false).resizable(false).default_width(380.0).show(ctx, |ui| {
+        let mut go = false;
+        let title = format!("Rename {} photo{}", d.files.len(), if d.files.len() == 1 { "" } else { "s" });
+        let open = dialog(ctx, "rename", &title, 380.0, |ui| {
             ui.add(egui::TextEdit::singleline(&mut d.pattern).desired_width(f32::INFINITY));
             token_chips(ui, &mut d.pattern);
             ui.add(egui::TextEdit::singleline(&mut d.roll).hint_text("Roll number (for {roll})").desired_width(f32::INFINITY));
@@ -1315,10 +1316,9 @@ impl App {
     /// Export settings: format, size and quality, then the file or folder dialog.
     fn export_window(&mut self, ctx: &egui::Context) {
         let Some(all) = self.export_dialog else { return };
-        let (mut open, mut go) = (true, false);
-        egui::Window::new(if !all { "Print".to_string() } else if self.export_sel.is_empty() { "Print all frames".to_string() } else { format!("Print {} frames", self.export_sel.len()) }).collapsible(false).resizable(false)
-            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0)).open(&mut open).show(ctx, |ui| {
-                ui.set_width(320.0);
+        let mut go = false;
+        let title = if !all { "Print".to_string() } else if self.export_sel.is_empty() { "Print all frames".to_string() } else { format!("Print {} frames", self.export_sel.len()) };
+        let open = dialog(ctx, "print", &title, 320.0, |ui| {
                 ui.spacing_mut().item_spacing.y = 8.0;
                 let o = &mut self.export;
                 ui.label(caps("Format"));
@@ -1414,7 +1414,7 @@ impl App {
                 ui.label(RichText::new("Prints hold pixels only unless you add the details above: never GPS or serial numbers.").size(11.5).color(TEXT2));
                 ui.add_space(4.0);
                 let sets = self.export_sets.iter().any(|b| *b);
-                go = primary(ui, if sets { "Print sets to folder…" } else if all { "Choose folder…" } else { "Choose file…" }, true).clicked();
+                go = primary(ui, if sets { "Print sets to folder…" } else if all { "Print to folder…" } else { "Print to file…" }, true).clicked();
             });
         if go || !open {
             self.export_dialog = None;
@@ -1990,7 +1990,8 @@ impl App {
         }
         ui.add_space(14.0);
         let rejects = self.meta.values().filter(|m| m.flag < 0).count();
-        if ui.add_enabled(rejects > 0, egui::Button::new(format!("Move {rejects} rejects to _rejects")).min_size(vec2(ui.available_width(), 32.0)))
+        // Only offered when there is something to move.
+        if rejects > 0 && ui.add(egui::Button::new(format!("Move {rejects} reject{} to _rejects", if rejects == 1 { "" } else { "s" })).min_size(vec2(ui.available_width(), 32.0)))
             .on_hover_text("Moves rejected photos and their settings into a _rejects folder here. Nothing is deleted.").clicked()
         {
             self.move_rejects(ui.ctx());
@@ -2014,24 +2015,25 @@ impl App {
                     self.tool = Tool::None;
                 }
             }
-            ui.add_space(8.0);
-            if tab(ui, "Shortcuts", self.keys_open).clicked() {
-                self.keys_open = !self.keys_open;
-            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
-                if matches!(self.module, Module::Library | Module::Cull) {
-                    // Secondary here: "Open in Develop" is the screen's one primary action.
-                    if ui.add(egui::Button::new("Open roll…").min_size(vec2(0.0, 28.0))).on_hover_text("Open a folder of frames").clicked()
-                        && let Some(d) = rfd::FileDialog::new().pick_folder()
-                    {
-                        self.open_path(ui.ctx(), &d);
-                    }
+                // Shortcuts is a dialog, not a view: a small button at the end of the bar, not a tab.
+                if ui.add(egui::Button::new(RichText::new("?").family(mono500()).size(13.0).color(TEXT2)).min_size(vec2(28.0, 28.0))).on_hover_text("Keyboard shortcuts").clicked() {
+                    self.keys_open = true;
+                }
+                let develop = !matches!(self.module, Module::Library | Module::Cull);
+                if develop && primary(ui, "Print", self.photo.is_some()).on_hover_text("Print this frame to a file").clicked() {
+                    self.export_dialog = Some(false);
+                }
+                // In every view, so a new roll is always one click away.
+                if ui.add(egui::Button::new("Open roll…").min_size(vec2(0.0, 28.0))).on_hover_text("Open a folder of frames").clicked()
+                    && let Some(d) = rfd::FileDialog::new().pick_folder()
+                {
+                    self.open_path(ui.ctx(), &d);
+                }
+                if !develop {
                     ui.add(egui::TextEdit::singleline(&mut self.lib_query).hint_text("Search file names").desired_width(240.0).margin(vec2(10.0, 6.0)));
                 } else {
-                    if primary(ui, "Print", self.photo.is_some()).on_hover_text("Export this frame").clicked() {
-                        self.export_dialog = Some(false);
-                    }
                     let name = self.current.as_ref().and_then(|c| c.file_name()).map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
                     let line = [name, self.status.clone()].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ");
                     ui.label(RichText::new(line).monospace().color(TEXT3).size(11.0));
@@ -2086,12 +2088,9 @@ impl App {
                         self.toggle_zoom([0.5, 0.5]);
                     }
                 }
-                if ui.button("Reset").clicked() {
-                    if neg {
-                        self.params.neg = negative::NegParams { enabled: true, stock: self.params.neg.stock.clone(), ..Default::default() };
-                    } else {
-                        self.params = Params { neg: self.params.neg.clone(), ..Params::default() };
-                    }
+                // Negative has its own "Reset conversion" under the panel.
+                if !neg && ui.button("Reset").on_hover_text("Clear this photo's Develop settings").clicked() {
+                    self.params = Params { neg: self.params.neg.clone(), ..Params::default() };
                 }
             });
         });
@@ -2311,6 +2310,8 @@ impl App {
     }
 
     fn histogram_block(&mut self, ui: &mut Ui) {
+        ui.label(caps("Histogram"));
+        ui.add_space(4.0);
         histogram(ui, &self.bins);
         // Pinned sample points: live readouts from the rendered photo.
         let mut remove = None;
@@ -2335,7 +2336,7 @@ impl App {
             self.samples.remove(k);
         }
         ui.horizontal(|ui| {
-            let rgb = self.hover_rgb.map(|c| format!("R {:>3}  G {:>3}  B {:>3}", c[0], c[1], c[2])).unwrap_or_else(|| "R   –  G   –  B   –".into());
+            let rgb = self.hover_rgb.map(|c| format!("R {:>3}  G {:>3}  B {:>3}", c[0], c[1], c[2])).unwrap_or_default(); // values appear while the pointer is over the photo
             ui.label(RichText::new(rgb).monospace().size(11.0).color(TEXT3));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let t = if self.clip_view { "Clipping on" } else { "Clipping off" };
@@ -2422,10 +2423,16 @@ impl App {
 
     fn library_toolbar(&mut self, ui: &mut Ui) {
         ui.horizontal_centered(|ui| {
-            for (i, n) in ["RAW", "JPEG", "TIFF", "Other", "Edited"].into_iter().enumerate() {
-                if chip(ui, n, self.lib_filter[i]).clicked() {
+            ui.label(caps("Show"));
+            ui.add_space(4.0);
+            for (i, n) in ["RAW", "JPEG", "TIFF", "Other"].into_iter().enumerate() {
+                if filter_chip(ui, n, self.lib_filter[i]).clicked() {
                     self.lib_filter[i] = !self.lib_filter[i];
                 }
+            }
+            ui.add_space(10.0);
+            if filter_chip(ui, "Edited only", self.lib_filter[4]).clicked() {
+                self.lib_filter[4] = !self.lib_filter[4];
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui.add_enabled(!self.files.is_empty(), egui::Button::new("Print all…")).clicked() {
@@ -2714,24 +2721,29 @@ impl App {
                         self.rate(&f, None, Some(if m.flag == flag { 0 } else { flag }), None);
                     }
                 }
-                let (r, resp) = ui.allocate_exact_size(vec2(70.0, 16.0), Sense::click());
-                for i in 0..5 {
-                    let c = pos2(r.left() + 7.0 + i as f32 * 14.0, r.center().y);
-                    paint_stars(ui.painter(), c, 1, 6.0, if (i as u8) < m.rating { ACCENT } else { hex(0x4A4A52) });
+                // 24 px per star: the minimum target size. Empty stars use the control border colour (3:1).
+                let (r, resp) = ui.allocate_exact_size(vec2(120.0, 24.0), Sense::click());
+                let hover = resp.hover_pos().map(|p| (((p.x - r.left()) / 24.0) as u8 + 1).min(5));
+                for i in 0..5u8 {
+                    let c = pos2(r.left() + 12.0 + i as f32 * 24.0, r.center().y);
+                    let lit = i < hover.unwrap_or(m.rating);
+                    paint_stars(ui.painter(), c, 1, 6.5, if lit { if hover.is_some() { TEXT2 } else { ACCENT } } else { BTN_BORDER });
                 }
                 if resp.clicked()
                     && let Some(p) = resp.interact_pointer_pos()
                 {
-                    let n = (((p.x - r.left()) / 14.0) as u8 + 1).min(5);
+                    let n = (((p.x - r.left()) / 24.0) as u8 + 1).min(5);
                     self.rate(&f, Some(if n == m.rating { 0 } else { n }), None, None);
                 }
             });
         });
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Label").size(12.0).color(TEXT3));
+            // The colour's name too, so the label doesn't rely on colour alone.
+            let name = m.label.checked_sub(1).and_then(|k| ["Red", "Yellow", "Green", "Blue", "Purple"].get(k as usize)).map_or(String::new(), |n| format!(" · {n}"));
+            ui.label(RichText::new(format!("Label{name}")).size(12.0).color(TEXT3));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 for k in (0..5u8).rev() {
-                    let (r, resp) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::click());
+                    let (r, resp) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::click());
                     let on = m.label == k + 1;
                     ui.painter().circle_filled(r.center(), if on { 6.0 } else { 4.5 }, LABEL_COLORS[k as usize].gamma_multiply(if on { 1.0 } else { 0.55 }));
                     if on {
@@ -3430,7 +3442,7 @@ impl App {
                 ui.spacing_mut().item_spacing.y = 2.0;
                 // Your own profiles first.
                 ui.add_space(8.0);
-                ui.label(RichText::new("My stocks").size(11.0).family(semi()).color(TEXT3));
+                ui.label(caps("My stocks"));
                 let mut apply = None;
                 let mut remove = None;
                 let mut share = None;
@@ -3502,7 +3514,7 @@ impl App {
                 for s in STOCKS.iter().filter(keep) {
                     if s.brand != last_brand {
                         ui.add_space(8.0);
-                        ui.label(RichText::new(s.brand).size(11.0).family(semi()).color(TEXT3));
+                        ui.label(caps(s.brand));
                         last_brand = s.brand;
                     }
                     let on = self.params.neg.stock == s.id;
@@ -3548,6 +3560,11 @@ impl App {
                     ui.label(RichText::new("Convert negative").size(12.0).color(LABEL));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| switch(ui, &mut np.enabled));
                 });
+                // Steps 1–3 do nothing until the frame is converted: say so, and grey them out.
+                if !np.enabled {
+                    ui.label(RichText::new("Off. Turn on, or pick a stock, to convert this frame.").size(11.5).color(TEXT2));
+                    ui.disable();
+                }
                 ui.add_space(6.0);
 
                 ui.label(caps("1 · Film base"));
@@ -3722,10 +3739,11 @@ impl App {
 
     fn negative_footer(&mut self, ui: &mut Ui) {
         ui.columns(2, |c| {
-            if c[0].add(egui::Button::new("Reset").min_size(vec2(c[0].available_width(), 32.0))).clicked() {
+            if c[0].add(egui::Button::new("Reset conversion").min_size(vec2(c[0].available_width(), 32.0))).on_hover_text("Back to this stock's defaults").clicked() {
                 self.params.neg = negative::NegParams { enabled: true, stock: self.params.neg.stock.clone(), ..Default::default() };
             }
-            if c[1].add(egui::Button::new(RichText::new("Open in Develop").color(INK).family(semi())).fill(BONE).stroke(Stroke::NONE).min_size(vec2(c[1].available_width(), 32.0))).clicked() {
+            // Secondary: Print in the top bar is this view's one filled button.
+            if c[1].add(egui::Button::new("Open in Develop").min_size(vec2(c[1].available_width(), 32.0))).clicked() {
                 self.module = Module::Develop;
             }
         });
@@ -3883,9 +3901,9 @@ impl App {
         if !self.keys_open {
             return;
         }
-        let mut open = true;
-        egui::Window::new("Keyboard shortcuts").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0)).open(&mut open).show(ctx, |ui| {
-            ui.set_width(380.0);
+        // Esc while waiting for a key cancels the binding, not the dialog.
+        let binding = self.binding.is_some();
+        let open = dialog(ctx, "keys", "Keyboard shortcuts", 380.0, |ui| {
             ui.label(RichText::new("Click a shortcut, then press the new key (Esc cancels). Undo, copy, paste and Ctrl/Cmd+arrows stay fixed.").size(11.5).color(TEXT2));
             ui.add_space(6.0);
             egui::ScrollArea::vertical().max_height(460.0).show(ui, |ui| {
@@ -3909,7 +3927,7 @@ impl App {
             ui.add_space(4.0);
             ui.label(RichText::new(format!("Rendering: {}", crate::gpu::status())).size(11.0).color(TEXT3));
         });
-        if !open {
+        if !open && !(binding && ctx.input(|i| i.key_pressed(egui::Key::Escape))) {
             self.keys_open = false;
             self.binding = None;
         }
