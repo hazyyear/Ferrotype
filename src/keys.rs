@@ -144,10 +144,10 @@ pub fn combo(key: Key, shift: bool) -> String {
 pub fn display(combo: &str) -> String {
     let Some((shift, key)) = parse(combo) else { return "—".into() };
     let name = match key {
-        Key::ArrowLeft => "Left",
-        Key::ArrowRight => "Right",
-        Key::ArrowUp => "Up",
-        Key::ArrowDown => "Down",
+        Key::ArrowLeft => "←",
+        Key::ArrowRight => "→",
+        Key::ArrowUp => "↑",
+        Key::ArrowDown => "↓",
         Key::OpenBracket => "[",
         Key::CloseBracket => "]",
         Key::Backslash => "\\",

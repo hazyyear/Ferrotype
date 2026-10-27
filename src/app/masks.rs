@@ -209,18 +209,18 @@ pub(super) fn masks_panel(ui: &mut Ui, st: &mut MaskUi, p: &mut Params) -> bool 
     for (name, v) in [("Texture", &mut a.texture), ("Clarity", &mut a.clarity), ("Dehaze", &mut a.dehaze), ("Vibrance", &mut a.vibrance), ("Saturation", &mut a.saturation)] {
         slider(ui, name, v, -100.0, 100.0, 0.0, None);
     }
-    egui::CollapsingHeader::new(RichText::new("Colour mixer").size(12.5)).id_salt("mask_mixer").show(ui, |ui| {
+    disclose(ui, "Colour mixer", "mask_mixer", |ui| {
         segmented(ui, &mut st.tab, &["Hue", "Saturation", "Luminance"]);
         for (b, name) in ["Red", "Orange", "Yellow", "Green", "Aqua", "Blue", "Purple", "Magenta"].into_iter().enumerate() {
             slider_ex(ui, name, Some(hsv(HUE_CENTERS[b], 0.7, 0.9)), &mut a.hsl[b][st.tab], -100.0, 100.0, 0.0, None);
         }
     });
-    egui::CollapsingHeader::new(RichText::new("Tone curve").size(12.5)).id_salt("mask_curve").show(ui, |ui| {
+    disclose(ui, "Tone curve", "mask_curve", |ui| {
         segmented(ui, &mut st.curve_chan, &["RGB", "Red", "Green", "Blue"]);
         curve_editor(ui, a, st.curve_chan, &mut st.curve_grab, None, &[[0.0; 128]; 3]);
         ui.label(RichText::new("Applied after the photo's own curve.").size(11.5).color(TEXT2));
     });
-    egui::CollapsingHeader::new(RichText::new("Detail").size(12.5)).id_salt("mask_detail").show(ui, |ui| {
+    disclose(ui, "Detail", "mask_detail", |ui| {
         let d = Params::default();
         let mut sharp = a.sh_amt - d.sh_amt;
         slider(ui, "Sharpness", &mut sharp, -100.0, 100.0, 0.0, None);

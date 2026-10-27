@@ -79,11 +79,7 @@ pub fn apply(plan: &[(PathBuf, PathBuf)]) -> Result<usize, String> {
     if plan.is_empty() {
         return Ok(0);
     }
-    // On Windows and macOS `img.jpg` → `IMG.jpg` names the same file: that is a rename, not a clash.
-    let same = |a: &Path, b: &Path| a == b || std::fs::canonicalize(a).ok().is_some_and(|x| std::fs::canonicalize(b).ok() == Some(x));
-    if let Some((_, to)) = plan.iter().find(|(from, to)| to.exists() && !plan.iter().any(|(f, _)| f == to) && !same(from, to)) {
-        return Err(format!("{} already exists", to.display()));
-    }
+    refuse_clash(plan)?;
     let log: Vec<(String, String)> = plan.iter().map(|(a, b)| (a.to_string_lossy().into(), b.to_string_lossy().into())).collect();
     let text = serde_json::to_string_pretty(&log).map_err(|e| e.to_string())?;
     // Every folder involved gets the whole list, so undo works from any of them.
@@ -91,6 +87,16 @@ pub fn apply(plan: &[(PathBuf, PathBuf)]) -> Result<usize, String> {
         crate::write_atomic(&dir.join(LOG), text.as_bytes()).map_err(|e| format!("could not save the undo list: {e}"))?;
     }
     move_all(plan)
+}
+
+/// Err when a move would land on a file that exists and isn't itself moving out of the way.
+fn refuse_clash(plan: &[(PathBuf, PathBuf)]) -> Result<(), String> {
+    // On Windows and macOS `img.jpg` → `IMG.jpg` names the same file: that is a rename, not a clash.
+    let same = |a: &Path, b: &Path| a == b || std::fs::canonicalize(a).ok().is_some_and(|x| std::fs::canonicalize(b).ok() == Some(x));
+    match plan.iter().find(|(from, to)| to.exists() && !plan.iter().any(|(f, _)| f == to) && !same(from, to)) {
+        Some((_, to)) => Err(format!("{} already exists", to.display())),
+        None => Ok(()),
+    }
 }
 
 fn folders<'a>(files: impl Iterator<Item = &'a Path>) -> std::collections::BTreeSet<PathBuf> {
@@ -128,6 +134,8 @@ pub fn undo(dir: &Path) -> Result<usize, String> {
     let text = std::fs::read_to_string(dir.join(LOG)).map_err(|_| "nothing to undo".to_string())?;
     let log: Vec<(String, String)> = serde_json::from_str(&text).map_err(|e| e.to_string())?;
     let back: Vec<(PathBuf, PathBuf)> = log.into_iter().rev().map(|(a, b)| (PathBuf::from(b), PathBuf::from(a))).filter(|(from, _)| from.exists()).collect();
+    // A new photo may have taken an old name since (cameras restart numbering): never rename over it.
+    refuse_clash(&back).map_err(|e| format!("{e}, so the rename can't be undone"))?;
     let n = move_all(&back)?;
     for d in folders(back.iter().map(|(_, a)| a.as_path())).into_iter().chain([dir.to_path_buf()]) {
         let _ = std::fs::remove_file(d.join(LOG));
@@ -158,6 +166,11 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dir.join("roll-001.NEF.ferrotype.json")).unwrap(), "A.NEF.ferrotype.json");
         assert_eq!(std::fs::read_to_string(dir.join("roll-002.JPG")).unwrap(), "roll-002.JPG");
         assert!(can_undo(&dir));
+        // A new photo took B.JPG's old name: undo must refuse rather than rename over it.
+        std::fs::write(dir.join("B.JPG"), "new card").unwrap();
+        assert!(undo(&dir).unwrap_err().contains("already exists"));
+        assert_eq!(std::fs::read_to_string(dir.join("B.JPG")).unwrap(), "new card");
+        std::fs::remove_file(dir.join("B.JPG")).unwrap();
         undo(&dir).unwrap();
         assert_eq!(std::fs::read_to_string(dir.join("A.xmp")).unwrap(), "A.xmp");
         assert!(!dir.join("roll-001.NEF").exists() && !can_undo(&dir));

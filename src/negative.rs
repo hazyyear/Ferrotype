@@ -190,7 +190,7 @@ impl CustomStock {
     }
 
     pub fn to_file(&self, path: &std::path::Path) -> Result<(), String> {
-        std::fs::write(path, serde_json::to_string_pretty(self).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+        crate::write_atomic(path, serde_json::to_string_pretty(self).map_err(|e| e.to_string())?.as_bytes()).map_err(|e| e.to_string())
     }
 
     /// Keep it in the profiles folder (named after the profile).
