@@ -23,7 +23,8 @@ pub const LABEL: Color32 = TEXT2;
 pub const ACCENT: Color32 = BONE;
 /// Secondary text on a bone (selected) surface.
 pub const ON_BONE: Color32 = hex(0x5A5752);
-const TRACK: Color32 = hex(0x5E5B57); // 2.5:1 against the panel; the bone tick carries the 3:1
+const TRACK: Color32 = hex(0x3A3A40); // unfilled part of a slider track; the bone thumb carries the 3:1
+const FILL: Color32 = hex(0xD9D5CE); // track between the default and the value
 
 pub const fn hex(rgb: u32) -> Color32 {
     Color32::from_rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8)
@@ -415,34 +416,38 @@ pub fn slider_ex(ui: &mut Ui, label: &str, swatch: Option<Color32>, v: &mut f32,
         let shown = if step < 1.0 && min < 0.0 { format!("{:+.2}", *v) } else if step < 1.0 { format!("{:.1}", *v) } else if max > 1000.0 { format!("{:.0} K", *v) } else if min < 0.0 { format!("{:+.0}", *v) } else { format!("{:.0}", *v) };
         let shown = if !changed && min < 0.0 && max <= 1000.0 { shown.trim_start_matches('+').to_string() } else { shown };
         let hover_value = resp.hover_pos().is_some_and(|h| value_r.contains(h));
-        if hover_value {
-            p.rect_stroke(value_r.shrink2(vec2(0.0, 4.0)), 3.0, Stroke::new(1.0, BTN_BORDER), egui::StrokeKind::Inside);
+        // A changed value is inverted (ink on bone), the kit's sign for "this one is set".
+        let font = FontId::monospace(11.0);
+        let w = ui.fonts_mut(|f| f.layout_no_wrap(shown.clone(), font.clone(), TEXT).size().x);
+        let pill = Rect::from_min_max(pos2((rect.right() - w - 10.0).max(value_r.left() - 6.0), rect.center().y - 9.0), pos2(rect.right(), rect.center().y + 9.0));
+        if changed {
+            p.rect_filled(pill, 2.0, BONE);
         }
-        p.text(pos2(rect.right() - 4.0, rect.center().y), Align2::RIGHT_CENTER, shown, FontId::monospace(11.0), if changed || hover_value { ACCENT } else { TEXT3 });
+        if hover_value {
+            p.rect_stroke(if changed { pill.expand(2.0) } else { value_r.shrink2(vec2(0.0, 4.0)) }, 3.0, Stroke::new(1.0, BTN_BORDER), egui::StrokeKind::Inside);
+        }
+        p.text(pos2(rect.right() - 5.0, rect.center().y), Align2::RIGHT_CENTER, shown, font, if changed { INK } else if hover_value { ACCENT } else { TEXT3 });
     }
 
+    // Grey (tone) gradients get the plain filled track; only colour tracks (temp, tint, HSL) keep their colour.
+    let neutral = |c: Color32| c.r().max(c.g()).max(c.b()) - c.r().min(c.g()).min(c.b()) < 24;
+    let grad = grad.filter(|g| ![min, (min + max) / 2.0, max].iter().all(|&x| neutral(g(x))));
     match grad {
         Some(g) => paint_gradient_track(ui, track, min, max, g),
         None => {
-            let thin = Rect::from_center_size(track.center(), vec2(track.width(), 2.0));
-            p.rect_filled(thin, 1.0, TRACK);
-            let (a, b) = (thin.left() + thin.width() * frac(default.clamp(min, max)), thin.left() + thin.width() * frac(*v));
+            // 4 px rounded track, filled in bone from the default to the value.
+            p.rect_filled(track, 2.0, TRACK);
+            let (a, b) = (track.left() + track.width() * frac(default.clamp(min, max)), track.left() + track.width() * frac(*v));
             if changed {
-                p.rect_filled(Rect::from_x_y_ranges(a.min(b)..=a.max(b), thin.y_range()), 1.0, ACCENT.gamma_multiply(0.85));
-            }
-            // Tick at the default when it is not an end.
-            if default > min && default < max {
-                p.vline(a, (thin.center().y - 3.0)..=(thin.center().y + 3.0), Stroke::new(1.0, TEXT3));
+                p.rect_filled(Rect::from_x_y_ranges(a.min(b)..=a.max(b), track.y_range()), 2.0, FILL);
+            } else if default > min && default < max {
+                // Tick at the default when it is not an end.
+                p.vline(a, (track.center().y - 4.0)..=(track.center().y + 4.0), Stroke::new(1.0, TEXT3));
             }
         }
     }
     let knob = pos2(track.left() + track.width() * frac(*v), track.center().y);
-    // Flat bone tick, as in the brand UI; an ink outline keeps it visible on colour tracks.
-    let knob_r = Rect::from_center_size(knob, if active { vec2(4.0, 16.0) } else { vec2(3.0, 13.0) });
-    if grad.is_some() {
-        p.rect_filled(knob_r.expand(1.5), 1.5, INK);
-    }
-    p.rect_filled(knob_r, 1.0, BONE);
+    paint_thumb(&p, knob, resp.dragged(), active);
 
     if resp.has_focus() {
         p.rect_stroke(rect.expand(1.0), 4.0, Stroke::new(1.5, ACCENT), egui::StrokeKind::Outside);
@@ -457,6 +462,14 @@ pub fn slider_ex(ui: &mut Ui, label: &str, swatch: Option<Color32>, v: &mut f32,
         resp.on_hover_text(label);
     }
     *v != before
+}
+
+/// Round bone thumb with a panel-coloured ring, so it reads on the bone fill and on colour tracks.
+/// 12 px at rest, 14 px on hover, 16 px while dragging.
+fn paint_thumb(p: &egui::Painter, c: egui::Pos2, dragging: bool, hovered: bool) {
+    let r = if dragging { 8.0 } else if hovered { 7.0 } else { 6.0 };
+    p.circle_filled(c, r, if dragging { INK } else { PANEL });
+    p.circle_filled(c, r - 2.0, BONE);
 }
 
 fn label_overflows(ui: &Ui, label: &str, indent: f32) -> bool {
@@ -477,12 +490,12 @@ pub fn plain_slider(ui: &mut Ui, v: &mut f32, min: f32, max: f32, width: f32) ->
     {
         *v = min + ((p.x - rect.left()) / rect.width()).clamp(0.0, 1.0) * (max - min);
     }
-    let thin = Rect::from_center_size(rect.center(), vec2(rect.width(), 2.0));
+    let track = Rect::from_center_size(rect.center(), vec2(rect.width() - 16.0, 4.0));
     let p = ui.painter();
-    p.rect_filled(thin, 1.0, TRACK);
-    let x = thin.left() + thin.width() * ((*v - min) / (max - min)).clamp(0.0, 1.0);
-    let active = resp.hovered() || resp.dragged();
-    p.rect_filled(Rect::from_center_size(pos2(x, thin.center().y), if active { vec2(4.0, 16.0) } else { vec2(3.0, 13.0) }), 1.0, BONE);
+    p.rect_filled(track, 2.0, TRACK);
+    let x = track.left() + track.width() * ((*v - min) / (max - min)).clamp(0.0, 1.0);
+    p.rect_filled(Rect::from_x_y_ranges(track.left()..=x, track.y_range()), 2.0, FILL);
+    paint_thumb(p, pos2(x, track.center().y), resp.dragged(), resp.hovered());
     resp.on_hover_cursor(egui::CursorIcon::ResizeHorizontal)
 }
 
