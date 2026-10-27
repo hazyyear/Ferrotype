@@ -19,6 +19,12 @@ const PREVIEW: u32 = 1400;
 /// Smaller copy rendered while a slider is being dragged, so dragging stays smooth (about 4× faster).
 const DRAFT: u32 = 700;
 const THUMB: u32 = 320;
+/// Thumbnail textures kept in memory (about 270 KB each); the grid only shows a few dozen at a time.
+const THUMB_KEEP: usize = 600;
+/// Undo steps kept per photo.
+const HISTORY_MAX: usize = 200;
+/// The thumbnail cache on disk is trimmed to this at start-up (about 50,000 thumbnails).
+const THUMB_CACHE_MAX: u64 = 1 << 30;
 
 #[derive(PartialEq, Clone, Copy)]
 enum Module {
@@ -154,7 +160,8 @@ enum View {
 }
 
 enum Msg {
-    Thumb(usize, PathBuf, ColorImage), // folder generation, so thumbs of a folder you left are dropped
+    /// Folder generation (so thumbs of a folder you left are dropped), photo, picture, and its sidecar summary.
+    Thumb(usize, PathBuf, ColorImage, Option<Meta>),
     Loaded(PathBuf, Result<Box<Opened>, String>),
     /// A preview render finished on the render thread.
     Rendered(Box<RenderOut>),
@@ -228,7 +235,15 @@ pub struct App {
     module: Module,
     folder: Option<PathBuf>,
     files: Vec<PathBuf>,
+    /// Thumbnail textures, at most THUMB_KEEP; the rest are reloaded from the disk cache when they come into view.
     thumbs: std::collections::HashMap<PathBuf, TextureHandle>,
+    /// When each thumbnail was last drawn (frame number), and the ones wanted but not loaded.
+    thumb_used: std::cell::RefCell<std::collections::HashMap<PathBuf, u64>>,
+    thumb_want: std::cell::RefCell<Vec<PathBuf>>,
+    thumb_pending: std::collections::HashSet<PathBuf>,
+    /// Photos whose thumbnail was made at least once in this folder (for the progress bar).
+    thumb_ready: std::collections::HashSet<PathBuf>,
+    frame: u64,
     thumb_gen: Arc<std::sync::atomic::AtomicUsize>,
     /// Edited / film scan / rating / flag of each photo with a sidecar. Read once per folder, not every frame.
     meta: std::collections::HashMap<PathBuf, Meta>,
@@ -339,6 +354,11 @@ pub fn run(start: Option<PathBuf>) -> eframe::Result {
         ..Default::default()
     };
     crate::gpu::warm_up();
+    std::thread::spawn(|| {
+        if let Some(d) = crate::keys::dirs_cache() {
+            crate::keys::trim_cache(&d.join("thumbs"), THUMB_CACHE_MAX);
+        }
+    });
     eframe::run_native("Ferrotype", opts, Box::new(move |cc| {
         install_style(&cc.egui_ctx);
         let mut app = App::new();
@@ -359,9 +379,7 @@ fn app_icon() -> std::sync::Arc<egui::IconData> {
 }
 
 fn user_preset_dir() -> Option<PathBuf> {
-    let base = std::env::var_os("APPDATA").or_else(|| std::env::var_os("XDG_CONFIG_HOME")).map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("ferrotype").join("presets"))
+    Some(crate::keys::dirs_config()?.join("presets"))
 }
 
 fn builtin_presets() -> Vec<(String, Params)> {
@@ -453,12 +471,7 @@ fn thumb_cache(f: &Path) -> Option<PathBuf> {
     let modified = |p: &Path| std::fs::metadata(p).ok().and_then(|m| m.modified().ok());
     let key = format!("{}|{:?}|{:?}", f.display(), modified(load::copy_of(f).as_deref().unwrap_or(f)), modified(&crate::sidecar(f)));
     let h: String = Sha256::digest(key.as_bytes()).iter().take(12).map(|b| format!("{b:02x}")).collect();
-    let base = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from).or_else(|| {
-        if cfg!(windows) { std::env::var_os("LOCALAPPDATA").map(PathBuf::from) }
-        else if cfg!(target_os = "macos") { std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Caches")) }
-        else { std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")) }
-    })?;
-    Some(base.join("ferrotype").join("thumbs").join(format!("{h}.jpg")))
+    Some(crate::keys::dirs_cache()?.join("thumbs").join(format!("{h}.jpg")))
 }
 
 /// Where the picture is sharp: the strongest edges (Laplacian of luma), marked green on a transparent layer.
@@ -556,7 +569,7 @@ impl App {
             presets.extend(user);
         }
         Self {
-            module: Module::Library, folder: None, files: vec![], thumbs: Default::default(), thumb_gen: Default::default(), meta: Default::default(), lib_rating: 0,
+            module: Module::Library, folder: None, files: vec![], thumbs: Default::default(), thumb_used: Default::default(), thumb_want: Default::default(), thumb_pending: Default::default(), thumb_ready: Default::default(), frame: 0, thumb_gen: Default::default(), meta: Default::default(), lib_rating: 0,
             subdirs: vec![], tex_scale: 1.0, thumb_size: 190.0, lib_sel: None, lib_query: String::new(),
             lib_filter: [true, true, true, true, false], current: None, photo: None, loading: false, params: Params::default(), prev_params: None,
             rendered: None, render_busy: false, photo_gen: 0, tex: None, before_tex: None, last_rgb: None, hover_rgb: None, shown_w: 0.0, bins: [[0.0; 128]; 3], clip_view: false,
@@ -588,10 +601,14 @@ impl App {
         files.sort();
         self.subdirs = entries.into_iter().filter(|p| p.is_dir() && !p.file_name().unwrap_or_default().to_string_lossy().starts_with('.')).collect();
         self.subdirs.sort();
-        self.meta = files.iter().filter_map(|f| Some((f.clone(), Meta::of(&read_params(f)?)))).collect();
+        // Ratings and edit marks arrive with each thumbnail: reading every sidecar here froze the window on cloud folders.
+        self.meta.clear();
         self.folder = Some(dir);
         self.files = files.clone();
         self.thumbs.clear();
+        self.thumb_used.borrow_mut().clear();
+        self.thumb_pending.clear();
+        self.thumb_ready.clear();
         self.lib_sel = files.first().cloned();
         use std::sync::atomic::Ordering::Relaxed;
         let gen_now = self.thumb_gen.fetch_add(1, Relaxed) + 1;
@@ -610,13 +627,15 @@ impl App {
                 if gen_.load(Relaxed) != gen_now {
                     return; // another folder was opened: stop decoding this one
                 }
+                let params = read_params(f);
+                let meta = params.as_ref().map(Meta::of);
                 let cached = thumb_cache(f).and_then(|c| image::open(c).ok()).map(|i| {
                     let i = i.to_rgb8();
                     ColorImage::from_rgb([i.width() as usize, i.height() as usize], i.as_raw())
                 });
                 let made = cached.or_else(|| {
                     let img = load::load_quick(f, THUMB).ok()?;
-                    let p = read_params(f).unwrap_or_default();
+                    let p = params.clone().unwrap_or_default();
                     let ci = to_color_image(&develop::render(&img, &p, 0.05));
                     if let Some(c) = thumb_cache(f) {
                         let _ = std::fs::create_dir_all(c.parent().unwrap());
@@ -625,10 +644,9 @@ impl App {
                     }
                     Some(ci)
                 });
-                if let Some(ci) = made {
-                    let _ = tx.send(Msg::Thumb(gen_now, f.clone(), ci));
-                    ctx2.request_repaint();
-                }
+                // Sent even without a picture, so the rating still arrives.
+                let _ = tx.send(Msg::Thumb(gen_now, f.clone(), made.unwrap_or_default(), meta));
+                ctx2.request_repaint();
             });
         });
     }
@@ -740,13 +758,53 @@ impl App {
         }
     }
 
+    /// The thumbnail texture for `f`, if loaded; otherwise asks for it. Marks it as in use.
+    fn thumb(&self, f: &Path) -> Option<&TextureHandle> {
+        let t = self.thumbs.get(f);
+        if t.is_some() {
+            self.thumb_used.borrow_mut().insert(f.to_path_buf(), self.frame);
+        } else if self.thumb_ready.contains(f) {
+            self.thumb_want.borrow_mut().push(f.to_path_buf());
+        }
+        t
+    }
+
+    /// Keep at most THUMB_KEEP textures (dropping the longest unseen), and reload the evicted ones that came back into view.
+    fn manage_thumbs(&mut self, ctx: &egui::Context) {
+        self.frame += 1;
+        if self.thumbs.len() > THUMB_KEEP {
+            let mut used = self.thumb_used.borrow_mut();
+            let mut by_age: Vec<(u64, PathBuf)> = self.thumbs.keys().map(|k| (used.get(k).copied().unwrap_or(0), k.clone())).collect();
+            by_age.sort();
+            for (_, k) in by_age.into_iter().take(self.thumbs.len() - THUMB_KEEP * 3 / 4) {
+                self.thumbs.remove(&k);
+                used.remove(&k);
+            }
+        }
+        let want: Vec<PathBuf> = std::mem::take(&mut *self.thumb_want.borrow_mut()).into_iter()
+            .filter(|f| !self.thumbs.contains_key(f) && self.thumb_pending.insert(f.clone())).collect();
+        if !want.is_empty() {
+            self.spawn_thumbs(ctx, want, self.thumb_gen.load(std::sync::atomic::Ordering::Relaxed));
+        }
+    }
+
     fn poll(&mut self, ctx: &egui::Context) {
+        self.manage_thumbs(ctx);
         while let Ok(m) = self.rx.try_recv() {
             match m {
-                Msg::Thumb(g, p, img) => {
+                Msg::Thumb(g, p, img, meta) => {
                     if g == self.thumb_gen.load(std::sync::atomic::Ordering::Relaxed) {
-                        let t = ctx.load_texture(p.display().to_string(), img, TextureOptions::LINEAR);
-                        self.thumbs.insert(p, t);
+                        self.thumb_pending.remove(&p);
+                        // An edit made while this was in flight is newer: keep it.
+                        if let Some(m) = meta {
+                            self.meta.entry(p.clone()).or_insert(m);
+                        }
+                        if img.size[0] > 0 {
+                            let t = ctx.load_texture(p.display().to_string(), img, TextureOptions::LINEAR);
+                            self.thumbs.insert(p.clone(), t);
+                            self.thumb_used.borrow_mut().entry(p.clone()).or_insert(self.frame);
+                            self.thumb_ready.insert(p);
+                        }
                     }
                 }
                 Msg::Loaded(p, r) if Some(&p) == self.current.as_ref() => {
@@ -875,6 +933,10 @@ impl App {
         }
         self.history.truncate(self.hist_pos + 1);
         self.history.push(self.params.clone());
+        // Each step is a full copy (brush masks included), so keep the most recent ones only.
+        if self.history.len() > HISTORY_MAX {
+            self.history.remove(0);
+        }
         self.hist_pos = self.history.len() - 1;
         self.save();
     }
@@ -1042,6 +1104,7 @@ impl App {
         self.files.insert(at, copy.clone());
         if let Some(t) = self.thumbs.get(f).cloned() {
             self.thumbs.insert(copy.clone(), t);
+            self.thumb_ready.insert(copy.clone());
         }
         Some(copy)
     }
@@ -1050,6 +1113,12 @@ impl App {
     fn remove_copy(&mut self, f: &Path) {
         if load::copy_of(f).is_none() {
             return;
+        }
+        // If it is open, close it first, or the next edit would write its settings file back.
+        if self.current.as_deref() == Some(f) {
+            self.current = None;
+            self.photo = None;
+            self.module = Module::Library;
         }
         let _ = std::fs::remove_file(crate::sidecar(f));
         self.files.retain(|x| x != f);
@@ -2034,7 +2103,7 @@ impl App {
             ui.horizontal_centered(|ui| {
                 for f in &self.files {
                     let size = vec2(93.0, 62.0);
-                    let r = match self.thumbs.get(f) {
+                    let r = match self.thumb(f) {
                         Some(t) => ui.add(egui::Image::new(t).uv(cover_uv(t, 1.5)).fit_to_exact_size(size).maintain_aspect_ratio(false).corner_radius(3).sense(Sense::click())),
                         None => {
                             let (r, resp) = ui.allocate_exact_size(size, Sense::click());
@@ -2338,12 +2407,12 @@ impl App {
             toggle(ui, "Give it these settings", &mut self.watch_apply, "New frames get the open photo's look and film conversion (handy when scanning a roll)");
         }
         ui.add_space((ui.available_height() - 62.0).max(18.0));
-            let loaded = self.thumbs.len() as f32 / self.files.len().max(1) as f32;
+            let loaded = self.thumb_ready.len() as f32 / self.files.len().max(1) as f32;
         egui::Frame::new().fill(CARD).corner_radius(8).inner_margin(10.0).show(ui, |ui| ui.vertical(|ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Previews").size(12.0).color(TEXT2));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.label(RichText::new(format!("{}/{}", self.thumbs.len(), self.files.len())).monospace().color(TEXT2)));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.label(RichText::new(format!("{}/{}", self.thumb_ready.len(), self.files.len())).monospace().color(TEXT2)));
             });
             let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 4.0), Sense::hover());
             ui.painter().rect_filled(r, 2.0, BTN_BORDER);
@@ -2417,7 +2486,7 @@ impl App {
                         ui.allocate_ui_with_layout(vec2(cell, cell / 1.5 + 26.0), Layout::top_down(Align::LEFT), |ui| {
                             ui.spacing_mut().item_spacing.y = 6.0;
                             let size = vec2(cell, cell / 1.5);
-                            let resp = match self.thumbs.get(f) {
+                            let resp = match self.thumb(f) {
                                 Some(t) => ui.add(egui::Image::new(t).uv(cover_uv(t, 1.5)).fit_to_exact_size(size).maintain_aspect_ratio(false).corner_radius(6).sense(Sense::click())),
                                 None => {
                                     let (r, resp) = ui.allocate_exact_size(size, Sense::click());
@@ -2609,7 +2678,7 @@ impl App {
             return;
         };
         let w = ui.available_width();
-        match self.thumbs.get(&f) {
+        match self.thumb(&f) {
             Some(t) => {
                 ui.add(egui::Image::new(t).uv(cover_uv(t, 1.5)).fit_to_exact_size(vec2(w, w / 1.5)).maintain_aspect_ratio(false).corner_radius(6));
             }

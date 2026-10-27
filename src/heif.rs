@@ -64,6 +64,15 @@ macro_rules! sym {
 
 /// The primary image, decoded to linear light (with libheif's rotation and mirroring applied), and its EXIF block.
 pub fn load(path: &Path) -> Result<(Rgb32FImage, Option<Vec<u8>>), String> {
+    read_file(path, true).map(|(img, exif)| (img.unwrap(), exif))
+}
+
+/// Only the EXIF block, without decoding the picture.
+pub fn exif(path: &Path) -> Option<Vec<u8>> {
+    read_file(path, false).ok()?.1
+}
+
+fn read_file(path: &Path, pixels: bool) -> Result<(Option<Rgb32FImage>, Option<Vec<u8>>), String> {
     let l = lib()?;
     let alloc = sym!(l, "heif_context_alloc", unsafe extern "C" fn() -> *mut c_void);
     let free = sym!(l, "heif_context_free", unsafe extern "C" fn(*mut c_void));
@@ -96,6 +105,18 @@ pub fn load(path: &Path) -> Result<(Rgb32FImage, Option<Vec<u8>>), String> {
                 format!("{e}: libheif is missing its decoder for this file (HEIC needs libde265, e.g. the libheif-plugin-libde265 package)")
             } else { e };
             let out = (|| {
+                // EXIF: a 4-byte offset to the TIFF header, then the TIFF structure.
+                let exif_type = c"Exif";
+                let mut id = 0u32;
+                let exif = (meta_ids(h, exif_type.as_ptr(), &mut id, 1) == 1).then(|| {
+                    let mut buf = vec![0u8; meta_size(h, id)];
+                    check(meta(h, id, buf.as_mut_ptr() as *mut c_void)).ok()?;
+                    let off = u32::from_be_bytes(buf.get(..4)?.try_into().ok()?) as usize;
+                    buf.get(4 + off..).map(|b| b.to_vec())
+                }).flatten();
+                if !pixels {
+                    return Ok((None, exif));
+                }
                 let deep = luma_bits(h) > 8;
                 let mut img = std::ptr::null_mut();
                 check(decode(h, &mut img, COLORSPACE_RGB, if deep { CHROMA_RRGGBB_LE } else { CHROMA_RGB }, std::ptr::null())).map_err(hint)?;
@@ -118,16 +139,7 @@ pub fn load(path: &Path) -> Result<(Rgb32FImage, Option<Vec<u8>>), String> {
                     }
                 }
                 release_image(img);
-                // EXIF: a 4-byte offset to the TIFF header, then the TIFF structure.
-                let exif_type = c"Exif";
-                let mut id = 0u32;
-                let exif = (meta_ids(h, exif_type.as_ptr(), &mut id, 1) == 1).then(|| {
-                    let mut buf = vec![0u8; meta_size(h, id)];
-                    check(meta(h, id, buf.as_mut_ptr() as *mut c_void)).ok()?;
-                    let off = u32::from_be_bytes(buf.get(..4)?.try_into().ok()?) as usize;
-                    buf.get(4 + off..).map(|b| b.to_vec())
-                }).flatten();
-                Ok((out, exif))
+                Ok((Some(out), exif))
             })();
             release_handle(h);
             out

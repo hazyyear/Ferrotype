@@ -79,13 +79,22 @@ pub fn apply(plan: &[(PathBuf, PathBuf)]) -> Result<usize, String> {
     if plan.is_empty() {
         return Ok(0);
     }
-    if let Some((_, to)) = plan.iter().find(|(from, to)| to.exists() && !plan.iter().any(|(f, _)| f == to) && from != to) {
+    // On Windows and macOS `img.jpg` → `IMG.jpg` names the same file: that is a rename, not a clash.
+    let same = |a: &Path, b: &Path| a == b || std::fs::canonicalize(a).ok().is_some_and(|x| std::fs::canonicalize(b).ok() == Some(x));
+    if let Some((_, to)) = plan.iter().find(|(from, to)| to.exists() && !plan.iter().any(|(f, _)| f == to) && !same(from, to)) {
         return Err(format!("{} already exists", to.display()));
     }
-    let dir = plan[0].0.parent().unwrap_or(Path::new(".")).to_path_buf();
     let log: Vec<(String, String)> = plan.iter().map(|(a, b)| (a.to_string_lossy().into(), b.to_string_lossy().into())).collect();
-    std::fs::write(dir.join(LOG), serde_json::to_string_pretty(&log).map_err(|e| e.to_string())?).map_err(|e| format!("could not save the undo list: {e}"))?;
+    let text = serde_json::to_string_pretty(&log).map_err(|e| e.to_string())?;
+    // Every folder involved gets the whole list, so undo works from any of them.
+    for dir in folders(plan.iter().map(|(a, _)| a.as_path())) {
+        crate::write_atomic(&dir.join(LOG), text.as_bytes()).map_err(|e| format!("could not save the undo list: {e}"))?;
+    }
     move_all(plan)
+}
+
+fn folders<'a>(files: impl Iterator<Item = &'a Path>) -> std::collections::BTreeSet<PathBuf> {
+    files.map(|f| f.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")).to_path_buf()).collect()
 }
 
 fn move_all(plan: &[(PathBuf, PathBuf)]) -> Result<usize, String> {
@@ -120,7 +129,9 @@ pub fn undo(dir: &Path) -> Result<usize, String> {
     let log: Vec<(String, String)> = serde_json::from_str(&text).map_err(|e| e.to_string())?;
     let back: Vec<(PathBuf, PathBuf)> = log.into_iter().rev().map(|(a, b)| (PathBuf::from(b), PathBuf::from(a))).filter(|(from, _)| from.exists()).collect();
     let n = move_all(&back)?;
-    let _ = std::fs::remove_file(dir.join(LOG));
+    for d in folders(back.iter().map(|(_, a)| a.as_path())).into_iter().chain([dir.to_path_buf()]) {
+        let _ = std::fs::remove_file(d.join(LOG));
+    }
     Ok(n)
 }
 
@@ -151,5 +162,23 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dir.join("A.xmp")).unwrap(), "A.xmp");
         assert!(!dir.join("roll-001.NEF").exists() && !can_undo(&dir));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn undo_works_from_either_folder() {
+        let root = std::env::temp_dir().join(format!("ferrotype-rename2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (a, b) = (root.join("a"), root.join("b"));
+        for d in [&a, &b] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(a.join("x.jpg"), "x").unwrap();
+        std::fs::write(b.join("y.jpg"), "y").unwrap();
+        apply(&[(a.join("x.jpg"), a.join("x1.jpg")), (b.join("y.jpg"), b.join("y1.jpg"))]).unwrap();
+        assert!(can_undo(&a) && can_undo(&b));
+        assert_eq!(undo(&b).unwrap(), 2);
+        assert!(a.join("x.jpg").exists() && b.join("y.jpg").exists());
+        assert!(!can_undo(&a) && !can_undo(&b));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

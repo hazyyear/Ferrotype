@@ -73,10 +73,29 @@ fn download(url: &str, dest: &Path, sha256: Option<&str>, progress: &dyn Fn(u64,
     // The system's certificates, so downloads also work behind company proxies.
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .tls_config(ureq::tls::TlsConfig::builder().root_certs(ureq::tls::RootCerts::PlatformVerifier).build())
+        .max_redirects(0)
         .build()
         .into();
-    let resp = agent.get(url).call().map_err(|e| format!("download failed: {e}"))?;
-    let total = resp.headers().get("content-length").and_then(|v| v.to_str().ok()?.parse().ok()).unwrap_or(0);
+    // Redirects by hand: Hugging Face names the SHA-256 of a large (LFS) file only on its first reply, in
+    // `x-linked-etag`. The URL is pinned to a commit, so that hash can't change under us.
+    let (mut url, mut linked) = (url.to_string(), None);
+    let mut hops = 0;
+    let resp = loop {
+        let resp = agent.get(&url).call().map_err(|e| format!("download failed: {e}"))?;
+        let header = |k: &str| resp.headers().get(k).and_then(|v| v.to_str().ok()).map(|v| v.trim_matches('"').to_string());
+        linked = linked.or_else(|| header("x-linked-etag").filter(|e| e.len() == 64 && e.bytes().all(|b| b.is_ascii_hexdigit())));
+        if !resp.status().is_redirection() {
+            break resp;
+        }
+        let to = header("location").ok_or("download failed: redirect without a location")?;
+        url = if to.starts_with('/') { format!("{}{to}", url.split('/').take(3).collect::<Vec<_>>().join("/")) } else { to };
+        hops += 1;
+        if hops > 5 {
+            return Err("download failed: too many redirects".into());
+        }
+    };
+    let sha256 = sha256.map(str::to_string).or(linked);
+    let total: u64 = resp.headers().get("content-length").and_then(|v| v.to_str().ok()?.parse().ok()).unwrap_or(0);
     let mut body = resp.into_body().into_reader();
     let tmp = dest.with_extension("part");
     let mut f = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
@@ -92,9 +111,13 @@ fn download(url: &str, dest: &Path, sha256: Option<&str>, progress: &dyn Fn(u64,
         progress(got, total);
     }
     drop(f);
+    if total > 0 && got != total {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("download was cut off ({got} of {total} bytes)"));
+    }
     if let Some(want) = sha256 {
         let have: String = hash.finalize().iter().map(|b| format!("{b:02x}")).collect();
-        if have != want {
+        if have != want.to_ascii_lowercase() {
             let _ = std::fs::remove_file(&tmp);
             return Err("download was corrupted (checksum mismatch)".into());
         }
@@ -233,16 +256,22 @@ pub fn apply_delta(img: &Rgb32FImage, delta: &[f32], amount: f32) -> Rgb32FImage
     out
 }
 
-/// Cached result for a photo, so the slow part runs once: `<cache>/denoise/<hash>.bin` (f32 little-endian deltas).
+/// Cached result for a photo, so the slow part runs once: `<user cache>/ferrotype/denoise/<hash>.bin` (f32 little-endian deltas).
 fn cache_file(path: &Path) -> Option<PathBuf> {
     let m = std::fs::metadata(crate::load::copy_of(path).as_deref().unwrap_or(path)).ok()?;
     let key = format!("{}|{}|{:?}", std::fs::canonicalize(path).unwrap_or(path.into()).display(), m.len(), m.modified().ok());
     let h: String = Sha256::digest(key.as_bytes()).iter().take(12).map(|b| format!("{b:02x}")).collect();
-    Some(dir()?.join("cache").join(format!("{h}.bin")))
+    Some(crate::keys::dirs_cache()?.join("denoise").join(format!("{h}.bin")))
 }
 
+/// About 10 photos at 24 MP; the oldest results go first.
+const CACHE_MAX: u64 = 3 << 30;
+
 pub fn cached_delta(path: &Path, len: usize) -> Option<Vec<f32>> {
-    let bytes = std::fs::read(cache_file(path)?).ok()?;
+    let f = cache_file(path)?;
+    let bytes = std::fs::read(&f).ok()?;
+    // Mark it as recently used, so trimming the cache keeps it.
+    let _ = std::fs::File::options().append(true).open(&f).and_then(|h| h.set_modified(std::time::SystemTime::now()));
     (bytes.len() == len * 4).then(|| bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect())
 }
 
@@ -250,7 +279,12 @@ pub fn store_delta(path: &Path, delta: &[f32]) {
     if let Some(f) = cache_file(path) {
         let _ = std::fs::create_dir_all(f.parent().unwrap());
         let bytes: Vec<u8> = delta.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let _ = std::fs::write(f, bytes);
+        let _ = crate::write_atomic(&f, &bytes);
+        crate::keys::trim_cache(f.parent().unwrap(), CACHE_MAX);
+        // Older builds kept an unbounded cache inside the AI folder.
+        if let Some(old) = dir().map(|d| d.join("cache")) {
+            let _ = std::fs::remove_dir_all(old);
+        }
     }
 }
 

@@ -148,7 +148,7 @@ pub fn file_name(pattern: &str, path: &Path, n: usize, roll: &str, p: &Params, s
     // Date taken from EXIF; the file's date when the photo has none.
     let taken: Vec<&str> = shot.taken.split([':', ' ', 'T', '-']).collect();
     let exif_date = (taken.len() >= 6 && taken[0].len() == 4).then(|| format!("{}-{}-{}", taken[0], taken[1], taken[2]));
-    let time = if taken.len() >= 6 { format!("{}{}{}", taken[3], taken[4], &taken[5][..taken[5].len().min(2)]) } else { String::new() };
+    let time = if taken.len() >= 6 { format!("{}{}{}", taken[3], taken[4], taken[5].chars().take(2).collect::<String>()) } else { String::new() };
     let date = exif_date.unwrap_or_else(|| file_date(path));
     let num = |v: f32, pre: &str, post: &str| if v > 0.0 { format!("{pre}{}{post}", (v * 10.0).round() / 10.0) } else { String::new() };
     let shutter = if shot.shutter <= 0.0 { String::new() } else if shot.shutter < 0.5 { format!("1-{}s", (1.0 / shot.shutter).round()) } else { format!("{}s", (shot.shutter * 10.0).round() / 10.0) };
@@ -272,6 +272,9 @@ mod tests {
         assert_eq!(n, "Roll 12 - 007 - Kodak Portra 400");
         assert_eq!(file_name("", Path::new("/x/IMG_1.NEF"), 1, "", &p, &shot), "IMG_1");
         assert_eq!(file_name("{camera}/{name}", Path::new("/x/a.jpg"), 1, "", &Params::default(), &shot), "Nikon F3-a");
+        // A broken byte in the EXIF date became a 3-byte replacement character, and cutting it panicked.
+        let odd = Shot { taken: "2024:05:06 12:34:\u{FFFD}7".into(), ..Default::default() };
+        assert_eq!(file_name("{time}", Path::new("/x/a.jpg"), 1, "", &Params::default(), &odd), "1234-7");
     }
 
     #[test]
