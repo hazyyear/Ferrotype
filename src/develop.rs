@@ -723,11 +723,11 @@ pub fn rgb_to_hsv(c: [f32; 3]) -> (f32, f32, f32) {
     (h, if mx <= 1e-6 { 0.0 } else { d / mx }, mx)
 }
 
-/// Weight of `hue` in color-mixer band `i` (triangular between neighbouring centers).
+/// Weight of `hue` in color-mixer band `i` (triangular between neighbouring centers). The reference for
+/// `band_pair` and the GPU shader.
+#[cfg(test)]
 fn band_weight(hue: f32, i: usize) -> f32 {
     let c = HUE_CENTERS[i];
-    let prev = HUE_CENTERS[(i + 7) % 8];
-    let next = HUE_CENTERS[(i + 1) % 8];
     // hue and the centres are in 0..360, so one wrap brings the difference into -180..180.
     let mut d = hue - c;
     if d > 180.0 {
@@ -735,9 +735,30 @@ fn band_weight(hue: f32, i: usize) -> f32 {
     } else if d < -180.0 {
         d += 360.0;
     }
-    let span = if d < 0.0 { (c - prev).rem_euclid(360.0) } else { (next - c).rem_euclid(360.0) };
+    let span = if d < 0.0 { BAND_SPAN[i].0 } else { BAND_SPAN[i].1 };
     (1.0 - d.abs() / span).max(0.0)
 }
+
+/// The two mixer bands a hue lies between, and how far it is towards the second: the same weights as
+/// `band_weight` over all 8 bands (only two are ever non-zero), at a fraction of the work per pixel.
+fn band_pair(hue: f32) -> (usize, usize, f32) {
+    let a = HUE_CENTERS.iter().rposition(|c| *c <= hue).unwrap_or(0); // hue ≥ 0 = the first centre
+    let t = ((hue - HUE_CENTERS[a]) / BAND_SPAN[a].1).clamp(0.0, 1.0);
+    (a, (a + 1) % 8, t)
+}
+
+/// Each band's distance to the centre below and above it. Worked out once: `rem_euclid` is a libm call, and the
+/// mixer asks for 8 bands a pixel.
+const BAND_SPAN: [(f32, f32); 8] = {
+    let mut s = [(0.0, 0.0); 8];
+    let mut i = 0;
+    while i < 8 {
+        let (c, prev, next) = (HUE_CENTERS[i], HUE_CENTERS[(i + 7) % 8], HUE_CENTERS[(i + 1) % 8]);
+        s[i] = (if c > prev { c - prev } else { c - prev + 360.0 }, if next > c { next - c } else { next - c + 360.0 });
+        i += 1;
+    }
+    s
+};
 
 /// Rotate a colour around the grey axis by `deg` degrees (Rodrigues).
 pub fn hue_rotate(c: [f32; 3], deg: f32) -> [f32; 3] {
@@ -1441,15 +1462,8 @@ fn finish(mut img: Rgb32FImage, p: &Params, scale: f32, full: (u32, u32), off: (
             }
             if mixer_on {
                 let (hh, s, v) = rgb_to_hsv(e);
-                let (mut dh, mut ds, mut dl) = (0.0, 0.0, 0.0);
-                for b in 0..8 {
-                    let wgt = band_weight(hh, b);
-                    if wgt > 0.0 {
-                        dh += wgt * p.hsl[b][0];
-                        ds += wgt * p.hsl[b][1];
-                        dl += wgt * p.hsl[b][2];
-                    }
-                }
+                let (a, b, t) = band_pair(hh);
+                let [dh, ds, dl] = [0, 1, 2].map(|k| p.hsl[a][k] * (1.0 - t) + p.hsl[b][k] * t);
                 e = hsv_to_rgb(hh + dh * 0.3, (s * (1.0 + ds / 100.0)).clamp(0.0, 1.0), (v * (1.0 + dl / 100.0 * 0.4 * s)).max(0.0));
             }
             if grade_on {
@@ -1694,6 +1708,19 @@ pub fn auto_tone(src: &Rgb32FImage, p: &Params) -> Params {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn band_pair_matches_band_weight() {
+        for k in 0..36000 {
+            let h = k as f32 * 0.01;
+            let (a, b, t) = band_pair(h);
+            for i in 0..8 {
+                let want = band_weight(h, i);
+                let got = if i == a { 1.0 - t } else if i == b { t } else { 0.0 };
+                assert!((want - got).abs() < 1e-4, "hue {h} band {i}: {want} vs {got}");
+            }
+        }
+    }
 
     #[test]
     fn default_params_keep_mid_grey() {
@@ -2022,6 +2049,30 @@ mod bench {
             p.hsl[0] = [10.0, 10.0, 0.0]; p.grade[0] = [200.0, 20.0, 0.0];
             let sc = prev.width() as f32 / full.width() as f32;
             for _ in 0..30 { t("render 1400 heavy", || render(&prev, &p, sc)); }
+            return;
+        }
+        if std::env::var("BENCH_STAGES").is_ok() {
+            let full = crate::load::load(std::path::Path::new(&path)).unwrap();
+            let prev = crate::load::fit(&full, 1400);
+            let sc = prev.width() as f32 / full.width() as f32;
+            let mut p = Params::default();
+            p.exposure = 0.5; p.contrast = 20.0; p.highlights = -40.0; p.shadows = 30.0; p.texture = 20.0; p.clarity = 30.0; p.dehaze = 15.0;
+            p.vibrance = 20.0; p.sh_amt = 60.0; p.nr_lum = 30.0; p.nr_col = 25.0; p.gr_amt = 30.0; p.hal_amt = 30.0; p.vig = -20.0; p.t_rot = 2.0;
+            p.hsl[0] = [10.0, 10.0, 0.0]; p.grade[0] = [200.0, 20.0, 0.0];
+            let v = |name: &str, f: &dyn Fn(&mut Params)| { let mut q = p.clone(); f(&mut q); render(&prev, &q, sc); let s = Instant::now(); for _ in 0..5 { render(&prev, &q, sc); } eprintln!("{name:<20} {:>7.1} ms", s.elapsed().as_secs_f64() * 200.0); };
+            v("heavy", &|_| {});
+            v("no clarity/tex", &|q| { q.clarity = 0.0; q.texture = 0.0; });
+            v("no dehaze", &|q| q.dehaze = 0.0);
+            v("no halation", &|q| q.hal_amt = 0.0);
+            v("no NR", &|q| { q.nr_lum = 0.0; q.nr_col = 0.0; });
+            v("no sharpen", &|q| q.sh_amt = 0.0);
+            v("no grain", &|q| q.gr_amt = 0.0);
+            v("no rotate", &|q| q.t_rot = 0.0);
+            v("no mixer/grade", &|q| { q.hsl[0] = [0.0; 3]; q.grade[0] = [0.0; 3]; });
+            v("no mixer", &|q| { q.hsl[0] = [0.0; 3]; });
+            v("no grade", &|q| { q.grade[0] = [0.0; 3]; });
+            v("no vignette", &|q| { q.vig = 0.0; });
+            v("no sat", &|q| { q.vibrance = 0.0; });
             return;
         }
         if std::env::var("BENCH_DEFAULT").is_ok() {
