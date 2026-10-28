@@ -92,9 +92,18 @@ struct CullData {
 struct CullState {
     cache: std::collections::HashMap<PathBuf, CullImg>,
     pending: std::collections::HashSet<PathBuf>,
+    /// Frames near the selection. A queued culling job for any other frame is skipped, so stepping fast
+    /// through a card never piles up full RAW reads.
+    wanted: Arc<std::sync::Mutex<std::collections::HashSet<PathBuf>>>,
     compare: bool,
     focus: bool,
+    /// What the last key did ("★★★", "Reject") and when, shown large on the photo for a moment.
+    flash: Option<(String, std::time::Instant)>,
 }
+
+/// Full decodes run one at a time: holding an arrow key would otherwise start one per frame passed, each
+/// several hundred MB for a large RAW.
+static DECODE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// 1:1 view: the visible part rendered at full resolution.
 struct Zoom {
@@ -177,6 +186,8 @@ enum Msg {
     Hdr(Result<Vec<PathBuf>, String>),
     /// A batch rename finished: what moved where.
     Renamed(Result<Vec<(PathBuf, PathBuf)>, String>),
+    /// Settings synced to these frames (with their new summaries).
+    Synced(Vec<(PathBuf, Meta)>),
 }
 
 /// A drag with the heal tool: painting a new stroke, or moving a spot's source (with the grab offset).
@@ -245,6 +256,8 @@ pub struct App {
     thumb_ready: std::collections::HashSet<PathBuf>,
     frame: u64,
     thumb_gen: Arc<std::sync::atomic::AtomicUsize>,
+    /// Bumped by every `select`: a load still queued for an earlier frame is dropped before decoding.
+    load_gen: Arc<std::sync::atomic::AtomicUsize>,
     /// Edited / film scan / rating / flag of each photo with a sidecar. Read once per folder, not every frame.
     meta: std::collections::HashMap<PathBuf, Meta>,
     /// 0 all, 1 = 1 star or more, 2 = 3 stars or more, 3 = picks only. Rejects are hidden except under "All".
@@ -569,7 +582,7 @@ impl App {
             presets.extend(user);
         }
         Self {
-            module: Module::Library, folder: None, files: vec![], thumbs: Default::default(), thumb_used: Default::default(), thumb_want: Default::default(), thumb_pending: Default::default(), thumb_ready: Default::default(), frame: 0, thumb_gen: Default::default(), meta: Default::default(), lib_rating: 0,
+            module: Module::Library, folder: None, files: vec![], thumbs: Default::default(), thumb_used: Default::default(), thumb_want: Default::default(), thumb_pending: Default::default(), thumb_ready: Default::default(), frame: 0, thumb_gen: Default::default(), load_gen: Default::default(), meta: Default::default(), lib_rating: 0,
             subdirs: vec![], tex_scale: 1.0, thumb_size: 190.0, lib_sel: None, lib_query: String::new(),
             lib_filter: [true, true, true, true, false], current: None, photo: None, loading: false, params: Params::default(), prev_params: None,
             rendered: None, render_busy: false, photo_gen: 0, tex: None, before_tex: None, last_rgb: None, hover_rgb: None, shown_w: 0.0, bins: [[0.0; 128]; 3], clip_view: false,
@@ -733,7 +746,12 @@ impl App {
         }
         let (tx, ctx2) = (self.tx.clone(), ctx.clone());
         let nr = self.params.ai_nr > 0.0;
+        let (load_gen, mine) = (self.load_gen.clone(), self.load_gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1);
         std::thread::spawn(move || {
+            let _one = DECODE.lock().unwrap_or_else(|e| e.into_inner());
+            if load_gen.load(std::sync::atomic::Ordering::Relaxed) != mine {
+                return; // another frame was chosen while this one waited
+            }
             // A finished AI denoise is read back from its cache rather than run again.
             let r = load::load(&path).map(|full| {
                 let delta = if nr { denoise::cached_delta(&path, full.len()) } else { None };
@@ -832,6 +850,10 @@ impl App {
                     }
                 }
                 Msg::Status(s) => self.status = s,
+                Msg::Synced(done) => {
+                    self.status = format!("Synced to {} frame{}", done.len(), if done.len() == 1 { "" } else { "s" });
+                    self.meta.extend(done);
+                }
                 Msg::Cull(p, d) => {
                     self.cull.pending.remove(&p);
                     if let Some(d) = d {
@@ -1137,28 +1159,14 @@ impl App {
             self.status = "No rejected photos".into();
             return;
         }
-        if let Err(e) = std::fs::create_dir_all(&dest) {
-            self.status = format!("Could not make _rejects: {e}");
-            return;
-        }
-        let mut moved = 0;
-        for f in &rejects {
-            let mut parts = vec![crate::sidecar(f)];
-            if load::copy_of(f).is_none() {
-                parts.push(f.clone());
-                parts.push(f.with_extension("xmp"));
-            }
-            for part in parts.into_iter().filter(|p| p.exists()) {
-                if let Some(n) = part.file_name()
-                    && std::fs::rename(&part, dest.join(n)).is_ok()
-                {
-                    moved += (part == *f || load::copy_of(f).is_some()) as usize;
-                }
-            }
-        }
+        let r = crate::move_to_rejects(&dest, &rejects);
+        // Reload either way: an error part way through still moved the frames before it.
         self.cull.cache.clear();
         self.open_path(ctx, &dir);
-        self.status = format!("Moved {moved} rejected photos to _rejects");
+        self.status = match r {
+            Ok(n) => format!("Moved {n} rejected frame{} to _rejects", if n == 1 { "" } else { "s" }),
+            Err(e) => format!("Could not move every reject: {e}"),
+        };
     }
 
     fn export_current(&mut self) {
@@ -1190,12 +1198,12 @@ impl App {
     }
 
     fn export_all(&mut self) {
-        let Some(dir) = rfd::FileDialog::new().set_title("Print all frames to…").pick_folder() else { return };
+        let Some(dir) = rfd::FileDialog::new().set_title("Print frames to…").pick_folder() else { return };
         self.commit();
         // Each photo with the folder it goes into: subfolders mirrored when asked for.
         let jobs: Vec<(PathBuf, PathBuf)> = match (&self.folder, self.export_sel.is_empty() && self.export.tree) {
             (Some(src), true) => crate::photos_under(src).into_iter().map(|(rel, f)| (dir.join(rel), f)).collect(),
-            _ => (if self.export_sel.is_empty() { self.files.clone() } else { self.export_sel.clone() }).into_iter().map(|f| (dir.clone(), f)).collect(),
+            _ => self.print_frames().into_iter().map(|f| (dir.clone(), f)).collect(),
         };
         let files: Vec<PathBuf> = jobs.iter().map(|j| j.1.clone()).collect();
         let (tx, o) = (self.tx.clone(), self.export.clone());
@@ -1245,18 +1253,20 @@ impl App {
     }
 
     /// Apply `f` to every other photo's saved settings in the folder.
-    fn sync_folder(&mut self, f: impl Fn(&Params) -> Params + Sync) {
+    /// On a thread: a cloud or network folder of a thousand frames is thousands of slow file operations.
+    fn sync_folder(&mut self, f: impl Fn(&Params) -> Params + Send + 'static) {
         self.commit();
         let cur = self.current.clone();
-        let mut n = 0;
-        for p in self.files.iter().filter(|p| Some(*p) != cur.as_ref()) {
-            let q = f(&read_params(p).unwrap_or_default());
-            if write_params(p, &q).is_ok() {
-                self.meta.insert(p.clone(), Meta::of(&q));
-                n += 1;
-            }
-        }
-        self.status = format!("Synced to {n} photos");
+        let files: Vec<PathBuf> = self.files.iter().filter(|p| Some(*p) != cur.as_ref()).cloned().collect();
+        let tx = self.tx.clone();
+        self.status = format!("Syncing {} frames…", files.len());
+        std::thread::spawn(move || {
+            let done: Vec<(PathBuf, Meta)> = files.into_iter().filter_map(|p| {
+                let q = f(&read_params(&p).unwrap_or_default());
+                write_params(&p, &q).ok().map(|()| (p, Meta::of(&q)))
+            }).collect();
+            let _ = tx.send(Msg::Synced(done));
+        });
     }
 
     /// Jump in history. Saved straight away, or an undone edit would come back next time the photo opens.
@@ -1317,7 +1327,8 @@ impl App {
     fn export_window(&mut self, ctx: &egui::Context) {
         let Some(all) = self.export_dialog else { return };
         let mut go = false;
-        let title = if !all { "Print".to_string() } else if self.export_sel.is_empty() { "Print all frames".to_string() } else { format!("Print {} frames", self.export_sel.len()) };
+        let n = if all { self.print_frames().len() } else { 1 };
+        let title = if !all { "Print".to_string() } else { format!("Print {n} frame{}", if n == 1 { "" } else { "s" }) };
         let open = dialog(ctx, "print", &title, 320.0, |ui| {
                 ui.spacing_mut().item_spacing.y = 8.0;
                 let o = &mut self.export;
@@ -1330,7 +1341,7 @@ impl App {
                 let sizes = [0, 4096, 2048, 1080];
                 let printing = o.print[0] > 0.0;
                 let mut j = if printing { 4 } else { sizes.iter().position(|v| *v == o.long_edge).unwrap_or(0) };
-                segmented(ui, &mut j, &["Full", "4096", "2048", "1080", "Print"]);
+                segmented(ui, &mut j, &["Full", "4096", "2048", "1080", "Paper"]);
                 if j == 4 {
                     if !printing {
                         let (_, a, b) = crate::output::PAPERS[2];
@@ -1373,7 +1384,7 @@ impl App {
                         ui.label(RichText::new("Highlights glow up to 2 stops brighter on HDR screens (recent phones, Macs, Chrome); everywhere else it's a normal JPEG.").size(11.5).color(TEXT2));
                     }
                 }
-                egui::CollapsingHeader::new(RichText::new("Watermark").size(12.5)).id_salt("wm").show(ui, |ui| {
+                disclose(ui, "Watermark", "wm", |ui| {
                     ui.add(egui::TextEdit::singleline(&mut o.wm_text).hint_text("© Your name").desired_width(f32::INFINITY));
                     ui.horizontal(|ui| {
                         let logo = if o.wm_logo.is_empty() { "Logo image…".to_string() } else { Path::new(&o.wm_logo).file_name().unwrap_or_default().to_string_lossy().to_string() };
@@ -1392,7 +1403,7 @@ impl App {
                     slider(ui, "Size", &mut o.wm_size, 1.0, 20.0, 4.0, None);
                     slider(ui, "Opacity", &mut o.wm_opacity, 10.0, 100.0, 70.0, None);
                 });
-                egui::CollapsingHeader::new(RichText::new("File names & details").size(12.5)).id_salt("names").show(ui, |ui| {
+                disclose(ui, "File names & details", "names", |ui| {
                     ui.add(egui::TextEdit::singleline(&mut o.name).hint_text("{name}  ·  try Roll {roll}-{n} {stock}").desired_width(f32::INFINITY));
                     token_chips(ui, &mut o.name);
                     ui.add(egui::TextEdit::singleline(&mut o.roll).hint_text("Roll number").desired_width(f32::INFINITY));
@@ -1404,7 +1415,7 @@ impl App {
                 if all && self.export_sel.is_empty() {
                     switch_row(ui, "Include subfolders, keep the folder tree", &mut o.tree);
                 }
-                egui::CollapsingHeader::new(RichText::new("Print sets").size(12.5)).id_salt("sets").show(ui, |ui| {
+                disclose(ui, "Print sets", "sets", |ui| {
                     for (k, (name, canvas, long, _)) in crate::output::SETS.iter().enumerate() {
                         let what = if canvas[0] > 0 { format!("{name}  {}×{}", canvas[0], canvas[1]) } else { format!("{name}  {long} px") };
                         ui.checkbox(&mut self.export_sets[k], what);
@@ -1422,7 +1433,7 @@ impl App {
         if go {
             self.export.save();
             if self.export_sets.iter().any(|b| *b) {
-                let files = if !all { self.current.iter().cloned().collect() } else if self.export_sel.is_empty() { self.files.clone() } else { self.export_sel.clone() };
+                let files = if !all { self.current.iter().cloned().collect() } else { self.print_frames() };
                 self.export_set_files(files);
             } else if all { self.export_all() } else { self.export_current() }
         }
@@ -1805,6 +1816,18 @@ impl App {
 
     /// Set the rating and/or flag of a photo. The open photo changes through its settings (so undo covers it).
     fn rate(&mut self, f: &Path, rating: Option<u8>, flag: Option<i8>, label: Option<u8>) {
+        if self.module == Module::Cull {
+            let text = match (rating, flag, label) {
+                (Some(0), ..) => "No stars".to_string(),
+                (Some(r), ..) => "★".repeat(r as usize),
+                (_, Some(1), _) => "Pick".into(),
+                (_, Some(-1), _) => "Reject".into(),
+                (_, Some(_), _) => "Flag cleared".into(),
+                (.., Some(l)) => ["Red", "Yellow", "Green", "Blue", "Purple"].get(l.saturating_sub(1) as usize).unwrap_or(&"Label").to_string(),
+                _ => String::new(),
+            };
+            self.cull.flash = Some((text, std::time::Instant::now()));
+        }
         let apply = |p: &mut Params| {
             if let Some(r) = rating {
                 p.rating = r;
@@ -1848,9 +1871,13 @@ impl App {
         if self.cull.cache.contains_key(f) || !self.cull.pending.insert(f.to_path_buf()) {
             return;
         }
-        let (f, tx, ctx2) = (f.to_path_buf(), self.tx.clone(), ctx.clone());
+        let (f, tx, ctx2, wanted) = (f.to_path_buf(), self.tx.clone(), ctx.clone(), self.cull.wanted.clone());
         std::thread::spawn(move || {
+            let _one = DECODE.lock().unwrap_or_else(|e| e.into_inner());
             let data = (|| {
+                if !wanted.lock().ok()?.contains(&f) {
+                    return None; // stepped past it while it waited
+                }
                 let img = load::load_quick(&f, 2560).ok()?;
                 let p = Params { border: Default::default(), ..read_params(&f).unwrap_or_default() };
                 let out = develop::render(&img, &p, 0.3);
@@ -1882,6 +1909,9 @@ impl App {
         let i = vis.iter().position(|f| *f == sel).unwrap_or(0);
         // The one shown, the next two and the previous, so stepping through is instant.
         let ctx = ui.ctx().clone();
+        if let Ok(mut w) = self.cull.wanted.lock() {
+            *w = [i, i + 1, i.wrapping_sub(1), i + 2].iter().filter_map(|j| vis.get(*j).cloned()).collect();
+        }
         for j in [i, i + 1, i.wrapping_sub(1), i + 2] {
             if let Some(f) = vis.get(j) {
                 self.request_cull(&ctx, f);
@@ -1930,12 +1960,35 @@ impl App {
             }
             if m.flag != 0 {
                 let t = if m.flag > 0 { "Pick" } else { "Reject" };
-                let g = ui.painter().layout_no_wrap(t.into(), FontId::proportional(12.0), if m.flag > 0 { ACCENT } else { hex(0xE5484D) });
+                let g = ui.painter().layout_no_wrap(t.into(), FontId::proportional(12.0), BONE);
                 x -= g.size().x;
                 ui.painter().galley(pos2(x, y - g.size().y / 2.0), g, TEXT);
                 x -= 12.0;
             }
             paint_stars(ui.painter(), pos2(x - 5.0 * 12.0 + 6.0, y), m.rating, 5.0, ACCENT);
+            // What the key just did, large on the photo, fading out over a second.
+            if *f == sel
+                && let Some((text, t0)) = &self.cull.flash
+            {
+                let age = t0.elapsed().as_secs_f32();
+                if age < 1.0 {
+                    let a = (1.0 - (age - 0.5).max(0.0) * 2.0).clamp(0.0, 1.0);
+                    let stars = text.chars().filter(|c| *c == '★').count();
+                    let fill = Color32::from_rgba_unmultiplied(20, 20, 22, (210.0 * a) as u8);
+                    if stars > 0 {
+                        // Drawn, not typed: the brand fonts have no star.
+                        let b = Rect::from_center_size(r.center(), vec2(stars as f32 * 34.0 + 30.0, 64.0));
+                        ui.painter().rect_filled(b, 8.0, fill);
+                        paint_stars(ui.painter(), pos2(b.left() + 32.0, b.center().y), stars as u8, 14.0, BONE.gamma_multiply(a));
+                    } else {
+                        let g = ui.painter().layout_no_wrap(text.clone(), FontId::new(34.0, semi()), BONE.gamma_multiply(a));
+                        let b = Rect::from_center_size(r.center(), g.size() + vec2(40.0, 20.0));
+                        ui.painter().rect_filled(b, 8.0, fill);
+                        ui.painter().galley(b.center() - g.size() / 2.0, g, BONE);
+                    }
+                    ui.ctx().request_repaint();
+                }
+            }
         }
         ui.allocate_rect(avail, Sense::hover());
     }
@@ -1973,21 +2026,8 @@ impl App {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| switch(ui, &mut self.cull.compare));
         });
         ui.add_space(14.0);
-        ui.label(caps("Keys"));
         let k = |id: &str| keys::display(self.keymap.key(id));
-        for (what, key) in [
-            ("Next / previous", format!("{} {}", k("next"), k("prev"))),
-            ("Stars", "0 – 5".to_string()),
-            ("Pick / reject / clear", format!("{} {} {}", k("pick"), k("reject"), k("unflag"))),
-            ("Labels", format!("{} {} {} {}", k("red"), k("yellow"), k("green"), k("blue"))),
-            ("Focus check", k("focus")),
-            ("Compare", k("compare")),
-        ] {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(what).size(12.0).color(TEXT2));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.label(RichText::new(key).monospace().size(11.5)));
-            });
-        }
+        ui.label(RichText::new(format!("{} {} next / previous · 0–5 stars · {} pick · {} reject. Press ? for every key.", k("next"), k("prev"), k("pick"), k("reject"))).size(11.5).color(TEXT3));
         ui.add_space(14.0);
         let rejects = self.meta.values().filter(|m| m.flag < 0).count();
         // Only offered when there is something to move.
@@ -2018,7 +2058,7 @@ impl App {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
                 // Shortcuts is a dialog, not a view: a small button at the end of the bar, not a tab.
-                if ui.add(egui::Button::new(RichText::new("?").family(mono500()).size(13.0).color(TEXT2)).min_size(vec2(28.0, 28.0))).on_hover_text("Keyboard shortcuts").clicked() {
+                if ui.add(egui::Button::new(RichText::new("?").family(mono500()).size(13.0).color(TEXT2)).min_size(vec2(28.0, 28.0))).on_hover_text(format!("Keyboard shortcuts\nRendering: {}", crate::gpu::status())).clicked() {
                     self.keys_open = true;
                 }
                 let develop = !matches!(self.module, Module::Library | Module::Cull);
@@ -2032,7 +2072,7 @@ impl App {
                     self.open_path(ui.ctx(), &d);
                 }
                 if !develop {
-                    ui.add(egui::TextEdit::singleline(&mut self.lib_query).hint_text("Search file names").desired_width(240.0).margin(vec2(10.0, 6.0)));
+                    ui.add(egui::TextEdit::singleline(&mut self.lib_query).hint_text("Search frames").desired_width(240.0).margin(vec2(10.0, 6.0)));
                 } else {
                     let name = self.current.as_ref().and_then(|c| c.file_name()).map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
                     let line = [name, self.status.clone()].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ");
@@ -2050,8 +2090,15 @@ impl App {
             let mut i = order.iter().position(|v| *v == self.view).unwrap_or(0);
             segmented(ui, &mut i, labels);
             self.view = order[i];
+            // Groups: views | tools | copy & paste ... zoom & paper | reset.
+            let divider = |ui: &mut Ui| {
+                ui.add_space(4.0);
+                let (r, _) = ui.allocate_exact_size(vec2(1.0, 20.0), Sense::hover());
+                ui.painter().vline(r.center().x, r.y_range(), Stroke::new(1.0, BORDER));
+                ui.add_space(4.0);
+            };
             if !neg {
-                ui.add_space(6.0);
+                divider(ui);
                 for (t, name, tip) in [(Tool::Crop, "Crop", "Drag the corners; drag inside to move"), (Tool::Heal, "Heal", "Click a spot to heal it; right-click a circle to remove it"),
                                        (Tool::Mask, "Mask", "Local adjustments: gradients, circles, painting, brightness and colour ranges"), (Tool::Sample, "Sample", "Click to pin a colour readout (up to 8); right-click one to remove it")] {
                     if ghost(ui, name, self.tool == t).on_hover_text(tip).clicked() {
@@ -2062,7 +2109,7 @@ impl App {
                         match self.tool { Tool::Crop => self.open[6] = true, Tool::Heal => self.open[10] = true, Tool::Mask => self.open[11] = true, Tool::None | Tool::Sample => {} }
                     }
                 }
-                ui.add_space(6.0);
+                divider(ui);
                 if ghost(ui, "Copy", false).on_hover_text("Ctrl/Cmd+C").clicked() {
                     self.copied = Some(self.params.clone());
                 }
@@ -2089,6 +2136,9 @@ impl App {
                     }
                 }
                 // Negative has its own "Reset conversion" under the panel.
+                if !neg {
+                    divider(ui);
+                }
                 if !neg && ui.button("Reset").on_hover_text("Clear this photo's Develop settings").clicked() {
                     self.params = Params { neg: self.params.neg.clone(), ..Params::default() };
                 }
@@ -2110,6 +2160,23 @@ impl App {
                             resp
                         }
                     };
+                    // Marks, so a culled roll reads at a glance: stars, label dot, rejects dimmed.
+                    let m = self.meta.get(f).copied().unwrap_or_default();
+                    let p = ui.painter_at(r.rect);
+                    if m.flag < 0 {
+                        p.rect_filled(r.rect, 3.0, Color32::from_black_alpha(150));
+                        p.text(r.rect.center(), Align2::CENTER_CENTER, "×", FontId::proportional(20.0), TEXT2);
+                    }
+                    if m.rating > 0 {
+                        let w = m.rating as f32 * 9.0 + 6.0;
+                        let b = Rect::from_min_size(pos2(r.rect.left() + 3.0, r.rect.bottom() - 15.0), vec2(w, 12.0));
+                        p.rect_filled(b, 3.0, Color32::from_rgba_unmultiplied(20, 20, 22, 210));
+                        paint_stars(&p, pos2(b.left() + 7.5, b.center().y), m.rating, 3.5, BONE);
+                    }
+                    if m.label > 0 {
+                        p.circle_filled(pos2(r.rect.right() - 8.0, r.rect.top() + 8.0), 4.5, LABEL_COLORS[(m.label - 1).min(4) as usize]);
+                        p.circle_stroke(pos2(r.rect.right() - 8.0, r.rect.top() + 8.0), 4.5, Stroke::new(1.0, INK));
+                    }
                     let here = if self.module == Module::Cull { self.lib_sel.as_ref() } else { self.current.as_ref() };
                     if Some(f) == here {
                         ui.painter().rect_stroke(r.rect.expand(2.0), 4.0, Stroke::new(2.0, ACCENT), egui::StrokeKind::Outside);
@@ -2340,7 +2407,7 @@ impl App {
             ui.label(RichText::new(rgb).monospace().size(11.0).color(TEXT3));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let t = if self.clip_view { "Clipping on" } else { "Clipping off" };
-                if ui.add(egui::Label::new(RichText::new(t).monospace().size(11.0).color(if self.clip_view { ACCENT } else { TEXT3 })).sense(Sense::click())).clicked() {
+                if small_action(ui, t, self.clip_view).on_hover_text("Show clipped highlights and shadows on the photo (J)").clicked() {
                     self.clip_view = !self.clip_view;
                 }
             });
@@ -2348,6 +2415,30 @@ impl App {
     }
 
     // ---------- Library ----------
+
+    /// Save a look to the stocks folder under a name no other stock uses ("Matte 2" when "Matte" exists), with
+    /// characters Windows forbids replaced. It joins the list only once the file is written. Returns the name used.
+    fn add_preset(&mut self, name: &str, p: Params) -> Result<String, String> {
+        let clean: String = name.trim().chars().map(|c| if c.is_control() || "<>:\"/\\|?*".contains(c) { '-' } else { c }).collect();
+        let clean = clean.trim_matches(|c: char| c == '.' || c == ' ').to_string();
+        let clean = if clean.is_empty() { "Stock".to_string() } else { clean };
+        let dir = user_preset_dir().ok_or("no settings folder")?;
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let taken = |n: &str| self.presets.iter().any(|(x, _)| x.eq_ignore_ascii_case(n)) || dir.join(format!("{n}.json")).exists();
+        let name = std::iter::once(clean.clone()).chain((2..).map(|k| format!("{clean} {k}"))).find(|n| !taken(n)).unwrap();
+        crate::write_atomic(&dir.join(format!("{name}.json")), serde_json::to_string_pretty(&p).map_err(|e| e.to_string())?.as_bytes()).map_err(|e| e.to_string())?;
+        self.presets.push((name.clone(), p));
+        self.preset_tex.clear();
+        Ok(name)
+    }
+
+    /// What "Print all" prints: the selection, else what Library shows. Rejects are never printed.
+    fn print_frames(&self) -> Vec<PathBuf> {
+        if !self.export_sel.is_empty() {
+            return self.export_sel.clone();
+        }
+        self.lib_visible().into_iter().filter(|f| self.meta.get(f).is_none_or(|m| m.flag >= 0)).collect()
+    }
 
     fn lib_visible(&self) -> Vec<PathBuf> {
         let q = self.lib_query.to_lowercase();
@@ -2365,10 +2456,10 @@ impl App {
     }
 
     fn library_left(&mut self, ui: &mut Ui) {
-        ui.label(caps("Folder"));
+        ui.label(caps("Roll"));
         ui.add_space(2.0);
         let Some(dir) = self.folder.clone() else {
-            ui.label(RichText::new("No folder open").color(TEXT3));
+            ui.label(RichText::new("No roll open").color(TEXT3));
             return;
         };
         if let Some(parent) = dir.parent()
@@ -2392,7 +2483,6 @@ impl App {
         ui.label(caps("Status"));
         list_row(ui, "Edited", &self.meta.values().filter(|m| m.edited).count().to_string(), false);
         list_row(ui, "Film scans", &self.meta.values().filter(|m| m.neg).count().to_string(), false);
-        list_row(ui, "Picks", &self.meta.values().filter(|m| m.flag > 0).count().to_string(), false);
         list_row(ui, "Rejects", &self.meta.values().filter(|m| m.flag < 0).count().to_string(), false);
         ui.add_space(18.0);
         ui.label(caps("Watch folder"));
@@ -2407,8 +2497,12 @@ impl App {
             toggle(ui, "Open each new photo", &mut self.watch_open, "Jump straight to the newest arrival");
             toggle(ui, "Give it these settings", &mut self.watch_apply, "New frames get the open photo's look and film conversion (handy when scanning a roll)");
         }
+        // Previews progress only while it is still working.
+        if self.thumb_ready.len() >= self.files.len() {
+            return;
+        }
         ui.add_space((ui.available_height() - 62.0).max(18.0));
-            let loaded = self.thumb_ready.len() as f32 / self.files.len().max(1) as f32;
+        let loaded = self.thumb_ready.len() as f32 / self.files.len().max(1) as f32;
         egui::Frame::new().fill(CARD).corner_radius(8).inner_margin(10.0).show(ui, |ui| ui.vertical(|ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -2443,10 +2537,7 @@ impl App {
                     self.make_contact_sheet();
                 }
                 ui.add_space(8.0);
-                ui.scope(|ui| {
-                    ui.spacing_mut().slider_width = 110.0;
-                    ui.add(egui::Slider::new(&mut self.thumb_size, 120.0..=320.0).show_value(false));
-                });
+                plain_slider(ui, &mut self.thumb_size, 120.0, 320.0, 110.0).on_hover_text("Thumbnail size");
                 ui.label(RichText::new("Size").size(12.0).color(TEXT3));
             });
         });
@@ -2459,7 +2550,7 @@ impl App {
                 ui.vertical_centered(|ui| {
                     ui.add_space(ui.available_height() / 2.0 - 110.0);
                     let (r, _) = ui.allocate_exact_size(vec2(56.0, 56.0), Sense::hover());
-                    paint_mark(ui.painter(), r, TEXT3);
+                    paint_mark(ui.painter(), r, TEXT2);
                     ui.add_space(10.0);
                     ui.label(RichText::new("No roll yet").family(display()).size(30.0).color(BONE).extra_letter_spacing(-0.4));
                     ui.label(RichText::new("Open a folder of RAW, JPEG or TIFF frames, or drop them here.").color(TEXT2));
@@ -2780,7 +2871,7 @@ impl App {
 
     fn develop_left(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
-            ui.label(caps("Presets"));
+            ui.label(caps("Stocks"));
         });
         let mut apply = None;
         for (i, (name, _)) in self.presets.iter().enumerate() {
@@ -2801,6 +2892,22 @@ impl App {
                 apply = Some(i);
             }
         }
+        // Film stocks you saved in Negative live in the same list: picking one converts this frame with it.
+        let mut film = None;
+        if !self.my_stocks.is_empty() {
+            ui.add_space(6.0);
+            ui.label(caps("My film"));
+            for (k, (_, c)) in self.my_stocks.iter().enumerate() {
+                let on = self.params.neg.enabled && c.apply(&self.params.neg) == self.params.neg;
+                if ui.add(egui::Button::new(RichText::new(&c.name).size(13.0).color(if on { INK } else { TEXT })).fill(if on { BONE } else { Color32::TRANSPARENT }).stroke(Stroke::NONE).min_size(vec2(ui.available_width(), 30.0))).clicked() {
+                    film = Some(k);
+                }
+            }
+        }
+        if let Some(k) = film {
+            self.params.neg = self.my_stocks[k].1.apply(&self.params.neg);
+            self.status = format!("Converting with {}", self.my_stocks[k].1.name);
+        }
         if let Some(i) = apply {
             // Switching between presets starts from the same original, unless it was edited since.
             let base = match (&self.preset_mix, self.last_preset) {
@@ -2818,47 +2925,43 @@ impl App {
         {
             let before = self.preset_amt;
             ui.add_space(4.0);
-            slider(ui, "Preset amount", &mut self.preset_amt, 0.0, 200.0, 100.0, None);
+            slider(ui, "Amount", &mut self.preset_amt, 0.0, 200.0, 100.0, None);
             if self.preset_amt != before {
                 self.params = Params::blend(base, full, self.preset_amt / 100.0);
             }
         }
+        let mut save = None;
         ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(&mut self.preset_name).hint_text("New preset").desired_width(ui.available_width() - 56.0).margin(vec2(8.0, 5.0)));
+            ui.add(egui::TextEdit::singleline(&mut self.preset_name).hint_text("New stock").desired_width(ui.available_width() - 56.0).margin(vec2(8.0, 5.0)));
             if ui.add_enabled(!self.preset_name.trim().is_empty(), egui::Button::new("Save")).clicked() {
-                let name = self.preset_name.trim().replace(['/', '\\'], "-");
-                if let Some(dir) = user_preset_dir() {
-                    let ok = std::fs::create_dir_all(&dir).is_ok() && std::fs::write(dir.join(format!("{name}.json")), serde_json::to_string_pretty(&self.params).unwrap_or_default()).is_ok();
-                    self.status = if ok { format!("Saved preset {name}") } else { "Could not save preset".into() };
-                }
-                self.presets.push((name, self.params.clone()));
-                self.preset_tex.clear();
-                self.preset_name.clear();
+                save = Some(self.preset_name.clone());
             }
         });
+        if let Some(name) = save {
+            let p = self.params.clone();
+            self.status = match self.add_preset(&name, p) {
+                Ok(n) => format!("Saved stock {n}"),
+                Err(e) => format!("Could not save stock: {e}"),
+            };
+            self.preset_name.clear();
+        }
         if ui.add(egui::Button::new(RichText::new("Import Lightroom presets…").size(12.0).color(TEXT2)).fill(Color32::TRANSPARENT).stroke(Stroke::NONE)).clicked()
             && let Some(files) = rfd::FileDialog::new().add_filter("Lightroom preset", &["xmp"]).pick_files()
         {
-            let mut n = 0;
+            let (mut n, mut failed) = (0, 0);
             for f in files {
-                if let Some((name, p)) = import_xmp_preset(&f) {
-                    let name = name.replace(['/', '\\'], "-");
-                    if let Some(dir) = user_preset_dir() {
-                        let _ = std::fs::create_dir_all(&dir);
-                        let _ = std::fs::write(dir.join(format!("{name}.json")), serde_json::to_string_pretty(&p).unwrap_or_default());
-                    }
-                    self.presets.push((name, p));
-                    n += 1;
+                match import_xmp_preset(&f).map(|(name, p)| self.add_preset(&name, p)) {
+                    Some(Ok(_)) => n += 1,
+                    _ => failed += 1,
                 }
             }
-            self.preset_tex.clear();
-            self.status = format!("Imported {n} presets");
+            self.status = if failed == 0 { format!("Imported {n} stocks") } else { format!("Imported {n} stocks, {failed} could not be read or saved") };
         }
         ui.add_space(14.0);
         ui.horizontal(|ui| {
             ui.label(caps("Snapshots"));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.add_enabled(self.current.is_some(), egui::Button::new(RichText::new("+ New").size(11.0)).fill(Color32::TRANSPARENT).stroke(Stroke::NONE))
+                if ui.add_enabled(self.current.is_some(), egui::Button::new(RichText::new("+ New").size(11.0).color(TEXT2)).fill(Color32::TRANSPARENT).stroke(Stroke::new(1.0, BTN_BORDER)).corner_radius(3).min_size(vec2(0.0, 22.0)))
                     .on_hover_text(format!("Save these settings to come back to ({})", keys::display(self.keymap.key("snapshot")))).clicked()
                 {
                     self.add_snapshot();
@@ -3227,7 +3330,7 @@ impl App {
                 slider(ui, "Amount", &mut p.gr_amt, 0.0, 100.0, 0.0, None);
                 slider(ui, "Size", &mut p.gr_size, 0.0, 100.0, d.gr_size, None);
                 slider(ui, "Roughness", &mut p.gr_rough, 0.0, 100.0, d.gr_rough, None);
-                slider(ui, "Grain in highlights", &mut p.gr_hi, 0.0, 100.0, d.gr_hi, None);
+                slider(ui, "Highlight grain", &mut p.gr_hi, 0.0, 100.0, d.gr_hi, None);
             });
             section(ui, "Border", o_border, |ui| {
                 group(ui, "Color", None);
@@ -3403,13 +3506,13 @@ impl App {
 
     fn develop_footer(&mut self, ui: &mut Ui) {
         ui.columns(2, |c| {
-            if c[0].add_enabled(self.prev_params.is_some(), egui::Button::new("Previous").min_size(vec2(c[0].available_width(), 32.0))).on_hover_text("Apply the settings of the photo you edited before this one").clicked() {
+            if c[0].add_enabled(self.prev_params.is_some(), egui::Button::new("Paste previous").min_size(vec2(c[0].available_width(), 32.0))).on_hover_text("Apply the settings of the frame you edited before this one").clicked() {
                 let prev = self.prev_params.clone().unwrap();
                 self.params = self.params.with_look_of(&prev);
             }
             if c[1].add(egui::Button::new("Sync settings…").min_size(vec2(c[1].available_width(), 32.0))).on_hover_text("Copy these settings (not crop or transform) to every photo in the folder").clicked() {
                 let me = self.params.clone();
-                self.sync_folder(|other| other.with_look_of(&me));
+                self.sync_folder(move |other| other.with_look_of(&me));
             }
         });
     }
@@ -3420,13 +3523,10 @@ impl App {
         egui::Frame::new().inner_margin(egui::Margin { left: 12, right: 12, top: 16, bottom: 10 }).show(ui, |ui| {
             ui.label(caps("Film stock"));
             ui.add(egui::TextEdit::singleline(&mut self.stock_query).hint_text(format!("Search {} stocks", STOCKS.len())).desired_width(f32::INFINITY).margin(vec2(10.0, 7.0)));
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
-                for (i, t) in ["All", "Color", "B&W", "Cine", "Slide"].iter().enumerate() {
-                    if chip(ui, t, self.stock_tab == i).clicked() {
-                        self.stock_tab = i;
-                    }
-                }
+            // One choice at a time, so a segmented control on one row rather than chips.
+            ui.scope(|ui| {
+                ui.spacing_mut().button_padding = vec2(8.0, 4.0);
+                segmented(ui, &mut self.stock_tab, &["All", "Color", "B&W", "Cine", "Slide"]);
             });
         });
         let y = ui.cursor().top();
@@ -3438,11 +3538,11 @@ impl App {
             kind_ok && (q.is_empty() || format!("{} {}", s.brand, s.name).to_lowercase().contains(&q))
         };
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            egui::Frame::new().inner_margin(egui::Margin { left: 8, right: 8, top: 4, bottom: 16 }).show(ui, |ui| {
+            egui::Frame::new().inner_margin(egui::Margin { left: 12, right: 12, top: 4, bottom: 16 }).show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 2.0;
                 // Your own profiles first.
                 ui.add_space(8.0);
-                ui.label(caps("My stocks"));
+                ui.label(caps("My film"));
                 let mut apply = None;
                 let mut remove = None;
                 let mut share = None;
@@ -3455,10 +3555,7 @@ impl App {
                     if resp.hovered() {
                         ui.painter().rect_filled(r, 6.0, hex(0x222226));
                     }
-                    let chip_r = Rect::from_min_size(pos2(r.left() + 8.0, r.center().y - 11.0), vec2(14.0, 22.0));
-                    ui.painter().rect_filled(chip_r, 2.0, base.map_or(ACCENT, stock_chip));
-                    ui.painter().rect_stroke(chip_r, 2.0, Stroke::new(1.0, ACCENT), egui::StrokeKind::Inside);
-                    ui.painter().text(pos2(chip_r.right() + 10.0, r.center().y), Align2::LEFT_CENTER, &c.name, FontId::proportional(13.0), TEXT);
+                    ui.painter().text(pos2(r.left() + 10.0, r.center().y), Align2::LEFT_CENTER, &c.name, FontId::proportional(13.0), TEXT);
                     let resp = resp.on_hover_text(format!("Based on {}. Right-click to share or delete.", base.map_or(String::new(), |b| format!("{} {}", b.brand, b.name))));
                     if resp.clicked() {
                         apply = Some(k);
@@ -3522,10 +3619,7 @@ impl App {
                     if on || resp.hovered() {
                         ui.painter().rect_filled(r, 3.0, if on { BONE } else { CARD });
                     }
-                    let chip_r = Rect::from_min_size(pos2(r.left() + 8.0, r.center().y - 11.0), vec2(14.0, 22.0));
-                    ui.painter().rect_filled(chip_r, 2.0, stock_chip(s));
-                    ui.painter().rect_stroke(chip_r, 2.0, Stroke::new(1.0, hex(0x3A3A40)), egui::StrokeKind::Inside);
-                    ui.painter().text(pos2(chip_r.right() + 10.0, r.center().y), Align2::LEFT_CENTER, s.name, FontId::proportional(13.0), if on { INK } else { TEXT });
+                    ui.painter().text(pos2(r.left() + 10.0, r.center().y), Align2::LEFT_CENTER, s.name, FontId::proportional(13.0), if on { INK } else { TEXT });
                     ui.painter().text(pos2(r.right() - 8.0, r.center().y), Align2::RIGHT_CENTER, stock_iso(s), FontId::monospace(11.0), if on { ON_BONE } else { TEXT3 });
                     if resp.clicked() {
                         self.params.neg.stock = s.id.into();
@@ -3600,8 +3694,10 @@ impl App {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
                         for (l, n) in row {
-                            if tile(ui, n, np.look == l, w).clicked() {
+                            // Nothing looks chosen while conversion is off; picking one turns it on, like a stock.
+                            if tile(ui, n, np.enabled && np.look == l, w).clicked() {
                                 np.look = l;
+                                np.enabled = true;
                             }
                         }
                     });
@@ -3925,7 +4021,6 @@ impl App {
                 let _ = self.keymap.save();
             }
             ui.add_space(4.0);
-            ui.label(RichText::new(format!("Rendering: {}", crate::gpu::status())).size(11.0).color(TEXT3));
         });
         if !open && !(binding && ctx.input(|i| i.key_pressed(egui::Key::Escape))) {
             self.keys_open = false;
@@ -4068,6 +4163,11 @@ fn grading_wheels(ui: &mut Ui, p: &mut Params) {
 }
 
 impl eframe::App for App {
+    /// A caption still being typed is not saved until its field loses focus: save it when the window closes.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.commit();
+    }
+
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll(&ctx);
@@ -4092,7 +4192,7 @@ impl eframe::App for App {
                 egui::Panel::left("lib_left").exact_size(260.0).resizable(false).frame(pad(PANEL, 12, 16)).show(ui, |ui| self.library_left(ui));
                 egui::Panel::right("lib_right").exact_size(320.0).resizable(false).frame(pad(PANEL, 16, 16)).show(ui, |ui| self.library_info(ui));
                 egui::CentralPanel::default().frame(egui::Frame::new().fill(BG)).show(ui, |ui| {
-                    egui::Panel::top("lib_tools").exact_size(48.0).frame(pad(BG, 16, 0)).show(ui, |ui| self.library_toolbar(ui));
+                    if !self.files.is_empty() { egui::Panel::top("lib_tools").exact_size(48.0).frame(pad(BG, 16, 0)).show(ui, |ui| self.library_toolbar(ui)); }
                     egui::CentralPanel::default().frame(pad(BG, 16, 16)).show(ui, |ui| self.library_grid(ui));
                 });
             }

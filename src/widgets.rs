@@ -23,7 +23,7 @@ pub const LABEL: Color32 = TEXT2;
 pub const ACCENT: Color32 = BONE;
 /// Secondary text on a bone (selected) surface.
 pub const ON_BONE: Color32 = hex(0x5A5752);
-const TRACK: Color32 = hex(0x4A4846); // 3:1 against the panel
+const TRACK: Color32 = hex(0x5E5B57); // 2.5:1 against the panel; the bone tick carries the 3:1
 
 pub const fn hex(rgb: u32) -> Color32 {
     Color32::from_rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8)
@@ -115,7 +115,6 @@ pub fn install_style(ctx: &egui::Context) {
     });
 }
 
-/// IBM Plex Sans 500: emphasised labels and dialog titles.
 /// The bare brand mark (assets/brand/mark.svg): a filled frame and an outlined frame, offset down and right.
 /// Axis-aligned, two frames, one colour, at any size.
 pub fn paint_mark(p: &egui::Painter, r: Rect, color: Color32) {
@@ -127,6 +126,7 @@ pub fn paint_mark(p: &egui::Painter, r: Rect, color: Color32) {
     p.rect_stroke(at(26.0, 26.0, 44.0), rad, Stroke::new(stroke, color), egui::StrokeKind::Middle);
 }
 
+/// IBM Plex Sans 500: emphasised labels and dialog titles.
 pub fn semi() -> FontFamily {
     FontFamily::Name("semi".into())
 }
@@ -152,6 +152,15 @@ pub fn primary(ui: &mut Ui, text: &str, enabled: bool) -> egui::Response {
 }
 
 /// Borderless text button; `on` inverts it (ink on bone).
+/// Small outlined action inside a panel ("As shot", "Auto", "+ New"): looks pressable, stays quiet.
+pub fn small_action(ui: &mut Ui, text: &str, on: bool) -> egui::Response {
+    ui.add(egui::Button::new(RichText::new(text).size(11.0).color(if on { INK } else { TEXT2 }))
+        .fill(if on { BONE } else { Color32::TRANSPARENT })
+        .stroke(Stroke::new(1.0, if on { BONE } else { BTN_BORDER }))
+        .corner_radius(3)
+        .min_size(vec2(0.0, 22.0)))
+}
+
 pub fn ghost(ui: &mut Ui, text: &str, on: bool) -> egui::Response {
     ui.add(egui::Button::new(RichText::new(text).color(if on { INK } else { TEXT2 })).fill(if on { BONE } else { Color32::TRANSPARENT }).stroke(Stroke::NONE))
 }
@@ -277,6 +286,24 @@ pub fn section(ui: &mut Ui, title: &str, open: &mut bool, body: impl FnOnce(&mut
     ui.painter().hline(ui.max_rect().x_range(), y, Stroke::new(1.0, DIVIDER));
 }
 
+/// Optional part of a dialog or panel: a title row with "+"/"−" on the right, as in `section`, but inline.
+pub fn disclose(ui: &mut Ui, title: &str, id: &str, body: impl FnOnce(&mut Ui)) {
+    let id = ui.make_persistent_id(("disclose", id));
+    let mut open = ui.data_mut(|d| *d.get_persisted_mut_or(id, false));
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::click());
+    if resp.clicked() {
+        open = !open;
+        ui.data_mut(|d| d.insert_persisted(id, open));
+    }
+    let col = if open || resp.hovered() { TEXT } else { TEXT2 };
+    ui.painter().text(pos2(rect.left(), rect.center().y), Align2::LEFT_CENTER, title, FontId::proportional(12.5), col);
+    ui.painter().text(pos2(rect.right(), rect.center().y), Align2::RIGHT_CENTER, if open { "−" } else { "+" }, FontId::proportional(14.0), TEXT3);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand).widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, open, title));
+    if open {
+        body(ui);
+    }
+}
+
 /// Group title row with an optional small action on the right ("Auto", "As shot").
 pub fn group(ui: &mut Ui, title: &str, action: Option<&str>) -> bool {
     let mut clicked = false;
@@ -284,7 +311,7 @@ pub fn group(ui: &mut Ui, title: &str, action: Option<&str>) -> bool {
         ui.label(caps(title));
         if let Some(a) = action {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                clicked = ui.add(egui::Label::new(RichText::new(a).size(11.0).color(TEXT2)).sense(Sense::click())).on_hover_cursor(egui::CursorIcon::PointingHand).clicked();
+                clicked = small_action(ui, a, false).clicked();
             });
         }
     });
@@ -293,57 +320,106 @@ pub fn group(ui: &mut Ui, title: &str, action: Option<&str>) -> bool {
 
 pub type Grad<'a> = &'a dyn Fn(f32) -> Color32;
 
-/// Slider in the mockup's layout: label and value on one line, thin full-width track below.
+/// Slider in the brand kit's one-line row: label (92 px), track, value (44 px), 30 px tall.
 /// `grad` maps a slider value to the colour that value produces, sampled densely so the track is smooth.
-/// Drag anywhere on the row; double-click resets; ←/→ nudge while hovered; Shift for fine steps.
+/// Drag on the label or track; double-click resets; ←/→ nudge while hovered; Shift for fine steps.
+/// Click the value to type an exact number (Enter sets it, Esc cancels).
 pub fn slider(ui: &mut Ui, label: &str, v: &mut f32, min: f32, max: f32, default: f32, grad: Option<Grad>) -> bool {
     slider_ex(ui, label, None, v, min, max, default, grad)
 }
 
+const SLIDER_LABEL_W: f32 = 92.0;
+const SLIDER_VALUE_W: f32 = 44.0;
+
 #[allow(clippy::too_many_arguments)]
 pub fn slider_ex(ui: &mut Ui, label: &str, swatch: Option<Color32>, v: &mut f32, min: f32, max: f32, default: f32, grad: Option<Grad>) -> bool {
     let before = *v;
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::click_and_drag());
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click_and_drag());
     let step = if max - min <= 20.0 { if max - min <= 4.0 { 0.01 } else { 0.05 } } else { 1.0 };
-    let changed = (*v - default).abs() > step * 0.5;
+    let snap = |x: f32| ((x.clamp(min, max)) / step).round() * step;
+
+    let value_r = Rect::from_min_max(pos2(rect.right() - SLIDER_VALUE_W, rect.top()), rect.max);
+    let track = Rect::from_min_max(pos2(rect.left() + SLIDER_LABEL_W + 6.0, rect.center().y - 2.0), pos2(value_r.left() - 10.0, rect.center().y + 2.0));
+    let frac = |x: f32| ((x - min) / (max - min)).clamp(0.0, 1.0);
+    let edit_id = resp.id.with("typed");
+    let mut editing: Option<String> = ui.data(|d| d.get_temp(edit_id));
+    let on_value = resp.interact_pointer_pos().is_some_and(|p| value_r.contains(p));
 
     // Input first so the frame paints the new value.
-    let track = Rect::from_min_max(pos2(rect.left() + 6.0, rect.bottom() - 9.0), pos2(rect.right() - 6.0, rect.bottom() - 5.0));
-    let frac = |x: f32| ((x - min) / (max - min)).clamp(0.0, 1.0);
-    if resp.double_clicked() {
+    let mut opened = false;
+    if editing.is_none() && resp.clicked() && on_value {
+        editing = Some(fmt_plain(*v, step));
+        opened = true;
+    } else if resp.double_clicked() {
         *v = default;
-    } else if resp.dragged() {
+    } else if resp.dragged() && !(resp.drag_started() && on_value) {
         let fine = ui.input(|i| i.modifiers.shift);
         let dx = resp.drag_delta().x / track.width() * (max - min);
         if resp.drag_started() && !fine {
-            if let Some(p) = resp.interact_pointer_pos() {
+            if let Some(p) = resp.interact_pointer_pos()
+                && p.x >= track.left()
+            {
                 *v = min + ((p.x - track.left()) / track.width()).clamp(0.0, 1.0) * (max - min);
             }
         } else {
             *v += if fine { dx * 0.15 } else { dx };
         }
-        *v = ((v.clamp(min, max)) / step).round() * step;
-    } else if resp.clicked() && let Some(p) = resp.interact_pointer_pos() {
-        *v = (((min + ((p.x - track.left()) / track.width()).clamp(0.0, 1.0) * (max - min)) / step).round() * step).clamp(min, max);
+        *v = snap(*v);
+    } else if resp.clicked() && let Some(p) = resp.interact_pointer_pos()
+        && p.x >= track.left() - 4.0
+    {
+        *v = snap(min + ((p.x - track.left()) / track.width()).clamp(0.0, 1.0) * (max - min));
     }
     // Tab focuses a slider; arrows then nudge it, like hovering does.
-    if resp.hovered() || resp.has_focus() {
+    if editing.is_none() && (resp.hovered() || resp.has_focus()) {
         // Cmd/Ctrl+arrows switch photos; don't also nudge the slider under the mouse.
         let n = ui.input(|i| if i.modifiers.command { 0.0 } else { (i.key_pressed(egui::Key::ArrowRight) as i32 - i.key_pressed(egui::Key::ArrowLeft) as i32) as f32 });
         let big = ui.input(|i| i.modifiers.shift);
         *v = (*v + n * step * if big { 10.0 } else { 1.0 }).clamp(min, max);
     }
+    let changed = (*v - default).abs() > step * 0.5;
 
     let p = ui.painter_at(rect.expand(2.0));
     let mut x = rect.left();
     if let Some(c) = swatch {
-        p.circle_filled(pos2(x + 4.0, rect.top() + 8.0), 4.0, c);
+        p.circle_filled(pos2(x + 4.0, rect.center().y), 4.0, c);
         x += 14.0;
     }
-    p.text(pos2(x, rect.top() + 8.0), Align2::LEFT_CENTER, label, FontId::proportional(12.0), if resp.hovered() || resp.dragged() { TEXT } else { LABEL });
-    let shown = if step < 1.0 && min < 0.0 { format!("{:+.2}", *v) } else if step < 1.0 { format!("{:.1}", *v) } else if max > 1000.0 { format!("{:.0} K", *v) } else if min < 0.0 { format!("{:+.0}", *v) } else { format!("{:.0}", *v) };
-    let shown = if !changed && min < 0.0 && max <= 1000.0 { shown.trim_start_matches('+').to_string() } else { shown };
-    p.text(pos2(rect.right(), rect.top() + 8.0), Align2::RIGHT_CENTER, shown, FontId::monospace(11.0), if changed { ACCENT } else { TEXT3 });
+    let active = resp.hovered() || resp.dragged();
+    let label_clip = p.with_clip_rect(Rect::from_min_max(rect.min, pos2(rect.left() + SLIDER_LABEL_W, rect.bottom())));
+    label_clip.text(pos2(x, rect.center().y), Align2::LEFT_CENTER, label, FontId::proportional(12.0), if active { TEXT } else { LABEL });
+
+    if let Some(mut text) = editing.take() {
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(value_r.shrink2(vec2(0.0, 3.0))));
+        let te = child.add(egui::TextEdit::singleline(&mut text).id(edit_id.with("field")).font(FontId::monospace(11.0)).align(Align2::RIGHT_CENTER)
+            .margin(vec2(4.0, 2.0)).desired_width(SLIDER_VALUE_W));
+        if !te.has_focus() && !te.lost_focus() {
+            te.request_focus();
+        }
+        if opened {
+            // Whole number selected, so typing replaces it. Set after the field has seen the opening click.
+            let mut st = egui::text_edit::TextEditState::load(ui.ctx(), te.id).unwrap_or_default();
+            st.cursor.set_char_range(Some(egui::text_selection::CCursorRange::select_all_str(&text)));
+            st.store(ui.ctx(), te.id);
+        }
+        let (enter, esc) = ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
+        if te.lost_focus() || enter || esc {
+            if !esc && let Ok(n) = text.trim().trim_end_matches('K').trim().replace(',', ".").parse::<f32>() {
+                *v = snap(n);
+            }
+            ui.data_mut(|d| d.remove::<String>(edit_id));
+        } else {
+            ui.data_mut(|d| d.insert_temp(edit_id, text));
+        }
+    } else {
+        let shown = if step < 1.0 && min < 0.0 { format!("{:+.2}", *v) } else if step < 1.0 { format!("{:.1}", *v) } else if max > 1000.0 { format!("{:.0} K", *v) } else if min < 0.0 { format!("{:+.0}", *v) } else { format!("{:.0}", *v) };
+        let shown = if !changed && min < 0.0 && max <= 1000.0 { shown.trim_start_matches('+').to_string() } else { shown };
+        let hover_value = resp.hover_pos().is_some_and(|h| value_r.contains(h));
+        if hover_value {
+            p.rect_stroke(value_r.shrink2(vec2(0.0, 4.0)), 3.0, Stroke::new(1.0, BTN_BORDER), egui::StrokeKind::Inside);
+        }
+        p.text(pos2(rect.right() - 4.0, rect.center().y), Align2::RIGHT_CENTER, shown, FontId::monospace(11.0), if changed || hover_value { ACCENT } else { TEXT3 });
+    }
 
     match grad {
         Some(g) => paint_gradient_track(ui, track, min, max, g),
@@ -361,7 +437,6 @@ pub fn slider_ex(ui: &mut Ui, label: &str, swatch: Option<Color32>, v: &mut f32,
         }
     }
     let knob = pos2(track.left() + track.width() * frac(*v), track.center().y);
-    let active = resp.hovered() || resp.dragged();
     // Flat bone tick, as in the brand UI; an ink outline keeps it visible on colour tracks.
     let knob_r = Rect::from_center_size(knob, if active { vec2(4.0, 16.0) } else { vec2(3.0, 13.0) });
     if grad.is_some() {
@@ -374,8 +449,41 @@ pub fn slider_ex(ui: &mut Ui, label: &str, swatch: Option<Color32>, v: &mut f32,
     }
     let val = *v as f64;
     resp.widget_info(|| egui::WidgetInfo::slider(true, val, label));
-    resp.on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+    let over_value = resp.hover_pos().is_some_and(|h| value_r.contains(h));
+    let resp = resp.on_hover_cursor(if over_value { egui::CursorIcon::Text } else { egui::CursorIcon::ResizeHorizontal });
+    if over_value {
+        resp.on_hover_text("Click to type a value");
+    } else if label_overflows(ui, label, x - rect.left()) {
+        resp.on_hover_text(label);
+    }
     *v != before
+}
+
+fn label_overflows(ui: &Ui, label: &str, indent: f32) -> bool {
+    let w = ui.fonts_mut(|f| f.layout_no_wrap(label.to_string(), FontId::proportional(12.0), TEXT).size().x);
+    indent + w > SLIDER_LABEL_W
+}
+
+/// The value as you would type it: no sign padding, no unit.
+fn fmt_plain(v: f32, step: f32) -> String {
+    if step < 1.0 { format!("{:.2}", v).trim_end_matches('0').trim_end_matches('.').to_string() } else { format!("{:.0}", v) }
+}
+
+/// Plain one-line slider for app settings (thumbnail size): same look, no value, no reset.
+pub fn plain_slider(ui: &mut Ui, v: &mut f32, min: f32, max: f32, width: f32) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, 24.0), Sense::click_and_drag());
+    if let Some(p) = resp.interact_pointer_pos()
+        && (resp.dragged() || resp.clicked())
+    {
+        *v = min + ((p.x - rect.left()) / rect.width()).clamp(0.0, 1.0) * (max - min);
+    }
+    let thin = Rect::from_center_size(rect.center(), vec2(rect.width(), 2.0));
+    let p = ui.painter();
+    p.rect_filled(thin, 1.0, TRACK);
+    let x = thin.left() + thin.width() * ((*v - min) / (max - min)).clamp(0.0, 1.0);
+    let active = resp.hovered() || resp.dragged();
+    p.rect_filled(Rect::from_center_size(pos2(x, thin.center().y), if active { vec2(4.0, 16.0) } else { vec2(3.0, 13.0) }), 1.0, BONE);
+    resp.on_hover_cursor(egui::CursorIcon::ResizeHorizontal)
 }
 
 /// Smooth RGB histogram as overlapping translucent areas, like the mockup.

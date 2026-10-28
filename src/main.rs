@@ -50,9 +50,11 @@ pub fn sidecar_damaged(path: &Path) -> bool {
     std::fs::read_to_string(sidecar(path)).is_ok_and(|t| serde_json::from_str::<Params>(&t).is_err())
 }
 
-/// `IMG_0001.xmp`, as Lightroom names it. Virtual copies have none (they share the photo's).
-fn xmp_path(path: &Path) -> PathBuf {
-    if load::copy_of(path).is_some() { PathBuf::new() } else { path.with_extension("xmp") }
+/// `IMG_0001.xmp`, as Lightroom names it, for RAW files only. A RAW+JPEG pair would otherwise share one file, so
+/// rejecting the JPEG rejected the RAW too (Lightroom keeps a JPEG's rating inside the JPEG). Virtual copies have
+/// none (they share the photo's).
+pub fn xmp_path(path: &Path) -> PathBuf {
+    if load::copy_of(path).is_some() || !load::is_raw(path) { PathBuf::new() } else { path.with_extension("xmp") }
 }
 
 /// Lightroom presets (.xmp) as named Ferrotype settings.
@@ -111,6 +113,43 @@ pub fn write_params(path: &Path, p: &Params) -> std::io::Result<()> {
         write_atomic(&xp, x.as_bytes())?;
     }
     Ok(())
+}
+
+/// Move rejected photos into `dest` (`_rejects`) with their edits and RAW `.xmp`. Never replaces a file already
+/// there: a second `DSC_0001.NEF` lands as `DSC_0001-2.NEF`, its sidecars renamed to match. Returns photos moved.
+pub fn move_to_rejects(dest: &Path, files: &[PathBuf]) -> std::io::Result<usize> {
+    std::fs::create_dir_all(dest)?;
+    let free = |p: &Path| !p.exists() && !sidecar(p).exists();
+    let mut moved = 0;
+    for f in files {
+        let name = f.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let to = match load::copy_of(f) {
+            // A virtual copy is only its settings file: give it a copy number no other copy there uses.
+            Some(orig) => {
+                let base = orig.file_name().unwrap_or_default().to_string_lossy().to_string();
+                (2..).map(|k| dest.join(format!("{base}.copy{k}"))).find(|p| free(p)).unwrap()
+            }
+            None => {
+                let (stem, ext) = (f.file_stem().unwrap_or_default().to_string_lossy().to_string(), f.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default());
+                std::iter::once(dest.join(&name)).chain((2..).map(|k| dest.join(format!("{stem}-{k}{ext}")))).find(|p| free(p) && (xmp_path(p).as_os_str().is_empty() || !xmp_path(p).exists())).unwrap()
+            }
+        };
+        let mut parts = vec![(sidecar(f), sidecar(&to))];
+        if load::copy_of(f).is_none() {
+            parts.insert(0, (f.clone(), to.clone()));
+            let x = xmp_path(f);
+            if !x.as_os_str().is_empty() {
+                parts.push((x, xmp_path(&to)));
+            }
+        }
+        let mut any = false;
+        for (a, b) in parts.into_iter().filter(|(a, _)| a.exists()) {
+            std::fs::rename(&a, &b)?;
+            any = true;
+        }
+        moved += any as usize;
+    }
+    Ok(moved)
 }
 
 /// Write to `path.tmp`, then rename over `path`, so a crash or full disk never leaves a half-written file.
@@ -174,7 +213,7 @@ impl ExportOpts {
     pub fn save(&self) {
         if let Some(d) = keys::dirs_config() {
             let _ = std::fs::create_dir_all(&d);
-            let _ = std::fs::write(d.join("export.json"), serde_json::to_string_pretty(self).unwrap_or_default());
+            let _ = write_atomic(&d.join("export.json"), serde_json::to_string_pretty(self).unwrap_or_default().as_bytes());
         }
     }
 
@@ -500,6 +539,36 @@ mod tests {
     }
 
     #[test]
+    fn rejecting_the_jpeg_of_a_pair_leaves_the_raw_alone() {
+        let dir = std::env::temp_dir().join(format!("ferrotype-pair-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (raw, jpg) = (dir.join("P.NEF"), dir.join("P.JPG"));
+        write_params(&raw, &Params { rating: 4, ..Default::default() }).unwrap();
+        write_params(&jpg, &Params { flag: -1, ..Default::default() }).unwrap();
+        let back = read_params(&raw).unwrap();
+        assert_eq!((back.rating, back.flag), (4, 0));
+        assert_eq!(xmp::rating_label(&std::fs::read_to_string(dir.join("P.xmp")).unwrap()).0, Some(4));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rejects_never_replace_a_file_already_in_rejects() {
+        let dir = std::env::temp_dir().join(format!("ferrotype-rej-{}", std::process::id()));
+        let dest = dir.join("_rejects");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("D.NEF"), "first card").unwrap();
+        std::fs::write(dest.join("D.NEF.ferrotype.json"), "{}").unwrap();
+        let photo = dir.join("D.NEF");
+        std::fs::write(&photo, "second card").unwrap();
+        write_params(&photo, &Params { flag: -1, ..Default::default() }).unwrap();
+        assert_eq!(move_to_rejects(&dest, &[photo.clone()]).unwrap(), 1);
+        assert_eq!(std::fs::read_to_string(dest.join("D.NEF")).unwrap(), "first card");
+        assert_eq!(std::fs::read_to_string(dest.join("D-2.NEF")).unwrap(), "second card");
+        assert!(dest.join("D-2.NEF.ferrotype.json").exists() && dest.join("D-2.xmp").exists() && !photo.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn sidecar_round_trip() {
         let dir = std::env::temp_dir().join(format!("ferrotype-sc-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -583,11 +652,11 @@ fn cli_pano(args: &[String]) -> Result<(), String> {
 }
 
 fn cli_contact(args: &[String]) -> Result<(), String> {
-    let (mut out, mut cols, mut files) = (PathBuf::from("contact.jpg"), 6, vec![]);
+    let (mut out, mut cols, mut files) = (None::<PathBuf>, 6, vec![]);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--out" => out = it.next().ok_or("--out needs a file name")?.into(),
+            "--out" => out = Some(it.next().ok_or("--out needs a file name")?.into()),
             "--cols" => cols = it.next().and_then(|v| v.parse().ok()).ok_or("--cols needs a number")?,
             f => files.push(PathBuf::from(f)),
         }
@@ -595,6 +664,11 @@ fn cli_contact(args: &[String]) -> Result<(), String> {
     if files.is_empty() {
         return Err(USAGE.into());
     }
+    // An --out you name is yours to replace; the default never replaces an earlier sheet (contact-2.jpg…).
+    let out = match out {
+        Some(o) => o,
+        None => claim_output(Path::new("."), "contact", "jpg")?,
+    };
     save_output(contact_sheet(&files, cols), &out, 90)?;
     println!("{}", out.display());
     Ok(())
