@@ -99,6 +99,8 @@ struct CullState {
     focus: bool,
     /// What the last key did ("★★★", "Reject") and when, shown large on the photo for a moment.
     flash: Option<(String, std::time::Instant)>,
+    /// Frames that could not be read: shown as such, never retried every frame.
+    failed: std::collections::HashSet<PathBuf>,
 }
 
 /// Full decodes run one at a time: holding an arrow key would otherwise start one per frame passed, each
@@ -175,7 +177,9 @@ enum Msg {
     /// A preview render finished on the render thread.
     Rendered(Box<RenderOut>),
     Status(String),
-    Cull(PathBuf, Option<CullData>),
+    /// A culling view: the data, or None when it could not be read. A frame skipped because you stepped past
+    /// it sends nothing but `skipped`, so it is tried again when you come back.
+    Cull(PathBuf, Option<CullData>, bool),
     Denoised(PathBuf, Result<Vec<f32>, String>),
     AiInstalled(Result<(), String>),
     /// A 1:1 window finished rendering: the settings and window it shows.
@@ -258,6 +262,8 @@ pub struct App {
     thumb_gen: Arc<std::sync::atomic::AtomicUsize>,
     /// Bumped by every `select`: a load still queued for an earlier frame is dropped before decoding.
     load_gen: Arc<std::sync::atomic::AtomicUsize>,
+    /// Why the open frame could not be opened, shown in place of the photo.
+    open_error: Option<String>,
     /// Edited / film scan / rating / flag of each photo with a sidecar. Read once per folder, not every frame.
     meta: std::collections::HashMap<PathBuf, Meta>,
     /// 0 all, 1 = 1 star or more, 2 = 3 stars or more, 3 = picks only. Rejects are hidden except under "All".
@@ -582,7 +588,7 @@ impl App {
             presets.extend(user);
         }
         Self {
-            module: Module::Library, folder: None, files: vec![], thumbs: Default::default(), thumb_used: Default::default(), thumb_want: Default::default(), thumb_pending: Default::default(), thumb_ready: Default::default(), frame: 0, thumb_gen: Default::default(), load_gen: Default::default(), meta: Default::default(), lib_rating: 0,
+            module: Module::Library, folder: None, files: vec![], thumbs: Default::default(), thumb_used: Default::default(), thumb_want: Default::default(), thumb_pending: Default::default(), thumb_ready: Default::default(), frame: 0, thumb_gen: Default::default(), load_gen: Default::default(), open_error: None, meta: Default::default(), lib_rating: 0,
             subdirs: vec![], tex_scale: 1.0, thumb_size: 190.0, lib_sel: None, lib_query: String::new(),
             lib_filter: [true, true, true, true, false], current: None, photo: None, loading: false, params: Params::default(), prev_params: None,
             rendered: None, render_busy: false, photo_gen: 0, tex: None, before_tex: None, last_rgb: None, hover_rgb: None, shown_w: 0.0, bins: [[0.0; 128]; 3], clip_view: false,
@@ -616,6 +622,7 @@ impl App {
         self.subdirs.sort();
         // Ratings and edit marks arrive with each thumbnail: reading every sidecar here froze the window on cloud folders.
         self.meta.clear();
+        self.cull.failed.clear();
         self.folder = Some(dir);
         self.files = files.clone();
         self.thumbs.clear();
@@ -736,6 +743,7 @@ impl App {
         self.photo = None;
         self.rendered = None;
         self.loading = true;
+        self.open_error = None;
         self.picking_base = false;
         self.last_preset = None;
         self.samples.clear();
@@ -839,7 +847,10 @@ impl App {
                             self.photo_gen += 1;
                             self.preset_tex.clear();
                         }
-                        Err(e) => self.status = format!("Could not open: {e}"),
+                        Err(e) => {
+                            self.status = format!("Could not open: {e}");
+                            self.open_error = Some(e);
+                        }
                     }
                 }
                 Msg::Loaded(..) => {}
@@ -854,8 +865,11 @@ impl App {
                     self.status = format!("Synced to {} frame{}", done.len(), if done.len() == 1 { "" } else { "s" });
                     self.meta.extend(done);
                 }
-                Msg::Cull(p, d) => {
+                Msg::Cull(p, d, skipped) => {
                     self.cull.pending.remove(&p);
+                    if d.is_none() && !skipped {
+                        self.cull.failed.insert(p.clone());
+                    }
                     if let Some(d) = d {
                         let name = p.display().to_string();
                         let tex = ctx.load_texture(format!("cull {name}"), d.img, TextureOptions::LINEAR);
@@ -1868,16 +1882,17 @@ impl App {
 
     /// Ask for a photo's culling image (fast embedded preview, focus map and raw statistics), off the UI thread.
     fn request_cull(&mut self, ctx: &egui::Context, f: &Path) {
-        if self.cull.cache.contains_key(f) || !self.cull.pending.insert(f.to_path_buf()) {
+        if self.cull.cache.contains_key(f) || self.cull.failed.contains(f) || !self.cull.pending.insert(f.to_path_buf()) {
             return;
         }
         let (f, tx, ctx2, wanted) = (f.to_path_buf(), self.tx.clone(), ctx.clone(), self.cull.wanted.clone());
         std::thread::spawn(move || {
             let _one = DECODE.lock().unwrap_or_else(|e| e.into_inner());
+            if !wanted.lock().is_ok_and(|w| w.contains(&f)) {
+                let _ = tx.send(Msg::Cull(f, None, true)); // stepped past it while it waited
+                return;
+            }
             let data = (|| {
-                if !wanted.lock().ok()?.contains(&f) {
-                    return None; // stepped past it while it waited
-                }
                 let img = load::load_quick(&f, 2560).ok()?;
                 let p = Params { border: Default::default(), ..read_params(&f).unwrap_or_default() };
                 let out = develop::render(&img, &p, 0.3);
@@ -1892,7 +1907,7 @@ impl App {
                 };
                 Some(CullData { focus: focus_map(&out), img: to_color_image(&out), bins, clipped, raw: raw.is_some() })
             })();
-            let _ = tx.send(Msg::Cull(f, data));
+            let _ = tx.send(Msg::Cull(f, data, false));
             ctx2.request_repaint();
         });
     }
@@ -1928,7 +1943,11 @@ impl App {
         for (k, f) in shown.iter().enumerate() {
             let slot = Rect::from_min_size(pos2(avail.left() + k as f32 * (slot_w + 12.0), avail.top()), vec2(slot_w, avail.height() - 30.0));
             let Some(c) = self.cull.cache.get(f) else {
-                ui.put(slot, egui::Spinner::new());
+                if self.cull.failed.contains(f) {
+                    ui.put(slot, egui::Label::new(RichText::new(format!("Can't open {}", f.file_name().unwrap_or_default().to_string_lossy())).color(TEXT2)));
+                } else {
+                    ui.put(slot, egui::Spinner::new());
+                }
                 continue;
             };
             let s = c.tex.size_vec2();
@@ -2148,47 +2167,69 @@ impl App {
 
     fn filmstrip(&mut self, ui: &mut Ui) {
         let mut open = None;
-        egui::ScrollArea::horizontal().auto_shrink([false, true]).show(ui, |ui| {
-            ui.horizontal_centered(|ui| {
-                for f in &self.files {
-                    let size = vec2(93.0, 62.0);
-                    let r = match self.thumb(f) {
-                        Some(t) => ui.add(egui::Image::new(t).uv(cover_uv(t, 1.5)).fit_to_exact_size(size).maintain_aspect_ratio(false).corner_radius(3).sense(Sense::click())),
-                        None => {
-                            let (r, resp) = ui.allocate_exact_size(size, Sense::click());
-                            ui.painter().rect_filled(r, 3.0, CARD);
-                            resp
-                        }
-                    };
-                    // Marks, so a culled roll reads at a glance: stars, label dot, rejects dimmed.
-                    let m = self.meta.get(f).copied().unwrap_or_default();
-                    let p = ui.painter_at(r.rect);
-                    if m.flag < 0 {
-                        p.rect_filled(r.rect, 3.0, Color32::from_black_alpha(150));
-                        p.text(r.rect.center(), Align2::CENTER_CENTER, "×", FontId::proportional(20.0), TEXT2);
-                    }
-                    if m.rating > 0 {
-                        let w = m.rating as f32 * 9.0 + 6.0;
-                        let b = Rect::from_min_size(pos2(r.rect.left() + 3.0, r.rect.bottom() - 15.0), vec2(w, 12.0));
-                        p.rect_filled(b, 3.0, Color32::from_rgba_unmultiplied(20, 20, 22, 210));
-                        paint_stars(&p, pos2(b.left() + 7.5, b.center().y), m.rating, 3.5, BONE);
-                    }
-                    if m.label > 0 {
-                        p.circle_filled(pos2(r.rect.right() - 8.0, r.rect.top() + 8.0), 4.5, LABEL_COLORS[(m.label - 1).min(4) as usize]);
-                        p.circle_stroke(pos2(r.rect.right() - 8.0, r.rect.top() + 8.0), 4.5, Stroke::new(1.0, INK));
-                    }
-                    let here = if self.module == Module::Cull { self.lib_sel.as_ref() } else { self.current.as_ref() };
-                    if Some(f) == here {
-                        ui.painter().rect_stroke(r.rect.expand(2.0), 4.0, Stroke::new(2.0, ACCENT), egui::StrokeKind::Outside);
-                    } else if r.hovered() {
-                        ui.painter().rect_stroke(r.rect.expand(1.0), 4.0, Stroke::new(1.0, hex(0x55555C)), egui::StrokeKind::Outside);
-                    }
-                    if r.clicked() {
-                        open = Some(f.clone());
+        let (size, gap) = (vec2(93.0, 62.0), 6.0);
+        let step = size.x + gap;
+        let here = if self.module == Module::Cull { self.lib_sel.clone() } else { self.current.clone() };
+        let here_i = here.as_ref().and_then(|h| self.files.iter().position(|f| f == h));
+        // Bring the current frame into view when it changes (stepping with the arrow keys).
+        let id = ui.scope_id().with("strip_here");
+        let moved = ui.data(|d| d.get_temp::<Option<usize>>(id)) != Some(here_i);
+        ui.data_mut(|d| d.insert_temp(id, here_i));
+        let mut area = egui::ScrollArea::horizontal().auto_shrink([false, true]);
+        if moved && let Some(i) = here_i {
+            let w = ui.available_width();
+            let (x, visible) = (i as f32 * step, ui.data(|d| d.get_temp::<f32>(id.with("x"))).unwrap_or(0.0));
+            if x < visible || x + size.x > visible + w {
+                area = area.horizontal_scroll_offset((x - (w - size.x) / 2.0).max(0.0));
+            }
+        }
+        // Only the frames in view are drawn: a roll of thousands would otherwise touch (and reload) every thumbnail
+        // each frame, far more than the texture budget holds.
+        let out = area.show_viewport(ui, |ui, vp| {
+            let n = self.files.len();
+            let h = ui.available_height();
+            ui.set_min_size(vec2((n as f32 * step - gap).max(0.0), h));
+            let origin = pos2(ui.max_rect().left(), ui.max_rect().top() + ((h - size.y) / 2.0).max(0.0));
+            let first = (vp.min.x / step).floor().max(0.0) as usize;
+            let last = ((vp.max.x / step).ceil().max(0.0) as usize + 1).min(n);
+            for i in first..last {
+                let f = &self.files[i];
+                let rect = Rect::from_min_size(origin + vec2(i as f32 * step, 0.0), size);
+                let r = ui.interact(rect, ui.scope_id().with(("strip", i)), Sense::click());
+                match self.thumb(f) {
+                    Some(t) => egui::Image::new(t).uv(cover_uv(t, 1.5)).corner_radius(3).paint_at(ui, rect),
+                    None => {
+                        ui.painter().rect_filled(rect, 3.0, CARD);
                     }
                 }
-            });
+                // Marks, so a culled roll reads at a glance: stars, label dot, rejects dimmed.
+                let m = self.meta.get(f).copied().unwrap_or_default();
+                let p = ui.painter_at(rect);
+                if m.flag < 0 {
+                    p.rect_filled(rect, 3.0, Color32::from_black_alpha(150));
+                    p.text(rect.center(), Align2::CENTER_CENTER, "×", FontId::proportional(20.0), TEXT2);
+                }
+                if m.rating > 0 {
+                    let w = m.rating as f32 * 9.0 + 6.0;
+                    let b = Rect::from_min_size(pos2(rect.left() + 3.0, rect.bottom() - 15.0), vec2(w, 12.0));
+                    p.rect_filled(b, 3.0, Color32::from_rgba_unmultiplied(20, 20, 22, 210));
+                    paint_stars(&p, pos2(b.left() + 7.5, b.center().y), m.rating, 3.5, BONE);
+                }
+                if m.label > 0 {
+                    p.circle_filled(pos2(rect.right() - 8.0, rect.top() + 8.0), 4.5, LABEL_COLORS[(m.label - 1).min(4) as usize]);
+                    p.circle_stroke(pos2(rect.right() - 8.0, rect.top() + 8.0), 4.5, Stroke::new(1.0, INK));
+                }
+                if Some(i) == here_i {
+                    ui.painter().rect_stroke(rect.expand(2.0), 4.0, Stroke::new(2.0, ACCENT), egui::StrokeKind::Outside);
+                } else if r.hovered() {
+                    ui.painter().rect_stroke(rect.expand(1.0), 4.0, Stroke::new(1.0, hex(0x55555C)), egui::StrokeKind::Outside);
+                }
+                if r.clicked() {
+                    open = Some(f.clone());
+                }
+            }
         });
+        ui.data_mut(|d| d.insert_temp(id.with("x"), out.state.clamped_offset().x));
         if let Some(f) = open {
             if self.module == Module::Cull {
                 self.lib_sel = Some(f);
@@ -2202,7 +2243,13 @@ impl App {
         let avail = ui.available_rect_before_wrap().shrink(24.0);
         let (Some(tex), Some(before)) = (self.tex.clone(), self.before_tex.clone()) else {
             ui.centered_and_justified(|ui| {
-                if self.loading { ui.spinner(); } else { ui.label(RichText::new("Pick a frame in the Library").color(TEXT3)); }
+                if self.loading {
+                    ui.spinner();
+                } else if let Some(e) = &self.open_error {
+                    ui.label(RichText::new(format!("Can't open this frame\n{e}")).color(TEXT2));
+                } else {
+                    ui.label(RichText::new("Pick a frame in the Library").color(TEXT3));
+                }
             });
             return;
         };
