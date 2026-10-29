@@ -34,6 +34,10 @@ pub fn read_params(path: &Path) -> Option<Params> {
     match std::fs::read_to_string(sidecar(path)) {
         Ok(t) => {
             let mut p: Params = serde_json::from_str(&t).ok()?;
+            // Saved before the camera curve: its settings were made on the flat look (see `wants_cam_curve`).
+            if !t.contains("\"process\"") {
+                p.process = 1;
+            }
             // Ratings and labels set in Lightroom, darktable or Bridge since win over ours.
             if let Some(x) = &x {
                 let (r, l) = xmp::rating_label(x);
@@ -44,6 +48,13 @@ pub fn read_params(path: &Path) -> Option<Params> {
         }
         Err(_) => Some(xmp::parse(&x?).1),
     }
+}
+
+/// Whether a photo should get the camera's tone curve now: it has none yet, and its settings weren't made on the
+/// flat look of older versions (`Params::process`; those would change under it). Lightroom settings imported from
+/// an XMP assume Lightroom's own base curve, so they get it.
+pub fn wants_cam_curve(p: &Params) -> bool {
+    p.cam_curve.is_empty() && p.process >= 2
 }
 
 /// A sidecar that exists but can't be read (damaged, or written by a much newer version).
@@ -386,7 +397,7 @@ pub fn export_file(path: &Path, out_dir: &Path, o: &ExportOpts, n: usize, overri
     overrides(&mut p);
     let raw = load::load(path)?;
     // A RAW never opened in the app has no camera curve yet: measure it, as opening it would.
-    if p.cam_curve.is_empty() && load::is_raw(path) {
+    if load::is_raw(path) && wants_cam_curve(&p) {
         p.cam_curve = load::camera_curve(path, &raw);
     }
     let img = denoise::prepare(raw, path, &p)?;
@@ -636,6 +647,11 @@ mod tests {
         let p = Params { exposure: 1.25, ..Default::default() };
         write_params(&photo, &p).unwrap();
         assert!(read_params(&photo) == Some(p));
+        // Edits saved before the camera curve keep the flat look they were made on; new ones get the curve.
+        std::fs::write(sidecar(&photo), r#"{"exposure":1.25}"#).unwrap();
+        let old = read_params(&photo).unwrap();
+        assert!(old.process == 1 && !wants_cam_curve(&old));
+        assert!(wants_cam_curve(&Params::default()));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

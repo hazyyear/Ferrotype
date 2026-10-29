@@ -117,6 +117,9 @@ pub struct Params {
     /// photo, not to a look. Not used on negatives, whose inversion needs linear data.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub cam_curve: Vec<[f32; 2]>,
+    /// 1 = made before the camera curve existed (settings tuned on the flat look, so it never gets one);
+    /// 2 = starts from the camera's look. `read_params` marks a sidecar without the field as 1.
+    pub process: u8,
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -287,6 +290,7 @@ impl Default for Params {
             lens: String::new(), lens_focal: 0.0, lens_f: 0.0, lens_crop: 1.0, lens_dist: 100.0, lens_vig: 100.0,
             profile: None,
             cam_curve: vec![],
+            process: 2,
         }
     }
 }
@@ -306,7 +310,7 @@ impl Params {
             (self.lens.clone(), self.lens_focal, self.lens_f, self.lens_crop, self.lens_dist, self.lens_vig);
         // So does the camera or scanner profile: the negative conversion was measured with it.
         p.profile = self.profile.clone();
-        p.cam_curve = self.cam_curve.clone();
+        (p.cam_curve, p.process) = (self.cam_curve.clone(), self.process);
         p
     }
 
@@ -337,7 +341,7 @@ impl Params {
         let mut p: Params = serde_json::from_value(mix(&a, &b, t as f64)).unwrap_or_else(|_| to.clone());
         // Ratings and the like are never part of a look.
         (p.rating, p.flag, p.label) = (from.rating, from.flag, from.label);
-        p.cam_curve = from.cam_curve.clone();
+        (p.cam_curve, p.process) = (from.cam_curve.clone(), from.process);
         p
     }
 
@@ -383,7 +387,7 @@ impl Params {
 
     /// True when the photo has edits, ignoring its rating, flag, label and snapshots.
     pub fn is_edited(&self) -> bool {
-        Params { rating: 0, flag: 0, label: 0, snapshots: vec![], cam_curve: vec![], ..self.clone() } != Params::default()
+        Params { rating: 0, flag: 0, label: 0, snapshots: vec![], cam_curve: vec![], process: 2, ..self.clone() } != Params::default()
     }
 
     /// Turn a quarter clockwise (or back), carrying the crop, spots, filters and brush strokes along.
@@ -1880,6 +1884,7 @@ mod tests {
         // Old sidecars without a profile still load, and saving leaves the field out.
         let q: Params = serde_json::from_str("{}").unwrap();
         assert!(q.profile.is_none() && !serde_json::to_string(&q).unwrap().contains("profile"));
+        assert!(!Params { process: 1, ..q }.is_edited());
     }
 
     #[test]

@@ -875,8 +875,9 @@ impl App {
                         Ok(o) => {
                             let Opened { full, delta, preview, draft, before, auto_base, cam } = *o;
                             // First open of a RAW: measure the camera's curve once. It's part of the photo, so the
-                            // whole history gets it and it isn't an edit.
-                            if self.params.cam_curve.is_empty() && !cam.is_empty() {
+                            // whole history gets it and it isn't an edit. Edits saved before Ferrotype had it were
+                            // made on the flat look: those keep it (`main::wants_cam_curve`).
+                            if crate::wants_cam_curve(&self.params) && !cam.is_empty() {
                                 self.params.cam_curve = cam.clone();
                                 for h in &mut self.history {
                                     h.cam_curve = cam.clone();
