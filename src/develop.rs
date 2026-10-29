@@ -109,6 +109,9 @@ pub struct Params {
     /// How much of the profile's distortion and vignetting correction to apply, 0–200.
     pub lens_dist: f32,
     pub lens_vig: f32,
+    /// Camera or scanner colour profile built from a chart (see `calib`), applied to the source first.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<crate::calib::ColorProfile>,
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -277,6 +280,7 @@ impl Default for Params {
             masks: vec![],
             rot90: 0, label: 0, ai_nr: 0.0, snapshots: vec![],
             lens: String::new(), lens_focal: 0.0, lens_f: 0.0, lens_crop: 1.0, lens_dist: 100.0, lens_vig: 100.0,
+            profile: None,
         }
     }
 }
@@ -1131,6 +1135,15 @@ pub fn remap_marks(old: &Params, new: &mut Params, w: u32, h: u32) {
 }
 
 fn geometry_window(src: &Rgb32FImage, p: &Params, win: Option<Window>) -> Rgb32FImage {
+    let mut out = reshape(src, p, win);
+    // The colour profile corrects the camera or scanner itself, so it comes before everything else that reads colour.
+    if let Some(pr) = &p.profile {
+        pr.apply(&mut out);
+    }
+    out
+}
+
+fn reshape(src: &Rgb32FImage, p: &Params, win: Option<Window>) -> Rgb32FImage {
     let (fw, fh) = output_size(src.width(), src.height(), p);
     let turned;
     let src = match p.rot90 % 4 {
@@ -1803,6 +1816,17 @@ mod tests {
         assert_eq!(out.get_pixel(0, 0).0, [1.0; 3]);
         assert_eq!(out.get_pixel(165, 206).0, [0.0; 3], "photo stays centred");
         assert_eq!(add_border(img, &Border::default()).dimensions(), (300, 200));
+    }
+
+    #[test]
+    fn colour_profile_applies_to_the_source_before_the_negative() {
+        let img = Rgb32FImage::from_fn(8, 8, |_, _| image::Rgb([0.6, 0.3, 0.1]));
+        let swap = crate::calib::ColorProfile { name: "swap".into(), m: [[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]] };
+        let p = Params { profile: Some(swap), ..Default::default() };
+        assert_eq!(geometry(&img, &p).get_pixel(3, 3).0, [0.1, 0.3, 0.6]);
+        // Old sidecars without a profile still load, and saving leaves the field out.
+        let q: Params = serde_json::from_str("{}").unwrap();
+        assert!(q.profile.is_none() && !serde_json::to_string(&q).unwrap().contains("profile"));
     }
 
     #[test]

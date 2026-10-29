@@ -44,6 +44,23 @@ enum Tool {
     Heal,
     Mask,
     Sample,
+    /// Place a colour chart on the photo to build a camera or scanner profile.
+    Chart,
+}
+
+/// The chart calibration tool: which chart, where its corner patches are (frame fractions), and the last fit.
+struct ChartUi {
+    target: crate::calib::Target,
+    q: [[f32; 2]; 4],
+    grab: Option<usize>,
+    name: String,
+    fit: Option<Result<crate::calib::Fit, String>>,
+}
+
+impl ChartUi {
+    fn new() -> Self {
+        ChartUi { target: crate::calib::colorchecker(), q: [[0.3, 0.35], [0.7, 0.35], [0.7, 0.65], [0.3, 0.65]], grab: None, name: String::new(), fit: None }
+    }
 }
 
 /// What the Library needs to know about a photo's sidecar, cached per folder.
@@ -326,6 +343,9 @@ pub struct App {
     rename_dlg: Option<RenameDlg>,
     mask_ui: MaskUi,
     tool: Tool,
+    chart: ChartUi,
+    /// Saved camera and scanner profiles (Calibration).
+    profiles: Vec<crate::calib::ColorProfile>,
     crop_grab: Option<usize>,
     crop_aspect: usize,
     spot_size: f32,
@@ -554,7 +574,7 @@ fn describe_change(a: &Params, b: &Params) -> (String, String) {
         ("t_rot", "Rotate"), ("t_scale", "Scale"), ("flip_h", "Flip"), ("crop", "Crop"), ("vig", "Vignette"), ("vig_mid", "Vignette midpoint"),
         ("vig_round", "Vignette roundness"), ("vig_fea", "Vignette feather"), ("vig_hi", "Vignette highlights"), ("gr_amt", "Grain"), ("gr_size", "Grain size"),
         ("gr_rough", "Grain roughness"), ("cal_sh", "Shadows tint"), ("cal", "Calibration"), ("neg", "Negative"), ("border", "Border"), ("spots", "Spot removal"), ("masks", "Mask"), ("hal_amt", "Halation"), ("hal_size", "Halation size"), ("hal_thr", "Halation threshold"), ("curves", "Point curve"), ("lut", "LUT"), ("lut_amt", "LUT amount"), ("rating", "Rating"), ("flag", "Flag"),
-        ("rot90", "Rotate 90°"), ("label", "Label"), ("ai_nr", "AI denoise"), ("snapshots", "Snapshot"),
+        ("rot90", "Rotate 90°"), ("profile", "Profile"), ("label", "Label"), ("ai_nr", "AI denoise"), ("snapshots", "Snapshot"),
     ];
     let changed: Vec<&(&str, &str)> = names.iter().filter(|(k, _)| ja.get(k) != jb.get(k)).collect();
     match changed.as_slice() {
@@ -597,7 +617,7 @@ impl App {
             history: vec![Params::default()], hist_pos: 0, copied: None, view: View::After, holding_before: false, picking_base: false,
             status: String::new(), presets, preset_tex: vec![], last_preset: None, preset_mix: None, preset_amt: 100.0, preset_name: String::new(), stock_query: String::new(), my_stocks: negative::custom_stocks(), my_stock_name: String::new(), proof: 0,
             stock_tab: 0, mixer_tab: 0, open: [true, false, false, false, false, false, false, false, false, false, false, false, false, false], tool: Tool::None,
-            zoom: None, curve_chan: 0, curve_grab: None, curve_big: false, samples: vec![], rename_dlg: None, mask_ui: MaskUi::default(),
+            zoom: None, curve_chan: 0, curve_grab: None, curve_big: false, samples: vec![], rename_dlg: None, mask_ui: MaskUi::default(), chart: ChartUi::new(), profiles: crate::calib::saved(),
             crop_grab: None, crop_aspect: 0, spot_size: 2.0, heal_clone: false, spot_sel: None, heal_drag: None, view_map: [1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0], photo_wh: [1.0, 1.0],
             export: ExportOpts::load(), export_dialog: None, export_sel: vec![], export_sets: [false; 3], keymap: Keymap::load(), keys_open: false, binding: None, picking_wb: false,
             thumb_due: false, lens_query: String::new(), lib_multi: vec![], pano_busy: false,
@@ -1040,8 +1060,8 @@ impl App {
         // While a slider is held, render the small draft; the full preview follows on release.
         let busy = ctx.input(|i| i.pointer.any_down()) || ctx.memory(|m| m.has_focus(egui::Id::NULL.with("caption")));
         let draft = busy && self.history.get(self.hist_pos) != Some(&self.params);
-        // Cropping shows the whole frame, without the border, with the crop drawn on top.
-        let shown = if self.tool == Tool::Crop { Params { crop: [0.0; 4], border: Default::default(), ..self.params.clone() } } else { self.params.clone() };
+        // Cropping and placing a chart show the whole frame, without the border, with the crop drawn on top.
+        let shown = if matches!(self.tool, Tool::Crop | Tool::Chart) { Params { crop: [0.0; 4], border: Default::default(), ..self.params.clone() } } else { self.params.clone() };
         let overlay = (self.tool == Tool::Mask && self.mask_ui.overlay && self.mask_ui.sel < shown.masks.len()).then_some(self.mask_ui.sel);
         let key = (shown.clone(), self.clip_view, draft, self.proof, overlay);
         if self.rendered.as_ref() == Some(&key) {
@@ -1076,7 +1096,7 @@ impl App {
         }
         self.last_rgb = Some(r.image);
         self.rendered = Some(r.key);
-        if self.thumb_due && !draft && self.tool != Tool::Crop && overlay.is_none() {
+        if self.thumb_due && !draft && !matches!(self.tool, Tool::Crop | Tool::Chart) && overlay.is_none() {
             self.refresh_thumb();
         }
     }
@@ -1543,6 +1563,153 @@ impl App {
             pt.circle_stroke(c, 7.0, Stroke::new(1.5, Color32::WHITE));
             pt.text(c + vec2(10.0, -10.0), Align2::LEFT_CENTER, format!("{}", k + 1), FontId::new(11.0, semi()), Color32::WHITE);
         }
+    }
+
+    /// Chart tool on the photo: drag the four numbered corners onto the centres of the chart's corner patches
+    /// (or drag inside to move it). Each patch shows its reference colour, so a misplaced grid stands out.
+    fn chart_tool(&mut self, ui: &Ui, resp: &egui::Response, r: Rect) {
+        let corners = self.chart.q.map(|f| self.to_screen(r, f));
+        let inside = |p: Pos2| {
+            // Inside the quad: same side of all four edges.
+            let s: Vec<f32> = (0..4).map(|i| { let (a, b) = (corners[i], corners[(i + 1) % 4]); (b - a).x * (p - a).y - (b - a).y * (p - a).x }).collect();
+            s.iter().all(|v| *v >= 0.0) || s.iter().all(|v| *v <= 0.0)
+        };
+        if resp.drag_started()
+            && let Some(p) = ui.input(|i| i.pointer.press_origin())
+        {
+            self.chart.grab = corners.iter().position(|c| c.distance(p) < 16.0).or(inside(p).then_some(4));
+        }
+        if resp.dragged()
+            && let (Some(g), Some(p)) = (self.chart.grab, resp.interact_pointer_pos())
+        {
+            let f = self.to_frame((p - r.min) / r.size());
+            if g < 4 {
+                self.chart.q[g] = f.map(|v| v.clamp(0.0, 1.0));
+            } else {
+                let was = self.to_frame((p - resp.drag_delta() - r.min) / r.size());
+                let d = [f[0] - was[0], f[1] - was[1]];
+                let lo = [0, 1].map(|k| self.chart.q.iter().map(|q| q[k]).fold(1.0, f32::min));
+                let hi = [0, 1].map(|k| self.chart.q.iter().map(|q| q[k]).fold(0.0, f32::max));
+                let d = [d[0].clamp(-lo[0], 1.0 - hi[0]), d[1].clamp(-lo[1], 1.0 - hi[1])];
+                for q in &mut self.chart.q {
+                    (q[0], q[1]) = (q[0] + d[0], q[1] + d[1]);
+                }
+            }
+            self.chart.fit = None;
+        }
+        if resp.drag_stopped() {
+            self.chart.grab = None;
+        }
+        let pt = ui.painter_at(r);
+        let t = &self.chart.target;
+        let sq = corners.map(|c| [c.x, c.y]);
+        let half = crate::calib::sample_half(t, &sq, 1.0).max(2.0);
+        for i in 0..t.rows * t.cols {
+            let Some(lab) = t.lab[i] else { continue };
+            let c = crate::calib::patch_center(t, &sq, i / t.cols, i % t.cols);
+            let rect = Rect::from_center_size(pos2(c[0], c[1]), vec2(half, half) * 2.0);
+            pt.rect_filled(rect, 1.0, lin(crate::calib::lab_to_rgb(lab).map(|v| v.clamp(0.0, 1.0))));
+            pt.rect_stroke(rect, 1.0, Stroke::new(1.0, Color32::from_black_alpha(160)), egui::StrokeKind::Outside);
+        }
+        for i in 0..4 {
+            pt.line_segment([corners[i], corners[(i + 1) % 4]], Stroke::new(1.0, Color32::from_white_alpha(140)));
+        }
+        for (i, c) in corners.iter().enumerate() {
+            pt.circle_filled(*c, 9.0, Color32::from_black_alpha(170));
+            pt.circle_stroke(*c, 9.0, Stroke::new(1.5, Color32::WHITE));
+            pt.text(*c, Align2::CENTER_CENTER, format!("{}", i + 1), FontId::new(11.0, semi()), Color32::WHITE);
+        }
+        if let Some(h) = resp.hover_pos() {
+            let icon = if corners.iter().any(|c| c.distance(h) < 16.0) { egui::CursorIcon::Crosshair } else if inside(h) { egui::CursorIcon::Grab } else { egui::CursorIcon::Default };
+            ui.ctx().set_cursor_icon(icon);
+        }
+    }
+
+    /// The settings panel while the chart tool is on: which chart, a name, and Build.
+    fn chart_panel(&mut self, ui: &mut Ui) {
+        let mut done = false;
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            egui::Frame::new().inner_margin(egui::Margin::symmetric(16, 12)).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Chart calibration").size(14.0).family(semi()).color(TEXT));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| done = ui.button("Done").clicked());
+                });
+                ui.add_space(6.0);
+                ui.label(RichText::new("Shoot or scan the chart under the same light as your photos, without clipping the white patch. Then drag the numbered markers onto the centres of the corner patches.").size(12.0).color(TEXT2));
+                ui.add_space(4.0);
+                let first = if self.chart.target.cols == 6 { "1 on dark skin (brown), 2 on bluish green, 3 on black, 4 on white" } else { "1 on A1, 2 on the last patch of row A, 3 on the last patch of the last row, 4 on its first" };
+                ui.label(RichText::new(first).size(12.0).color(TEXT2));
+                ui.add_space(10.0);
+                ui.label(caps("Chart"));
+                ui.horizontal(|ui| {
+                    let cc = self.chart.target.cols == 6 && self.chart.target.rows == 4 && self.chart.target.name == "ColorChecker 24";
+                    if small_action(ui, "ColorChecker 24", cc).clicked() {
+                        self.chart.target = crate::calib::colorchecker();
+                        self.chart.fit = None;
+                    }
+                    if small_action(ui, if cc { "IT8 reference…" } else { &self.chart.target.name }, !cc).on_hover_text("An IT8.7 chart: open the reference file (CGATS .txt) that came with it").clicked()
+                        && let Some(f) = rfd::FileDialog::new().add_filter("IT8 reference", &["txt", "it8", "cie", "cgats"]).pick_file()
+                    {
+                        let name = f.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                        match std::fs::read_to_string(&f).map_err(|e| e.to_string()).and_then(|t| crate::calib::parse_cgats(&t, &name)) {
+                            Ok(t) => {
+                                self.chart.target = t;
+                                self.chart.fit = None;
+                            }
+                            Err(e) => self.chart.fit = Some(Err(format!("Could not read the reference file: {e}"))),
+                        }
+                    }
+                });
+                ui.add_space(10.0);
+                ui.label(caps("Profile name"));
+                ui.add(egui::TextEdit::singleline(&mut self.chart.name).hint_text("e.g. X-T5 daylight, or Scanner + CRI light").desired_width(ui.available_width()));
+                ui.add_space(8.0);
+                let can = self.photo.is_some() && !self.chart.name.trim().is_empty();
+                if primary(ui, "Build profile", can).on_disabled_hover_text("Name the profile first").clicked() {
+                    self.build_chart_profile();
+                }
+                ui.add_space(8.0);
+                match &self.chart.fit {
+                    Some(Ok(f)) => {
+                        ui.label(RichText::new(format!("Average colour error ΔE {:.1} → {:.1} (worst patch {:.1}), from {} patches.", f.de_before, f.de_after, f.de_worst, f.used)).size(12.0).color(TEXT));
+                        ui.label(RichText::new("Saved and applied to this photo. Pick it under Calibration › Profile for other photos, or paste these settings onto them. Set white balance on the chart's grey patch as usual.").size(11.5).color(TEXT2));
+                        if f.de_after > 6.0 {
+                            ui.label(RichText::new("The error is still high: check that each marker sits on the right patch.").size(11.5).color(ACCENT));
+                        }
+                    }
+                    Some(Err(e)) => {
+                        ui.label(RichText::new(e).size(12.0).color(ACCENT));
+                    }
+                    None => {}
+                }
+            });
+        });
+        if done {
+            self.tool = Tool::None;
+        }
+    }
+
+    /// Measure the chart on the uncorrected frame, fit, save and apply the profile.
+    fn build_chart_profile(&mut self) {
+        let Some(ph) = &self.photo else { return };
+        let frame = develop::geometry(&ph.preview, &Params { crop: [0.0; 4], profile: None, ..self.params.clone() });
+        let measured = crate::calib::sample(&frame, &self.chart.target, &self.chart.q);
+        let fit = crate::calib::fit(&self.chart.target, &measured);
+        if let Ok(f) = &fit {
+            let prof = crate::calib::ColorProfile { name: self.chart.name.trim().to_string(), m: f.m };
+            match prof.install() {
+                Ok(_) => {
+                    self.params.profile = Some(prof);
+                    self.profiles = crate::calib::saved();
+                    self.status = format!("Saved profile {}", self.chart.name.trim());
+                }
+                Err(e) => {
+                    self.chart.fit = Some(Err(format!("Could not save the profile: {e}")));
+                    return;
+                }
+            }
+        }
+        self.chart.fit = Some(fit);
     }
 
     fn to_screen(&self, r: Rect, f: [f32; 2]) -> egui::Pos2 {
@@ -2210,7 +2377,7 @@ impl App {
                         self.view = View::After;
                         self.zoom = None;
                         // Open the matching panel section.
-                        match self.tool { Tool::Crop => self.open[6] = true, Tool::Heal => self.open[10] = true, Tool::Mask => self.open[11] = true, Tool::None | Tool::Sample => {} }
+                        match self.tool { Tool::Crop => self.open[6] = true, Tool::Heal => self.open[10] = true, Tool::Mask => self.open[11] = true, Tool::None | Tool::Sample | Tool::Chart => {} }
                     }
                 }
             }
@@ -2435,6 +2602,7 @@ impl App {
                         Tool::Crop => self.crop_tool(ui, &resp, r),
                         Tool::Heal => self.heal_tool(ui, &resp, r),
                         Tool::Mask => self.mask_tool(ui, &resp, r),
+                        Tool::Chart => self.chart_tool(ui, &resp, r),
                         Tool::None | Tool::Sample => {}
                     }
                     self.sample_marks(ui, &resp, r, tool == Tool::Sample);
@@ -3168,6 +3336,10 @@ impl App {
     }
 
     fn develop_right(&mut self, ui: &mut Ui) {
+        if self.tool == Tool::Chart {
+            self.chart_panel(ui);
+            return;
+        }
         let d = Params::default();
         let photo = &self.photo;
         let mixer_tab = &mut self.mixer_tab;
@@ -3176,6 +3348,8 @@ impl App {
         let bins = self.bins;
         let mask_ui = &mut self.mask_ui;
         let mut mask_tool_on = false;
+        let profiles = &self.profiles;
+        let mut chart_on = false;
         let p = &mut self.params;
         let (spot_size, crop_aspect) = (&mut self.spot_size, &mut self.crop_aspect);
         let (heal_clone, spot_sel) = (&mut self.heal_clone, &mut self.spot_sel);
@@ -3488,6 +3662,29 @@ impl App {
                 ui.label(RichText::new("Applied after the tone and color settings, on display-ready colors (Rec.709 / sRGB LUTs).").size(11.5).color(TEXT2));
             });
             section(ui, "Calibration", o_cal, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Profile").size(12.0));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if small_action(ui, "From chart…", false).on_hover_text("Build a camera or scanner profile from a photo of a ColorChecker or IT8 chart").clicked() {
+                            chart_on = true;
+                        }
+                        let shown = p.profile.as_ref().map_or("Standard", |c| c.name.as_str());
+                        egui::ComboBox::from_id_salt("cal_profile").width(ui.available_width() - 8.0).selected_text(shown).show_ui(ui, |ui| {
+                            if ui.selectable_label(p.profile.is_none(), "Standard").clicked() {
+                                p.profile = None;
+                            }
+                            for c in profiles {
+                                if ui.selectable_label(p.profile.as_ref() == Some(c), &c.name).clicked() {
+                                    p.profile = Some(c.clone());
+                                }
+                            }
+                        });
+                    });
+                });
+                if profiles.is_empty() && p.profile.is_none() {
+                    ui.label(RichText::new("Profiles correct a camera's or scanner's colours. Build one from a chart shot under your light.").size(11.5).color(TEXT2));
+                }
+                ui.add_space(4.0);
                 slider(ui, "Shadows tint", &mut p.cal_sh, -100.0, 100.0, 0.0, Some(&|t: f32| lin([0.12, 0.12 + t / 100.0 * 0.06, 0.12])));
                 for (j, name) in ["Red", "Green", "Blue"].into_iter().enumerate() {
                     let mut e = [0.0f32; 3];
@@ -3502,6 +3699,12 @@ impl App {
         });
         if let Some(a) = set_aspect {
             self.set_crop_aspect(a);
+        }
+        if chart_on {
+            self.tool = Tool::Chart;
+            self.chart.fit = None;
+            self.zoom = None;
+            self.view = View::After;
         }
         if mask_tool_on && self.tool != Tool::Mask {
             self.tool = Tool::Mask;
@@ -3767,6 +3970,7 @@ impl App {
 
     fn negative_right(&mut self, ui: &mut Ui) {
         let auto_base = self.photo.as_ref().map(|p| p.auto_base);
+        let profile = self.params.profile.clone();
         let np = &mut self.params.neg;
         let st = negative::stock(&np.stock);
         let mut add_character = false;
@@ -3867,7 +4071,7 @@ impl App {
                 if locked != np.levels.is_some() {
                     if locked {
                         if let Some(ph) = &self.photo {
-                            let geo = develop::geometry(&ph.preview, &Params { neg: np.clone(), ..Default::default() });
+                            let geo = develop::geometry(&ph.preview, &Params { neg: np.clone(), profile: profile.clone(), ..Default::default() });
                             let (b, l) = negative::analyse(&geo, np);
                             (np.base, np.levels) = (Some(b), Some(l));
                         }
