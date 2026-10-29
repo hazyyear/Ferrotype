@@ -15,6 +15,7 @@ mod xmp;
 mod rename;
 mod hdrmerge;
 mod gpu;
+mod calib;
 
 use develop::Params;
 use image::{DynamicImage, Rgb32FImage, codecs::jpeg::JpegEncoder};
