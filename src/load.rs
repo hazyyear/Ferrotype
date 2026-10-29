@@ -15,6 +15,11 @@ pub fn is_raw(path: &Path) -> bool {
     e != "tif" && e != "tiff" && rawler::decoders::supported_extensions().iter().any(|s| s.eq_ignore_ascii_case(&e))
 }
 
+/// `is_raw` for a photo or a virtual copy of one (`IMG_0001.NEF.copy2`).
+pub fn is_raw_photo(path: &Path) -> bool {
+    is_raw(copy_of(path).as_deref().unwrap_or(path))
+}
+
 pub fn is_supported(path: &Path) -> bool {
     is_raw(path) || OTHER_EXT.contains(&ext(path).as_str())
 }
@@ -259,5 +264,7 @@ mod tests {
             assert!((q[1] - (q[0] * 2.0).powf(0.7).min(1.0)).abs() < 0.01, "{q:?}");
         }
         assert!(super::match_curve(vec![0.1; 10], vec![0.2; 10]).is_empty());
+        // A virtual copy of a RAW is a RAW too (it gets the same camera curve).
+        assert!(super::is_raw_photo(std::path::Path::new("IMG_1.NEF.copy2")) && !super::is_raw(std::path::Path::new("IMG_1.NEF.copy2")));
     }
 }

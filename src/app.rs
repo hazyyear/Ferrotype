@@ -797,7 +797,7 @@ impl App {
                 let delta = if nr { denoise::cached_delta(&path, full.len()) } else { None };
                 let preview = load::fit(&full, PREVIEW);
                 let draft = load::fit(&preview, DRAFT);
-                let cam = if load::is_raw(&path) { load::camera_curve(&path, &full) } else { vec![] };
+                let cam = if load::is_raw_photo(&path) { load::camera_curve(&path, &full) } else { vec![] };
                 // "Before" is the photo as the camera rendered it: with its tone curve, without edits.
                 let mut shown = preview.clone();
                 develop::apply_cam_curve(&mut shown, &cam);

@@ -397,7 +397,7 @@ pub fn export_file(path: &Path, out_dir: &Path, o: &ExportOpts, n: usize, overri
     overrides(&mut p);
     let raw = load::load(path)?;
     // A RAW never opened in the app has no camera curve yet: measure it, as opening it would.
-    if load::is_raw(path) && wants_cam_curve(&p) {
+    if load::is_raw_photo(path) && wants_cam_curve(&p) {
         p.cam_curve = load::camera_curve(path, &raw);
     }
     let img = denoise::prepare(raw, path, &p)?;
