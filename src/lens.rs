@@ -421,6 +421,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn big_endian_exif_reads_camera_and_settings() {
+        // "MM" (big-endian) TIFF as Nikon bodies and many scanners write it: IFD0 with Make and an Exif
+        // pointer, then an Exif IFD with FNumber (rational, stored after the IFDs), ISO and 35 mm focal length.
+        let mut b: Vec<u8> = b"MM\0\x2a".to_vec();
+        b.extend(8u32.to_be_bytes());
+        let entry = |b: &mut Vec<u8>, tag: u16, typ: u16, count: u32, value: [u8; 4]| {
+            b.extend(tag.to_be_bytes());
+            b.extend(typ.to_be_bytes());
+            b.extend(count.to_be_bytes());
+            b.extend(value);
+        };
+        let ifd0 = 8;
+        let exif = ifd0 + 2 + 2 * 12 + 4;
+        let data = exif + 2 + 4 * 12 + 4;
+        b.extend(2u16.to_be_bytes());
+        entry(&mut b, 0x010F, 2, 6, (data as u32 + 8).to_be_bytes()); // Make, 6 bytes, after the rationals
+        entry(&mut b, 0x8769, 4, 1, (exif as u32).to_be_bytes());
+        b.extend(0u32.to_be_bytes());
+        b.extend(4u16.to_be_bytes());
+        entry(&mut b, 0x829D, 5, 1, (data as u32).to_be_bytes()); // FNumber 28/10
+        entry(&mut b, 0x8827, 3, 1, [0x01, 0x90, 0, 0]); // ISO 400: a SHORT sits in the first two bytes
+        entry(&mut b, 0x920A, 5, 1, (data as u32).to_be_bytes()); // focal length, same 2.8 for brevity
+        entry(&mut b, 0xA405, 3, 1, [0, 42, 0, 0]); // 42 mm equivalent
+        b.extend(0u32.to_be_bytes());
+        assert_eq!(b.len(), data);
+        b.extend(28u32.to_be_bytes());
+        b.extend(10u32.to_be_bytes());
+        b.extend(b"NIKON\0");
+        let s = parse_exif(&b).expect("parses");
+        assert_eq!((s.make.as_str(), s.fnum, s.iso, s.focal), ("NIKON", 2.8, 400.0, 2.8));
+        assert_eq!(s.crop, Some(15.0));
+    }
+
+    #[test]
     fn database_loads_and_matches_exif_names() {
         let d = db();
         assert!(d.lenses.len() > 1000, "{}", d.lenses.len());

@@ -167,6 +167,8 @@ pub fn raw_stats(path: &Path) -> Option<RawStats> {
     let (w, h) = (raw.width, raw.height);
     let mut bins = [[0f32; 128]; 3];
     let (mut clip, mut count) = ([0u64; 3], [0u64; 3]);
+    // Bin of each level (gamma 2.2, 128 bins), looked up instead of a powf per sample.
+    let bin_of: [u8; 4096] = std::array::from_fn(|i| ((i as f32 / 4095.0).powf(1.0 / 2.2) * 127.0) as u8);
     // Every second row and column of each 2×2 block is plenty for statistics.
     for y in (0..h).step_by(3) {
         for x in (0..w).step_by(3) {
@@ -182,7 +184,7 @@ pub fn raw_stats(path: &Path) -> Option<RawStats> {
                 clip[c] += 1;
             }
             let n = ((v - black) / (white - black)).clamp(0.0, 1.0);
-            bins[c][((n.powf(1.0 / 2.2)) * 127.0) as usize] += 1.0;
+            bins[c][bin_of[(n * 4095.0) as usize] as usize] += 1.0;
         }
     }
     for b in &mut bins {

@@ -130,14 +130,20 @@ fn read_file(path: &Path, pixels: bool) -> Result<(Option<Rgb32FImage>, Option<V
                 let (w, ht, stride) = (w as usize, ht as usize, stride as usize);
                 let max = ((1u32 << range(img, CHANNEL_INTERLEAVED).clamp(8, 16)) - 1) as f32;
                 let mut out = Rgb32FImage::new(w as u32, ht as u32);
-                for y in 0..ht {
-                    let row = std::slice::from_raw_parts(p.add(y * stride), if deep { w * 6 } else { w * 3 });
-                    let dst = &mut out.as_mut()[y * w * 3..(y + 1) * w * 3];
+                // Every code value through one table (256 entries, or up to 65,536 for 10-16 bit), rows on every
+                // core: a powf per value on one thread added about half a second to a 24 MP HEIC.
+                let row_len = if deep { w * 6 } else { w * 3 };
+                let src = std::slice::from_raw_parts(p, (ht - 1) * stride + row_len);
+                let top = if deep { max as usize } else { 255 };
+                let table: Vec<f32> = (0..=top).map(|v| crate::load::srgb_to_linear(v as f32 / top as f32)).collect();
+                use rayon::prelude::*;
+                out.par_chunks_mut(w * 3).enumerate().for_each(|(y, dst)| {
+                    let row = &src[y * stride..y * stride + row_len];
                     for (i, d) in dst.iter_mut().enumerate() {
-                        let v = if deep { u16::from_le_bytes([row[i * 2], row[i * 2 + 1]]) as f32 } else { row[i] as f32 };
-                        *d = crate::load::srgb_to_linear(v / if deep { max } else { 255.0 });
+                        let v = if deep { u16::from_le_bytes([row[i * 2], row[i * 2 + 1]]) as usize } else { row[i] as usize };
+                        *d = table[v.min(top)];
                     }
-                }
+                });
                 release_image(img);
                 Ok((Some(out), exif))
             })();

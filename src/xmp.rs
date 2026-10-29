@@ -170,12 +170,17 @@ pub fn with_rating_label(existing: Option<&str>, p: &Params) -> Option<String> {
     match existing {
         Some(x) => {
             let (r, l) = rating_label(x);
-            if r.unwrap_or(0) == rating && LABELS[l.unwrap_or(0) as usize] == label {
+            // A label outside Lightroom's five (Bridge's "Approved", "To Do") reads as none; only rewrite the label
+            // when ours really differs, so changing the stars keeps it.
+            let label_changed = l.unwrap_or(0) != p.label.min(5);
+            if r.unwrap_or(0) == rating && !label_changed {
                 return None;
             }
             let mut x = x.to_string();
             set_attr(&mut x, "xmp:Rating", &rating.to_string());
-            set_attr(&mut x, "xmp:Label", label);
+            if label_changed {
+                set_attr(&mut x, "xmp:Label", label);
+            }
             Some(x)
         }
         None if rating == 0 && label.is_empty() => None,
@@ -217,5 +222,9 @@ mod tests {
         let back = parse(&out).1;
         assert_eq!((back.flag, back.label, back.exposure), (-1, 1, 1.0));
         assert!(with_rating_label(Some(&out), &rejected).is_none(), "unchanged: nothing to write");
+        // Bridge's own label set: new stars must not wipe a label Ferrotype can't show.
+        let bridge = r#"<x:xmpmeta><rdf:RDF><rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmp:Rating="1" xmp:Label="Approved"/></rdf:RDF></x:xmpmeta>"#;
+        let out = with_rating_label(Some(bridge), &Params { rating: 3, ..Default::default() }).unwrap();
+        assert!(out.contains("xmp:Label=\"Approved\"") && out.contains("xmp:Rating=\"3\""));
     }
 }

@@ -7,7 +7,7 @@ use crate::load::{self, linear_to_srgb};
 use crate::negative::{self, Kind, Look, STOCKS};
 use crate::widgets::*;
 use crate::keys::{self, Keymap};
-use crate::{ExportOpts, contact_sheet, denoise, export_file, import_xmp_preset, read_params, save_output, scan, write_export, write_params};
+use crate::{ExportOpts, save_contact_sheets, denoise, export_file, import_xmp_preset, read_params, scan, write_export, write_params};
 use eframe::egui;
 use egui::{Align, Align2, Color32, ColorImage, FontId, Layout, Pos2, Rect, RichText, Sense, Stroke, TextureHandle, TextureOptions, Ui, Vec2, pos2, vec2};
 use image::Rgb32FImage;
@@ -869,7 +869,13 @@ impl App {
                 Msg::Status(s) => self.status = s,
                 Msg::Synced(done) => {
                     self.status = format!("Synced to {} frame{}", done.len(), if done.len() == 1 { "" } else { "s" });
-                    self.meta.extend(done);
+                    // Only what the sync changed: a rating, flag or label set while it ran is newer than the
+                    // thread's copy, and Move rejects reads this list.
+                    for (p, m) in done {
+                        let e = self.meta.entry(p).or_insert(m);
+                        e.edited = m.edited;
+                        e.neg = m.neg;
+                    }
                 }
                 Msg::Cull(p, d, skipped) => {
                     self.cull.pending.remove(&p);
@@ -1885,12 +1891,19 @@ impl App {
 
     fn make_contact_sheet(&mut self) {
         let files = self.lib_visible();
-        let Some(out) = rfd::FileDialog::new().set_file_name("contact-sheet.jpg").add_filter("JPEG", &["jpg"]).save_file() else { return };
+        let Some(mut out) = rfd::FileDialog::new().set_file_name("contact-sheet.jpg").add_filter("JPEG", &["jpg"]).save_file() else { return };
+        if out.extension().is_none() {
+            out.set_extension("jpg"); // some save dialogs (GTK) drop it
+        }
         self.status = format!("Making a contact sheet of {} photos…", files.len());
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            let r = save_output(contact_sheet(&files, 6), &out, 90);
-            let _ = tx.send(Msg::Status(match r { Ok(()) => format!("Saved {}", out.file_name().unwrap_or_default().to_string_lossy()), Err(e) => format!("Contact sheet failed: {e}") }));
+            let r = save_contact_sheets(&files, 6, &out);
+            let _ = tx.send(Msg::Status(match r {
+                Ok(w) if w.len() == 1 => format!("Saved {}", out.file_name().unwrap_or_default().to_string_lossy()),
+                Ok(w) => format!("Saved {} contact sheet pages", w.len()),
+                Err(e) => format!("Contact sheet failed: {e}"),
+            }));
         });
     }
 
