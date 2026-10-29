@@ -44,9 +44,23 @@ impl ColorProfile {
         let dir = dir().ok_or("no config folder")?;
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let safe: String = self.name.chars().map(|c| if c.is_alphanumeric() || " -_".contains(c) { c } else { '_' }).collect();
-        let path = dir.join(format!("{}.{EXT}", if safe.trim().is_empty() { "profile" } else { safe.trim() }));
+        let stem = if safe.trim().is_empty() { "profile" } else { safe.trim() };
+        // Two names can clean up to the same file name: keep the other profile and number this one.
+        let taken = |p: &std::path::Path| std::fs::read_to_string(p).ok().and_then(|t| serde_json::from_str::<ColorProfile>(&t).ok()).is_some_and(|c| c.name != self.name);
+        let mut path = dir.join(format!("{stem}.{EXT}"));
+        for n in 2.. {
+            if !taken(&path) {
+                break;
+            }
+            path = dir.join(format!("{stem}-{n}.{EXT}"));
+        }
         crate::write_atomic(&path, serde_json::to_string_pretty(self).map_err(|e| e.to_string())?.as_bytes()).map_err(|e| e.to_string())?;
         Ok(path)
+    }
+
+    /// One colour through the profile.
+    pub fn map(&self, c: [f32; 3]) -> [f32; 3] {
+        mul(&self.m, c).map(|v| v.max(0.0))
     }
 
     pub fn apply(&self, img: &mut Rgb32FImage) {
@@ -92,8 +106,8 @@ pub fn parse_cgats(text: &str, name: &str) -> Result<Target, String> {
             "END_DATA_FORMAT" => in_fmt = false,
             "BEGIN_DATA" => in_data = true,
             "END_DATA" => in_data = false,
-            _ if in_fmt => fields.extend(t.split_whitespace().map(String::from)),
-            _ if in_data => data.extend(t.split_whitespace().map(|s| s.trim_matches('"').to_string())),
+            _ if in_fmt => fields.extend(fields_of(t)),
+            _ if in_data => data.extend(fields_of(t)),
             _ => {}
         }
     }
@@ -132,6 +146,38 @@ pub fn parse_cgats(text: &str, name: &str) -> Result<Target, String> {
         lab[r * cols + c] = Some(v);
     }
     Ok(Target { name: name.into(), cols, rows, lab })
+}
+
+/// A colour measured with profile `from` (None = no profile), as it reads with profile `to` instead. Film base
+/// colours are plain averages of pixels, so they follow a profile change exactly.
+pub fn reprofile(c: [f32; 3], from: Option<&ColorProfile>, to: Option<&ColorProfile>) -> [f32; 3] {
+    let raw = match from.and_then(|p| invert(&p.m)) {
+        Some(inv) => mul(&inv, c),
+        None => c,
+    };
+    to.map_or(raw, |p| mul(&p.m, raw)).map(|v| v.max(1e-4))
+}
+
+/// Split a CGATS data line into fields; a quoted field may contain spaces.
+fn fields_of(line: &str) -> Vec<String> {
+    let mut out = vec![];
+    let mut it = line.chars().peekable();
+    while let Some(&c) = it.peek() {
+        if c.is_whitespace() {
+            it.next();
+        } else if c == '"' {
+            it.next();
+            out.push(it.by_ref().take_while(|c| *c != '"').collect());
+        } else {
+            let mut t = String::new();
+            while let Some(&c) = it.peek().filter(|c| !c.is_whitespace()) {
+                t.push(c);
+                it.next();
+            }
+            out.push(t);
+        }
+    }
+    out
 }
 
 // ---------- colour maths ----------
@@ -377,8 +423,31 @@ mod tests {
             }
         }
         txt += "GS0 90.1 0 0\nEND_DATA\n";
+
         let t = parse_cgats(&txt, "R1").unwrap();
         assert_eq!((t.rows, t.cols), (12, 22));
         assert_eq!(t.lab[22 + 2], Some([21.5, 3.0, -1.0])); // B3
+    }
+
+    #[test]
+    fn quoted_fields_with_spaces_stay_one_field() {
+        let mut txt = String::from("BEGIN_DATA_FORMAT\nSAMPLE_ID SAMPLE_NAME LAB_L LAB_A LAB_B\nEND_DATA_FORMAT\nBEGIN_DATA\n");
+        for r in 0..2u8 {
+            for c in 1..=8 {
+                txt += &format!("{}{} \"patch {c}\" 50 {c} 0\n", (b'A' + r) as char, c);
+            }
+        }
+        txt += "END_DATA\n";
+        let t = parse_cgats(&txt, "q").unwrap();
+        assert_eq!((t.rows, t.cols, t.lab[3]), (2, 8, Some([50.0, 4.0, 0.0])));
+    }
+
+    #[test]
+    fn reprofile_moves_a_base_between_profiles() {
+        let a = ColorProfile { name: "a".into(), m: [[1.2, -0.1, -0.1], [0.0, 1.0, 0.0], [-0.05, -0.1, 1.15]] };
+        let raw = [0.8, 0.5, 0.3];
+        let with_a = a.map(raw);
+        let back = reprofile(with_a, Some(&a), None);
+        assert!((0..3).all(|k| (back[k] - raw[k]).abs() < 1e-5), "{back:?}");
     }
 }

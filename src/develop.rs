@@ -298,6 +298,8 @@ impl Params {
         // The lens profile belongs to the photo, like its geometry.
         (p.lens, p.lens_focal, p.lens_f, p.lens_crop, p.lens_dist, p.lens_vig) =
             (self.lens.clone(), self.lens_focal, self.lens_f, self.lens_crop, self.lens_dist, self.lens_vig);
+        // So does the camera or scanner profile: the negative conversion was measured with it.
+        p.profile = self.profile.clone();
         p
     }
 
@@ -1836,6 +1838,9 @@ mod tests {
         let digital = Params { exposure: 0.5, ..Default::default() };
         let pasted = scan.with_look_of(&digital);
         assert!(pasted.neg.enabled && pasted.exposure == 0.5);
+        // A preset or paste never drops the scanner profile the conversion was measured with.
+        let profiled = Params { profile: Some(Default::default()), ..scan.clone() };
+        assert!(profiled.with_look_of(&digital).profile.is_some());
     }
 
     #[test]

@@ -998,7 +998,7 @@ impl App {
     /// Positive view shows a positive. Other frames (a slide, B&W, a positive opened here by mistake) wait for the
     /// switch or a stock. It's an ordinary edit: undo or the switch turns it off.
     fn convert_if_negative(&mut self) {
-        let Some(base) = self.photo.as_ref().map(|p| p.auto_base) else { return };
+        let Some(base) = self.auto_base() else { return };
         if self.module == Module::Negative && !self.params.neg.enabled && negative::orange_mask(base) {
             self.params.neg.enabled = true;
             self.status = "Orange film base found: converted as a colour negative".into();
@@ -1571,7 +1571,7 @@ impl App {
         let corners = self.chart.q.map(|f| self.to_screen(r, f));
         let inside = |p: Pos2| {
             // Inside the quad: same side of all four edges.
-            let s: Vec<f32> = (0..4).map(|i| { let (a, b) = (corners[i], corners[(i + 1) % 4]); (b - a).x * (p - a).y - (b - a).y * (p - a).x }).collect();
+            let s: [f32; 4] = std::array::from_fn(|i| { let (a, b) = (corners[i], corners[(i + 1) % 4]); (b - a).x * (p - a).y - (b - a).y * (p - a).x });
             s.iter().all(|v| *v >= 0.0) || s.iter().all(|v| *v <= 0.0)
         };
         if resp.drag_started()
@@ -1699,7 +1699,7 @@ impl App {
             let prof = crate::calib::ColorProfile { name: self.chart.name.trim().to_string(), m: f.m };
             match prof.install() {
                 Ok(_) => {
-                    self.params.profile = Some(prof);
+                    self.set_profile(Some(prof));
                     self.profiles = crate::calib::saved();
                     self.status = format!("Saved profile {}", self.chart.name.trim());
                 }
@@ -1710,6 +1710,28 @@ impl App {
             }
         }
         self.chart.fit = Some(fit);
+    }
+
+    /// Switch the colour profile. A film base and locked levels were measured through the old one, so they move
+    /// with it: the base exactly (it is an average of pixels), locked levels by measuring again.
+    fn set_profile(&mut self, new: Option<crate::calib::ColorProfile>) {
+        let old = self.params.profile.take();
+        let np = &mut self.params.neg;
+        if let Some(b) = np.base {
+            np.base = Some(crate::calib::reprofile(b, old.as_ref(), new.as_ref()));
+        }
+        if np.levels.is_some()
+            && let Some(ph) = &self.photo
+        {
+            let geo = develop::geometry(&ph.preview, &Params { neg: np.clone(), profile: new.clone(), ..Default::default() });
+            np.levels = Some(negative::analyse(&geo, np).1);
+        }
+        self.params.profile = new;
+    }
+
+    /// The film base found when the photo was opened (measured without a profile), as this photo's profile sees it.
+    fn auto_base(&self) -> Option<[f32; 3]> {
+        self.photo.as_ref().map(|p| crate::calib::reprofile(p.auto_base, None, self.params.profile.as_ref()))
     }
 
     fn to_screen(&self, r: Rect, f: [f32; 2]) -> egui::Pos2 {
@@ -3350,6 +3372,7 @@ impl App {
         let mut mask_tool_on = false;
         let profiles = &self.profiles;
         let mut chart_on = false;
+        let mut pick_profile: Option<Option<crate::calib::ColorProfile>> = None;
         let p = &mut self.params;
         let (spot_size, crop_aspect) = (&mut self.spot_size, &mut self.crop_aspect);
         let (heal_clone, spot_sel) = (&mut self.heal_clone, &mut self.spot_sel);
@@ -3671,11 +3694,11 @@ impl App {
                         let shown = p.profile.as_ref().map_or("Standard", |c| c.name.as_str());
                         egui::ComboBox::from_id_salt("cal_profile").width(ui.available_width() - 8.0).selected_text(shown).show_ui(ui, |ui| {
                             if ui.selectable_label(p.profile.is_none(), "Standard").clicked() {
-                                p.profile = None;
+                                pick_profile = Some(None);
                             }
                             for c in profiles {
-                                if ui.selectable_label(p.profile.as_ref() == Some(c), &c.name).clicked() {
-                                    p.profile = Some(c.clone());
+                                if ui.selectable_label(p.profile.as_ref().is_some_and(|x| x.name == c.name), &c.name).clicked() {
+                                    pick_profile = Some(Some(c.clone()));
                                 }
                             }
                         });
@@ -3699,6 +3722,9 @@ impl App {
         });
         if let Some(a) = set_aspect {
             self.set_crop_aspect(a);
+        }
+        if let Some(pr) = pick_profile {
+            self.set_profile(pr);
         }
         if chart_on {
             self.tool = Tool::Chart;
@@ -3837,7 +3863,8 @@ impl App {
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ghost(ui, "Reset", false).on_hover_text("Clear this photo's Develop settings (undo brings them back)").clicked() {
-                    self.params = Params { neg: self.params.neg.clone(), ..Params::default() };
+                    // The conversion and the profile it was measured with stay together.
+                    self.params = Params { neg: self.params.neg.clone(), profile: self.params.profile.clone(), ..Params::default() };
                 }
             });
         });
@@ -3969,7 +3996,7 @@ impl App {
     }
 
     fn negative_right(&mut self, ui: &mut Ui) {
-        let auto_base = self.photo.as_ref().map(|p| p.auto_base);
+        let auto_base = self.auto_base();
         let profile = self.params.profile.clone();
         let np = &mut self.params.neg;
         let st = negative::stock(&np.stock);
@@ -4079,12 +4106,12 @@ impl App {
                         np.levels = None;
                     }
                 }
-                if ui.button("Apply to roll").on_hover_text("Copy this conversion to every photo in the folder").clicked() {
+                if ui.button("Apply to roll").on_hover_text("Copy this conversion and colour profile to every photo in the folder").clicked() {
                     let neg = np.clone();
                     let cur = self.current.clone();
                     let mut n = 0;
                     for f in self.files.iter().filter(|f| Some(*f) != cur.as_ref()) {
-                        let q = Params { neg: neg.clone(), ..read_params(f).unwrap_or_default() };
+                        let q = Params { neg: neg.clone(), profile: profile.clone(), ..read_params(f).unwrap_or_default() };
                         if write_params(f, &q).is_ok() {
                             self.meta.insert(f.clone(), Meta::of(&q));
                             n += 1;
@@ -4166,7 +4193,8 @@ impl App {
                         n += 1.0;
                     }
                 }
-                self.params.neg.base = Some(acc.map(|a| (a / n.max(1.0)).max(1e-4)));
+                // The blank frame is read without a profile; the scans it applies to go through this photo's.
+                self.params.neg.base = Some(crate::calib::reprofile(acc.map(|a| (a / n.max(1.0)).max(1e-4)), None, self.params.profile.as_ref()));
                 self.params.neg.levels = None;
                 self.status = format!("Film base taken from {}", f.file_name().unwrap_or_default().to_string_lossy());
             }
