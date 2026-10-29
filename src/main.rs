@@ -102,8 +102,11 @@ fn contact_sheet(files: &[PathBuf], cols: u32, first: usize) -> Rgb32FImage {
     let rows = (files.len() as u32).div_ceil(cols).max(1);
     let (w, h) = (cols * (fw + gap) + gap, rows * (fh + label + gap) + gap);
     let frames: Vec<Option<Rgb32FImage>> = files.par_iter().map(|f| {
-        let img = load::load_quick(f, cell).ok()?;
-        let p = Params { border: Default::default(), ..read_params(f).unwrap_or_default() };
+        let (img, toned) = load::load_quick_toned(f, cell).ok()?;
+        let mut p = Params { border: Default::default(), ..read_params(f).unwrap_or_default() };
+        if toned {
+            p.cam_curve.clear(); // the camera's JPEG already has it
+        }
         Some(load::fit(&develop::render(&img, &p, 0.15), cell))
     }).collect();
     let mut sheet = Rgb32FImage::from_pixel(w, h, image::Rgb([0.04; 3]));
@@ -381,7 +384,12 @@ pub fn export_file(path: &Path, out_dir: &Path, o: &ExportOpts, n: usize, overri
     }
     let mut p = read_params(path).unwrap_or_default();
     overrides(&mut p);
-    let img = denoise::prepare(load::load(path)?, path, &p)?;
+    let raw = load::load(path)?;
+    // A RAW never opened in the app has no camera curve yet: measure it, as opening it would.
+    if p.cam_curve.is_empty() && load::is_raw(path) {
+        p.cam_curve = load::camera_curve(path, &raw);
+    }
+    let img = denoise::prepare(raw, path, &p)?;
     let shot = if !o.name.trim().is_empty() && o.name != "{name}" { lens::shot(path).unwrap_or_default() } else { Default::default() };
     let out = claim_output(out_dir, &output::file_name(&o.name, path, n, &o.roll, &p, &shot), o.ext)?;
     write_export(&img, &p, o, &out, path).inspect_err(|_| {

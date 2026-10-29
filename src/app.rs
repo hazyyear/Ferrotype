@@ -55,11 +55,13 @@ struct ChartUi {
     grab: Option<usize>,
     name: String,
     fit: Option<Result<crate::calib::Fit, String>>,
+    /// A build is running on a worker thread.
+    busy: bool,
 }
 
 impl ChartUi {
     fn new() -> Self {
-        ChartUi { target: crate::calib::colorchecker(), q: [[0.3, 0.35], [0.7, 0.35], [0.7, 0.65], [0.3, 0.65]], grab: None, name: String::new(), fit: None }
+        ChartUi { target: crate::calib::colorchecker(), q: [[0.3, 0.35], [0.7, 0.35], [0.7, 0.65], [0.3, 0.65]], grab: None, name: String::new(), fit: None, busy: false }
     }
 }
 
@@ -196,6 +198,8 @@ enum Msg {
     /// A preview render finished on the render thread.
     Rendered(Box<RenderOut>),
     Status(String),
+    /// A chart profile was fitted off the UI thread: photo generation, profile name, result.
+    ChartFit(usize, String, Result<crate::calib::Fit, String>),
     /// A culling view: the data, or None when it could not be read. A frame skipped because you stepped past
     /// it sends nothing but `skipped`, so it is tried again when you come back.
     Cull(PathBuf, Option<CullData>, bool),
@@ -237,6 +241,8 @@ struct Opened {
     draft: Rgb32FImage,
     before: ColorImage,
     auto_base: [f32; 3],
+    /// The camera's tone curve for a RAW (empty for other files).
+    cam: Vec<[f32; 2]>,
 }
 
 type RenderKey = (Params, bool, bool, usize, Option<usize>);
@@ -676,8 +682,11 @@ impl App {
                     ColorImage::from_rgb([i.width() as usize, i.height() as usize], i.as_raw())
                 });
                 let made = cached.or_else(|| {
-                    let img = load::load_quick(f, THUMB).ok()?;
-                    let p = params.clone().unwrap_or_default();
+                    let (img, toned) = load::load_quick_toned(f, THUMB).ok()?;
+                    let mut p = params.clone().unwrap_or_default();
+                    if toned {
+                        p.cam_curve.clear(); // the camera's JPEG already has it
+                    }
                     let ci = to_color_image(&develop::render(&img, &p, 0.05));
                     if let Some(c) = thumb_cache(f) {
                         let _ = std::fs::create_dir_all(c.parent().unwrap());
@@ -735,6 +744,7 @@ impl App {
                 // The new frame gets this photo's look and film conversion, but its own geometry and rating.
                 let mut p = Params::default().with_look_of(&self.params);
                 p.neg = self.params.neg.clone();
+                p.profile = self.params.profile.clone();
                 let _ = write_params(f, &p);
                 self.meta.insert(f.clone(), Meta::of(&p));
             }
@@ -787,9 +797,13 @@ impl App {
                 let delta = if nr { denoise::cached_delta(&path, full.len()) } else { None };
                 let preview = load::fit(&full, PREVIEW);
                 let draft = load::fit(&preview, DRAFT);
-                let before = to_color_image(&encode(&preview));
+                let cam = if load::is_raw(&path) { load::camera_curve(&path, &full) } else { vec![] };
+                // "Before" is the photo as the camera rendered it: with its tone curve, without edits.
+                let mut shown = preview.clone();
+                develop::apply_cam_curve(&mut shown, &cam);
+                let before = to_color_image(&encode(&shown));
                 let auto_base = negative::auto_base(&preview);
-                Box::new(Opened { full, delta, preview, draft, before, auto_base })
+                Box::new(Opened { full, delta, preview, draft, before, auto_base, cam })
             });
             let _ = tx.send(Msg::Loaded(path, r));
             ctx2.request_repaint();
@@ -859,7 +873,15 @@ impl App {
                     self.loading = false;
                     match r {
                         Ok(o) => {
-                            let Opened { full, delta, preview, draft, before, auto_base } = *o;
+                            let Opened { full, delta, preview, draft, before, auto_base, cam } = *o;
+                            // First open of a RAW: measure the camera's curve once. It's part of the photo, so the
+                            // whole history gets it and it isn't an edit.
+                            if self.params.cam_curve.is_empty() && !cam.is_empty() {
+                                self.params.cam_curve = cam.clone();
+                                for h in &mut self.history {
+                                    h.cam_curve = cam.clone();
+                                }
+                            }
                             self.before_tex = Some(ctx.load_texture("before", before, TextureOptions::LINEAR));
                             // Keep the damaged-edits warning from `select` visible: the size alone used to replace it
                             // the moment the photo opened.
@@ -890,6 +912,12 @@ impl App {
                     }
                 }
                 Msg::Status(s) => self.status = s,
+                Msg::ChartFit(generation, name, fit) => {
+                    self.chart.busy = false;
+                    if generation == self.photo_gen {
+                        self.finish_chart_profile(name, fit);
+                    }
+                }
                 Msg::Synced(done) => {
                     self.status = format!("Synced to {} frame{}", done.len(), if done.len() == 1 { "" } else { "s" });
                     // Only what the sync changed: a rating, flag or label set while it ran is newer than the
@@ -1603,7 +1631,8 @@ impl App {
         let pt = ui.painter_at(r);
         let t = &self.chart.target;
         let sq = corners.map(|c| [c.x, c.y]);
-        let half = crate::calib::sample_half(t, &sq, 1.0).max(2.0);
+        // A third of the patch: big enough to compare, small enough to see the patch around it.
+        let half = (crate::calib::sample_half(t, &sq, 1.0) * 0.55).max(2.0);
         for i in 0..t.rows * t.cols {
             let Some(lab) = t.lab[i] else { continue };
             let c = crate::calib::patch_center(t, &sq, i / t.cols, i % t.cols);
@@ -1614,6 +1643,12 @@ impl App {
         for i in 0..4 {
             pt.line_segment([corners[i], corners[(i + 1) % 4]], Stroke::new(1.0, Color32::from_white_alpha(140)));
         }
+        // Which patch marker 1 belongs on, on the photo itself.
+        let first = if t.cols == 6 && t.rows == 4 { "dark skin" } else { "A1" };
+        let tag = pt.layout_no_wrap(first.into(), FontId::new(11.0, semi()), Color32::WHITE);
+        let at = corners[0] + vec2(-14.0 - tag.size().x, -8.0 - tag.size().y);
+        pt.rect_filled(Rect::from_min_size(at, tag.size()).expand(3.0), 3.0, Color32::from_black_alpha(170));
+        pt.galley(at, tag, Color32::WHITE);
         for (i, c) in corners.iter().enumerate() {
             pt.circle_filled(*c, 9.0, Color32::from_black_alpha(170));
             pt.circle_stroke(*c, 9.0, Stroke::new(1.5, Color32::WHITE));
@@ -1664,9 +1699,9 @@ impl App {
                 ui.label(caps("Profile name"));
                 ui.add(egui::TextEdit::singleline(&mut self.chart.name).hint_text("e.g. X-T5 daylight, or Scanner + CRI light").desired_width(ui.available_width()));
                 ui.add_space(8.0);
-                let can = self.photo.is_some() && !self.chart.name.trim().is_empty();
-                if primary(ui, "Build profile", can).on_disabled_hover_text("Name the profile first").clicked() {
-                    self.build_chart_profile();
+                let can = self.photo.is_some() && !self.chart.name.trim().is_empty() && !self.chart.busy;
+                if primary(ui, if self.chart.busy { "Building…" } else { "Build profile" }, can).on_disabled_hover_text("Name the profile first").clicked() {
+                    self.build_chart_profile(ui.ctx());
                 }
                 ui.add_space(8.0);
                 match &self.chart.fit {
@@ -1674,11 +1709,11 @@ impl App {
                         ui.label(RichText::new(format!("Average colour error ΔE {:.1} → {:.1} (worst patch {:.1}), from {} patches.", f.de_before, f.de_after, f.de_worst, f.used)).size(12.0).color(TEXT));
                         ui.label(RichText::new("Saved and applied to this photo. Pick it under Calibration › Profile for other photos, or paste these settings onto them. Set white balance on the chart's grey patch as usual.").size(11.5).color(TEXT2));
                         if f.de_after > 6.0 {
-                            ui.label(RichText::new("The error is still high: check that each marker sits on the right patch.").size(11.5).color(ACCENT));
+                            ui.label(RichText::new("The error is still high: check that each marker sits on the right patch.").size(11.5).color(WARN));
                         }
                     }
                     Some(Err(e)) => {
-                        ui.label(RichText::new(e).size(12.0).color(ACCENT));
+                        ui.label(RichText::new(e).size(12.0).color(WARN));
                     }
                     None => {}
                 }
@@ -1690,18 +1725,30 @@ impl App {
     }
 
     /// Measure the chart on the uncorrected frame, fit, save and apply the profile.
-    fn build_chart_profile(&mut self) {
+    /// Measures on a worker thread (a full geometry pass of the preview), so the window never stalls.
+    fn build_chart_profile(&mut self, ctx: &egui::Context) {
         let Some(ph) = &self.photo else { return };
-        let frame = develop::geometry(&ph.preview, &Params { crop: [0.0; 4], profile: None, ..self.params.clone() });
-        let measured = crate::calib::sample(&frame, &self.chart.target, &self.chart.q);
-        let fit = crate::calib::fit(&self.chart.target, &measured);
+        let (src, p) = (ph.preview.clone(), Params { crop: [0.0; 4], profile: None, ..self.params.clone() });
+        let (target, q, name) = (self.chart.target.clone(), self.chart.q, self.chart.name.trim().to_string());
+        let (tx, ctx, generation) = (self.tx.clone(), ctx.clone(), self.photo_gen);
+        self.chart.busy = true;
+        std::thread::spawn(move || {
+            let frame = develop::geometry(&src, &p);
+            let fit = crate::calib::fit(&target, &crate::calib::sample(&frame, &target, &q));
+            let _ = tx.send(Msg::ChartFit(generation, name, fit));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Save and apply a fitted profile (or show why it failed).
+    fn finish_chart_profile(&mut self, name: String, fit: Result<crate::calib::Fit, String>) {
         if let Ok(f) = &fit {
-            let prof = crate::calib::ColorProfile { name: self.chart.name.trim().to_string(), m: f.m };
+            let prof = crate::calib::ColorProfile { name: name.clone(), m: f.m };
             match prof.install() {
                 Ok(_) => {
                     self.set_profile(Some(prof));
                     self.profiles = crate::calib::saved();
-                    self.status = format!("Saved profile {}", self.chart.name.trim());
+                    self.status = format!("Saved profile {name}");
                 }
                 Err(e) => {
                     self.chart.fit = Some(Err(format!("Could not save the profile: {e}")));
@@ -2125,8 +2172,11 @@ impl App {
                 return;
             }
             let data = (|| {
-                let img = load::load_quick(&f, 2560).ok()?;
-                let p = Params { border: Default::default(), ..read_params(&f).unwrap_or_default() };
+                let (img, toned) = load::load_quick_toned(&f, 2560).ok()?;
+                let mut p = Params { border: Default::default(), ..read_params(&f).unwrap_or_default() };
+                if toned {
+                    p.cam_curve.clear(); // the camera's JPEG already has it
+                }
                 let out = develop::render(&img, &p, 0.3);
                 let raw = load::raw_stats(&f);
                 let (bins, clipped) = match &raw {
@@ -2379,7 +2429,7 @@ impl App {
         ui.horizontal_centered(|ui| {
             let neg = self.module == Module::Negative;
             // Mockup order: Negative | Split | Positive in the Negative module.
-            let (labels, order): (&[&str], &[View]) = if neg { (&["Negative", "Split", "Positive"], &[View::Before, View::Split, View::After]) } else { (&["After", "Before", "Split", "2-up"], &[View::After, View::Before, View::Wipe, View::Split]) };
+            let (labels, order): (&[&str], &[View]) = if neg { (&["Positive", "Negative", "Split"], &[View::After, View::Before, View::Split]) } else { (&["After", "Before", "Split", "2-up"], &[View::After, View::Before, View::Wipe, View::Split]) };
             let mut i = order.iter().position(|v| *v == self.view).unwrap_or(0);
             segmented(ui, &mut i, labels);
             self.view = order[i];
@@ -2406,7 +2456,7 @@ impl App {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if !neg {
                     let names: Vec<&str> = std::iter::once("Screen").chain(crate::output::PROOF_PAPERS.iter().map(|p| p.0)).collect();
-                    egui::ComboBox::from_id_salt("proof").width(64.0).selected_text(if self.proof == 0 { "Paper" } else { names[self.proof] }).show_ui(ui, |ui| {
+                    egui::ComboBox::from_id_salt("proof").width(96.0).selected_text(if self.proof == 0 { "Proof: off".to_string() } else { format!("Proof: {}", names[self.proof]) }).show_ui(ui, |ui| {
                         for (k, n) in names.iter().enumerate() {
                             ui.selectable_value(&mut self.proof, k, *n);
                         }
@@ -2475,6 +2525,11 @@ impl App {
                     p.rect_filled(b, 3.0, Color32::from_rgba_unmultiplied(20, 20, 22, 210));
                     paint_stars(&p, pos2(b.left() + 7.5, b.center().y), m.rating, 3.5, BONE);
                 }
+                if m.flag > 0 {
+                    let b = Rect::from_min_size(pos2(rect.left() + 3.0, rect.top() + 3.0), vec2(14.0, 14.0));
+                    p.rect_filled(b, 3.0, Color32::from_rgba_unmultiplied(20, 20, 22, 210));
+                    paint_flag(&p, b.center(), BONE);
+                }
                 if m.label > 0 {
                     p.circle_filled(pos2(rect.right() - 8.0, rect.top() + 8.0), 4.5, LABEL_COLORS[(m.label - 1).min(4) as usize]);
                     p.circle_stroke(pos2(rect.right() - 8.0, rect.top() + 8.0), 4.5, Stroke::new(1.0, INK));
@@ -2506,7 +2561,7 @@ impl App {
                 if self.loading {
                     ui.spinner();
                 } else if let Some(e) = &self.open_error {
-                    ui.label(RichText::new(format!("Can't open this frame\n{e}")).color(TEXT2));
+                    ui.label(RichText::new(format!("Can't open this frame\n{e}")).color(WARN));
                 } else {
                     ui.label(RichText::new("Pick a frame in the Library").color(TEXT3));
                 }
@@ -3100,7 +3155,7 @@ impl App {
         let mm = self.meta.get(&f).copied();
         let rows = [
             ("Type", if load::is_raw(&real) { format!("{} raw", ext_of(&real)) } else { ext_of(&real) }),
-            ("File size", meta.as_ref().map(|m| format!("{:.1} MB", m.len() as f64 / 1e6)).unwrap_or_default()),
+            ("File size", meta.as_ref().map(|m| if m.len() < 1_000_000 { format!("{:.0} KB", (m.len() as f64 / 1e3).ceil()) } else { format!("{:.1} MB", m.len() as f64 / 1e6) }).unwrap_or_default()),
             ("Status", match mm { Some(m) if m.neg => "Film scan".into(), Some(m) if m.edited => "Edited".into(), _ => if real != f { "Virtual copy".into() } else { "Unedited".into() } }),
         ];
         for (k, v) in rows {
@@ -3178,7 +3233,7 @@ impl App {
 
     fn develop_left(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
-            ui.label(caps("Stocks"));
+            ui.label(caps("Presets"));
         });
         let mut apply = None;
         for (i, (name, _)) in self.presets.iter().enumerate() {
@@ -3239,7 +3294,7 @@ impl App {
         }
         let mut save = None;
         ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(&mut self.preset_name).hint_text("New stock").desired_width(ui.available_width() - 56.0).margin(vec2(8.0, 5.0)));
+            ui.add(egui::TextEdit::singleline(&mut self.preset_name).hint_text("New preset").desired_width(ui.available_width() - 56.0).margin(vec2(8.0, 5.0)));
             if ui.add_enabled(!self.preset_name.trim().is_empty(), egui::Button::new("Save")).clicked() {
                 save = Some(self.preset_name.clone());
             }
@@ -3423,15 +3478,24 @@ impl App {
             }
             return;
         }
+        // Which sections hold edits (compared as saved, so every field type counts the same way).
+        let (pj, dj) = (serde_json::to_value(&*p).unwrap_or_default(), serde_json::to_value(&d).unwrap_or_default());
+        let changed = |keys: &[&str]| keys.iter().any(|k| pj.get(k) != dj.get(k));
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            section(ui, "Basic", o_basic, |ui| {
-                if group(ui, "White balance", Some("As shot")) {
-                    (p.temp, p.tint) = (d.temp, d.tint);
-                }
+            section(ui, "Basic", o_basic, changed(&["temp","tint","exposure","contrast","highlights","shadows","whites","blacks","texture","clarity","dehaze","vibrance","saturation"]), |ui| {
+                // The eyedropper sits with "As shot" in the group's header, as Lightroom's does: an action, not a field.
+                ui.horizontal(|ui| {
+                    ui.label(caps("White balance"));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if small_action(ui, "As shot", false).clicked() {
+                            (p.temp, p.tint) = (d.temp, d.tint);
+                        }
+                        pick_wb = small_action(ui, if picking_wb { "Cancel" } else { "Pick neutral" }, picking_wb)
+                            .on_hover_text("Eyedropper (W): click something that should be grey or white").clicked();
+                    });
+                });
                 slider(ui, "Temp", &mut p.temp, 2000.0, 12000.0, d.temp, Some(&temp_g));
                 slider(ui, "Tint", &mut p.tint, -150.0, 150.0, d.tint, Some(&tint_g));
-                pick_wb = ui.add(egui::Button::new(RichText::new(if picking_wb { "Cancel picking" } else { "Pick a neutral spot" }).size(12.0)).min_size(vec2(ui.available_width(), 26.0)).selected(picking_wb))
-                    .on_hover_text("Eyedropper (W): click something that should be grey or white").clicked();
                 if group(ui, "Tone", Some("Auto"))
                     && let Some(ph) = photo
                 {
@@ -3450,7 +3514,7 @@ impl App {
                 slider(ui, "Vibrance", &mut p.vibrance, -100.0, 100.0, 0.0, Some(&vib_g));
                 slider(ui, "Saturation", &mut p.saturation, -100.0, 100.0, 0.0, Some(&sat_g));
             });
-            section(ui, "Tone curve", o_curve, |ui| {
+            section(ui, "Tone curve", o_curve, changed(&["c_hi","c_li","c_da","c_sh","curves","curve_lum"]), |ui| {
                 ui.horizontal(|ui| {
                     segmented(ui, curve_chan, &["RGB", "Red", "Green", "Blue"]);
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -3472,7 +3536,7 @@ impl App {
                 slider(ui, "Darks", &mut p.c_da, -100.0, 100.0, 0.0, None);
                 slider(ui, "Shadows", &mut p.c_sh, -100.0, 100.0, 0.0, None);
             });
-            section(ui, "Color mixer", o_mixer, |ui| {
+            section(ui, "Color mixer", o_mixer, changed(&["hsl"]), |ui| {
                 ui.horizontal(|ui| segmented(ui, mixer_tab, &["Hue", "Saturation", "Luminance"]));
                 for (b, name) in ["Red", "Orange", "Yellow", "Green", "Aqua", "Blue", "Purple", "Magenta"].into_iter().enumerate() {
                     let h = HUE_CENTERS[b];
@@ -3485,7 +3549,7 @@ impl App {
                     slider_ex(ui, name, Some(hsv(h, 0.7, 0.9)), &mut p.hsl[b][*mixer_tab], -100.0, 100.0, 0.0, Some(&*g));
                 }
             });
-            section(ui, "Color grading", o_grade, |ui| {
+            section(ui, "Color grading", o_grade, changed(&["grade","g_blend","g_bal"]), |ui| {
                 grading_wheels(ui, p);
                 for (z, name) in ["Shadows", "Midtones", "Highlights", "Global"].into_iter().enumerate() {
                     group(ui, name, None);
@@ -3498,7 +3562,7 @@ impl App {
                 slider(ui, "Blending", &mut p.g_blend, 0.0, 100.0, d.g_blend, None);
                 slider(ui, "Balance", &mut p.g_bal, -100.0, 100.0, 0.0, None);
             });
-            section(ui, "Detail", o_detail, |ui| {
+            section(ui, "Detail", o_detail, changed(&["sh_amt","sh_rad","sh_det","sh_mask","nr_lum","nr_det","nr_col","ai_nr"]), |ui| {
                 group(ui, "Sharpening", None);
                 slider(ui, "Amount", &mut p.sh_amt, 0.0, 150.0, d.sh_amt, None);
                 slider(ui, "Radius", &mut p.sh_rad, 0.5, 3.0, d.sh_rad, None);
@@ -3517,7 +3581,7 @@ impl App {
                     ui.label(RichText::new("Optional. Downloads ONNX Runtime and the RawNIND and SCUNet models once; Ferrotype itself stays small.").size(11.5).color(TEXT2));
                 }
             });
-            section(ui, "Lens corrections", o_lens, |ui| {
+            section(ui, "Lens corrections", o_lens, changed(&["o_dist","o_vig","o_fringe","lens","lens_dist","lens_vig"]), |ui| {
                 group(ui, "Profile", None);
                 if p.lens.is_empty() {
                     lens_auto = ui.add(egui::Button::new("Enable profile corrections").min_size(vec2(ui.available_width(), 28.0)))
@@ -3566,7 +3630,7 @@ impl App {
                 slider(ui, "Vignetting", &mut p.o_vig, -100.0, 100.0, 0.0, Some(&grey_ramp(0.05, 0.6)));
                 slider(ui, "Defringe", &mut p.o_fringe, 0.0, 20.0, 0.0, None);
             });
-            section(ui, "Transform & crop", o_geo, |ui| {
+            section(ui, "Transform & crop", o_geo, changed(&["t_vert","t_hor","t_rot","t_scale","flip_h","crop","rot90"]), |ui| {
                 slider(ui, "Vertical", &mut p.t_vert, -100.0, 100.0, 0.0, None);
                 slider(ui, "Horizontal", &mut p.t_hor, -100.0, 100.0, 0.0, None);
                 slider(ui, "Rotate", &mut p.t_rot, -45.0, 45.0, 0.0, None);
@@ -3596,7 +3660,7 @@ impl App {
                 let (cw, ch) = (1.0 - c[0] - c[2], 1.0 - c[1] - c[3]);
                 ui.label(RichText::new(format!("Ratio {:.2} · {:.0}% of the frame. Use Crop in the toolbar to drag the corners.", cw * frame_aspect / ch.max(1e-3), cw * ch * 100.0)).size(11.5).color(TEXT2));
             });
-            section(ui, "Spot removal", o_spot, |ui| {
+            section(ui, "Spot removal", o_spot, changed(&["spots"]), |ui| {
                 let mut mode = *heal_clone as usize;
                 segmented(ui, &mut mode, &["Heal", "Clone"]);
                 *heal_clone = mode == 1;
@@ -3619,10 +3683,10 @@ impl App {
                 });
                 ui.label(RichText::new("Choose Heal in the toolbar, then click a spot or paint over a larger area. Drag the thin source circle to take texture from somewhere else. Right-click a spot to remove it. Clone copies the source exactly; Heal blends it in.").size(11.5).color(TEXT2));
             });
-            section(ui, "Masks", o_masks, |ui| {
+            section(ui, "Masks", o_masks, changed(&["masks"]), |ui| {
                 mask_tool_on = masks::masks_panel(ui, mask_ui, p);
             });
-            section(ui, "Effects", o_fx, |ui| {
+            section(ui, "Effects", o_fx, changed(&["vig","vig_mid","vig_round","vig_fea","vig_hi","gr_amt","gr_size","gr_rough","gr_hi","hal_amt","hal_size","hal_thr"]), |ui| {
                 group(ui, "Vignette", None);
                 slider(ui, "Amount", &mut p.vig, -100.0, 100.0, 0.0, Some(&grey_ramp(0.0, 0.85)));
                 slider(ui, "Midpoint", &mut p.vig_mid, 0.0, 100.0, d.vig_mid, None);
@@ -3646,7 +3710,7 @@ impl App {
                 slider(ui, "Roughness", &mut p.gr_rough, 0.0, 100.0, d.gr_rough, None);
                 slider(ui, "Highlight grain", &mut p.gr_hi, 0.0, 100.0, d.gr_hi, None);
             });
-            section(ui, "Border", o_border, |ui| {
+            section(ui, "Border", o_border, changed(&["border"]), |ui| {
                 group(ui, "Color", None);
                 let mut c = p.border.white as usize;
                 segmented(ui, &mut c, &["Black", "White"]);
@@ -3661,7 +3725,7 @@ impl App {
                 ui.add(egui::TextEdit::singleline(&mut p.border.caption).id(egui::Id::NULL.with("caption")).hint_text("Optional, e.g. Portra 400 · Lisbon").desired_width(f32::INFINITY).margin(vec2(8.0, 5.0)));
                 ui.label(RichText::new("Width is a share of the long side. Canvas pads the frame out to a fixed shape, e.g. 4:5 for Instagram posts. A caption adds a band under the photo.").size(11.5).color(TEXT2));
             });
-            section(ui, "Color look (LUT)", o_lut, |ui| {
+            section(ui, "Color look (LUT)", o_lut, changed(&["lut","lut_amt"]), |ui| {
                 let name = std::path::Path::new(&p.lut).file_name().map(|n| n.to_string_lossy().to_string());
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(name.as_deref().unwrap_or("None")).size(12.0).color(LABEL));
@@ -3678,13 +3742,13 @@ impl App {
                 });
                 if !p.lut.is_empty() {
                     if develop::load_cube(&p.lut).is_none() {
-                        ui.label(RichText::new("Could not read this file. Only 3D .cube LUTs with a 0–1 range are supported.").size(11.5).color(ACCENT));
+                        ui.label(RichText::new("Could not read this file. Only 3D .cube LUTs with a 0–1 range are supported.").size(11.5).color(WARN));
                     }
                     slider(ui, "Amount", &mut p.lut_amt, 0.0, 100.0, 100.0, None);
                 }
                 ui.label(RichText::new("Applied after the tone and color settings, on display-ready colors (Rec.709 / sRGB LUTs).").size(11.5).color(TEXT2));
             });
-            section(ui, "Calibration", o_cal, |ui| {
+            section(ui, "Calibration", o_cal, changed(&["cal_sh","cal","profile"]), |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Profile").size(12.0));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -4006,14 +4070,17 @@ impl App {
             egui::Frame::new().inner_margin(16.0).show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 10.0;
                 ui.horizontal(|ui| {
+                    // Until the frame is converted the stock is only a choice, so the header says so.
+                    let on = np.enabled;
                     let (r, _) = ui.allocate_exact_size(vec2(44.0, 44.0), Sense::hover());
-                    ui.painter().rect_filled(r, 6.0, stock_chip(st));
+                    ui.painter().rect_filled(r, 6.0, if on { stock_chip(st) } else { stock_chip(st).gamma_multiply(0.35) });
                     ui.painter().rect_stroke(r, 6.0, Stroke::new(1.0, hex(0x3A3A40)), egui::StrokeKind::Inside);
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 2.0;
-                        ui.label(RichText::new(format!("{} {}", st.brand, st.name)).family(semi()).size(15.0));
+                        ui.label(RichText::new(format!("{} {}", st.brand, st.name)).family(semi()).size(15.0).color(if on { TEXT } else { TEXT2 }));
                         let iso = stock_iso(st);
-                        ui.label(RichText::new(if iso.is_empty() { kind_label(st.kind).to_string() } else { format!("ISO {iso} · {}", kind_label(st.kind)) }).size(12.0).color(TEXT2));
+                        let what = if iso.is_empty() { kind_label(st.kind).to_string() } else { format!("ISO {iso} · {}", kind_label(st.kind)) };
+                        ui.label(RichText::new(if on { what } else { format!("Not converted · {what}") }).size(12.0).color(TEXT2));
                     });
                 });
                 ui.horizontal(|ui| {
@@ -4023,8 +4090,10 @@ impl App {
                 // Steps 1–3 do nothing until the frame is converted: say so, and grey them out.
                 if !np.enabled {
                     ui.label(RichText::new("Off. Turn on, or pick a stock, to convert this frame.").size(11.5).color(TEXT2));
+                    // egui reads this when the ui is disabled, so it goes first. 0.75 keeps dim captions above 3:1
+                    // and labels near 5:1 (egui's 0.5 gave 2:1), so you can still read what turning it on gives.
+                    ui.visuals_mut().disabled_alpha = 0.75;
                     ui.disable();
-                    ui.visuals_mut().disabled_alpha = 0.7; // still readable, so you can see what turning it on gives
 
                 }
                 ui.add_space(6.0);
