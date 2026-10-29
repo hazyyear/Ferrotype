@@ -374,7 +374,10 @@ impl Params {
 
     /// Turn a quarter clockwise (or back), carrying the crop, spots, filters and brush strokes along.
     pub fn rotate(&mut self, cw: bool) {
-        self.rot90 = (self.rot90 + if cw { 1 } else { 3 }) % 4;
+        // The flip is applied after the quarter turns, so on a flipped photo turning the source one way turns
+        // what you see the other way. `cw` is what you see; the marks below are in that (frame) space.
+        let src_cw = cw != self.flip_h;
+        self.rot90 = (self.rot90 % 4 + if src_cw { 1 } else { 3 }) % 4;
         let f = |x: f32, y: f32| if cw { (1.0 - y, x) } else { (y, 1.0 - x) };
         let [l, t, r, b] = self.crop;
         self.crop = if cw { [b, l, t, r] } else { [t, r, b, l] };
@@ -596,9 +599,15 @@ fn heal(img: &mut Rgb32FImage, p: &Params, full: (usize, usize), off: (f32, f32)
         }
         let (x0, x1) = ((lo[0] - r).floor().max(0.0) as u32, ((hi[0] + r).ceil().max(0.0) as u32).min(w));
         let (y0, y1) = ((lo[1] - r).floor().max(0.0) as u32, ((hi[1] + r).ceil().max(0.0) as u32).min(h));
-        for y in y0..y1 {
-            for x in x0..x1 {
-                let (xf, yf) = (x as f32, y as f32);
+        if x0 >= x1 || y0 >= y1 {
+            continue;
+        }
+        let stride = w as usize * 3;
+        let buf: &mut [f32] = img;
+        buf[y0 as usize * stride..y1 as usize * stride].par_chunks_mut(stride).enumerate().for_each(|(j, row)| {
+            let yf = (y0 as usize + j) as f32;
+            for (x, px) in px3_mut(row).iter_mut().enumerate().take(x1 as usize).skip(x0 as usize) {
+                let xf = x as f32;
                 let (d, near) = stroke_dist(&pts, xf, yf);
                 let a = 1.0 - smooth(0.55 * r, r, d);
                 if a <= 0.0 {
@@ -606,14 +615,23 @@ fn heal(img: &mut Rgb32FImage, p: &Params, full: (usize, usize), off: (f32, f32)
                 }
                 let (qx, qy) = source(xf, yf);
                 let v = bilinear_clamped(&src, qx, qy);
-                let px = img.get_pixel_mut(x, y);
-                px.0 = [0, 1, 2].map(|k| px.0[k] + ((v[k] + fix[near][k]).max(0.0) - px.0[k]) * a);
+                *px = [0, 1, 2].map(|k| px[k] + ((v[k] + fix[near][k]).max(0.0) - px[k]) * a);
             }
-        }
+        });
     }
 }
 
 pub const HUE_CENTERS: [f32; 8] = [0.0, 30.0, 60.0, 120.0, 180.0, 240.0, 275.0, 310.0];
+
+/// An RGB buffer as pixels. Fixed-size pixels let the compiler drop bounds checks and vectorise; `chunks(3)`
+/// slices made every 3-float copy a call into memmove.
+pub fn px3(s: &[f32]) -> &[[f32; 3]] {
+    s.as_chunks::<3>().0
+}
+
+pub fn px3_mut(s: &mut [f32]) -> &mut [[f32; 3]] {
+    s.as_chunks_mut::<3>().0
+}
 
 pub fn luma(c: [f32; 3]) -> f32 {
     0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
@@ -678,7 +696,7 @@ pub fn fpow(x: f32, p: f32) -> f32 {
 }
 
 #[inline]
-fn log2_fast(x: f32) -> f32 {
+pub(crate) fn log2_fast(x: f32) -> f32 {
     // x = m · 2^e with m in [√½, √2), then log2(m) from the atanh series in t = (m − 1)/(m + 1), |t| < 0.172.
     let bits = x.to_bits();
     let mut e = ((bits >> 23) & 0xff) as i32 - 127;
@@ -698,7 +716,7 @@ fn log2_fast(x: f32) -> f32 {
 #[inline]
 fn exp2_fast(y: f32) -> f32 {
     let y = y.clamp(-126.0, 127.0);
-    let i = y.floor();
+    let i = floor_fast(y);
     let f = y - i;
     // 2^f on [0, 1): degree-6 polynomial (Taylor of e^(f·ln2), error < 2e-7).
     let p = 1.0 + f * (std::f32::consts::LN_2 + f * (0.240_226_5 + f * (0.055_504_1 + f * (0.009_618_13 + f * (0.001_333_36 + f * 0.000_154_04)))));
@@ -708,7 +726,7 @@ fn exp2_fast(y: f32) -> f32 {
 pub fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [f32; 3] {
     let h = if (0.0..360.0).contains(&h) { h } else { h.rem_euclid(360.0) } / 60.0;
     let c = v * s;
-    let x = c * (1.0 - ((h - 2.0 * (h * 0.5).floor()) - 1.0).abs());
+    let x = c * (1.0 - ((h - 2.0 * floor_fast(h * 0.5)) - 1.0).abs());
     let (r, g, b) = match h as u32 {
         0 => (c, x, 0.0), 1 => (x, c, 0.0), 2 => (0.0, c, x), 3 => (0.0, x, c), 4 => (x, 0.0, c), _ => (c, 0.0, x),
     };
@@ -804,20 +822,24 @@ fn box_row(s: &[f32], o: &mut [f32], r: usize) {
     }
 }
 
-/// One vertical box pass of radius `r`, edges clamped. Each output row sums whole input rows, so it reads
-/// memory in order and vectorises (the old transpose-based pass was a third of a render).
+/// One vertical box pass of radius `r`, edges clamped. Works on whole rows, so it reads memory in order and
+/// vectorises. Each band of rows keeps a running sum of the rows in its window: one row in and one out per
+/// output row, instead of adding up all 2r + 1 again.
 fn box_cols(src: &[f32], dst: &mut [f32], w: usize, h: usize, r: usize) {
+    const BAND: usize = 64;
     let inv = 1.0 / (2 * r + 1) as f32;
-    dst.par_chunks_mut(w).enumerate().for_each(|(y, o)| {
-        o.copy_from_slice(&src[y.saturating_sub(r) * w..][..w]);
-        for k in 1..=2 * r {
-            let yy = (y + k).saturating_sub(r).min(h - 1);
-            for (a, b) in o.iter_mut().zip(&src[yy * w..][..w]) {
-                *a += *b;
-            }
+    let row = |y: usize| &src[y.min(h - 1) * w..][..w];
+    dst.par_chunks_mut(w * BAND).enumerate().for_each(|(band, out)| {
+        let y0 = band * BAND;
+        let mut acc = vec![0f32; w];
+        for k in 0..=2 * r {
+            acc.iter_mut().zip(row((y0 + k).saturating_sub(r))).for_each(|(a, b)| *a += *b);
         }
-        for a in o.iter_mut() {
-            *a *= inv;
+        for (j, o) in out.chunks_mut(w).enumerate() {
+            let y = y0 + j;
+            o.iter_mut().zip(&acc).for_each(|(o, a)| *o = *a * inv);
+            let (gone, next) = (row(y.saturating_sub(r)), row(y + r + 1));
+            acc.iter_mut().zip(next.iter().zip(gone)).for_each(|(a, (n, g))| *a += *n - *g);
         }
     });
 }
@@ -1151,8 +1173,16 @@ fn hash(x: i32, y: i32) -> f32 {
     ((n ^ (n >> 16)) & 0xffff) as f32 / 65535.0
 }
 
+/// `floor` for values well inside i32 range. Plain x86-64 has no rounding instruction, so `f32::floor` is a libm
+/// call; the grain and fast-math loops call it several times a pixel.
+#[inline]
+fn floor_fast(x: f32) -> f32 {
+    let t = x as i32 as f32;
+    if t > x { t - 1.0 } else { t }
+}
+
 fn value_noise(x: f32, y: f32) -> f32 {
-    let (xi, yi) = (x.floor() as i32, y.floor() as i32);
+    let (xi, yi) = (floor_fast(x) as i32, floor_fast(y) as i32);
     let (fx, fy) = (smooth(0.0, 1.0, x - xi as f32), smooth(0.0, 1.0, y - yi as f32));
     let a = hash(xi, yi) * (1.0 - fx) + hash(xi + 1, yi) * fx;
     let b = hash(xi, yi + 1) * (1.0 - fx) + hash(xi + 1, yi + 1) * fx;
@@ -1220,7 +1250,7 @@ pub fn render_window(src: &Rgb32FImage, p: &Params, scale: f32, win: Option<Wind
                 continue;
             }
             let alt = finish(base.clone(), &p.with_mask(&m.adj), scale, (full_w, full_h), (x0, y0));
-            img.par_chunks_mut(3).zip(alt.par_chunks(3)).zip(wts.par_iter()).for_each(|((o, a), w)| {
+            px3_mut(&mut img).par_iter_mut().zip(px3(&alt).par_iter()).zip(wts.par_iter()).for_each(|((o, a), w)| {
                 for k in 0..3 {
                     o[k] += (a[k] - o[k]) * w;
                 }
@@ -1283,8 +1313,8 @@ pub fn mask_weights(m: &Mask, p: &Params, shown: &Rgb32FImage, full: (u32, u32),
             }
             Shape::Luminance { lo, hi, soft } => {
                 let s = soft.max(0.001);
-                v.par_iter_mut().zip(shown.par_chunks(3)).for_each(|(o, c)| {
-                    let l = luma([c[0], c[1], c[2]]);
+                v.par_iter_mut().zip(px3(shown).par_iter()).for_each(|(o, c)| {
+                    let l = luma(*c);
                     *o = smooth(lo - s, *lo, l) * (1.0 - smooth(*hi, hi + s, l));
                 });
             }
@@ -1293,8 +1323,8 @@ pub fn mask_weights(m: &Mask, p: &Params, shown: &Rgb32FImage, full: (u32, u32),
                 let opp = |c: [f32; 3]| [c[0] - c[1], (c[0] + c[1]) * 0.5 - c[2], luma(c) * 0.5];
                 let t = opp(*rgb);
                 let r = 0.02 + range / 100.0 * 0.35;
-                v.par_iter_mut().zip(shown.par_chunks(3)).for_each(|(o, c)| {
-                    let q = opp([c[0], c[1], c[2]]);
+                v.par_iter_mut().zip(px3(shown).par_iter()).for_each(|(o, c)| {
+                    let q = opp(*c);
                     let d = ((q[0] - t[0]).powi(2) + (q[1] - t[1]).powi(2) + (q[2] - t[2]).powi(2)).sqrt();
                     *o = 1.0 - smooth(r * 0.5, r, d);
                 });
@@ -1334,10 +1364,14 @@ fn finish(mut img: Rgb32FImage, p: &Params, scale: f32, full: (u32, u32), off: (
     // Positions below are in whole-output pixels: (gx, gy) = this pixel's place in the full render.
     let (cx, cy) = (big_w / 2.0, big_h / 2.0);
     let r2max = cx * cx + cy * cy;
+    let cal_on = p.cal.iter().flatten().any(|v| *v != 0.0);
     img.par_chunks_mut(w * 3).enumerate().for_each(|(y, row)| {
-        for (x, px) in row.chunks_mut(3).enumerate() {
+        for (x, px) in px3_mut(row).iter_mut().enumerate() {
             let (gx, gy) = ((x + x0) as f32, (y + y0) as f32);
-            let mut c = mul(&cal, [px[0] * gains[0], px[1] * gains[1], px[2] * gains[2]]);
+            let mut c = [px[0] * gains[0], px[1] * gains[1], px[2] * gains[2]];
+            if cal_on {
+                c = mul(&cal, c);
+            }
             if p.o_vig != 0.0 {
                 let r2 = ((gx - cx).powi(2) + (gy - cy).powi(2)) / r2max;
                 c = c.map(|v| v * (1.0 + p.o_vig / 100.0 * r2));
@@ -1346,18 +1380,18 @@ fn finish(mut img: Rgb32FImage, p: &Params, scale: f32, full: (u32, u32), off: (
                 let s = (1.0 - smooth(0.0, 0.18, luma(c))) * p.cal_sh / 100.0 * 0.02;
                 c[1] += s;
             }
-            px.copy_from_slice(&c.map(|v| v.max(0.0)));
+            *px = c.map(|v| v.max(0.0));
         }
     });
 
     // Halation: highlights above the threshold, blurred wide and added back as a red-orange glow.
     if p.hal_amt > 0.0 {
         let t = 0.15 + p.hal_thr / 100.0 * 0.85;
-        let hi: Vec<f32> = img.par_chunks(3).map(|c| (luma([c[0], c[1], c[2]]) - t).max(0.0)).collect();
+        let hi: Vec<f32> = px3(&img).par_iter().map(|c| (luma(*c) - t).max(0.0)).collect();
         let sigma = big_w.max(big_h) * (0.002 + p.hal_size / 100.0 * 0.02);
         let (near, far) = (blur(&hi, w, h, sigma * 0.4), blur(&hi, w, h, sigma));
         let k = p.hal_amt / 100.0 * 3.0;
-        img.par_chunks_mut(3).enumerate().for_each(|(i, px)| {
+        px3_mut(&mut img).par_iter_mut().enumerate().for_each(|(i, px)| {
             let g = (near[i] * 0.4 + far[i] * 0.6) * k;
             px[0] += g;
             px[1] += g * 0.22;
@@ -1366,11 +1400,11 @@ fn finish(mut img: Rgb32FImage, p: &Params, scale: f32, full: (u32, u32), off: (
     }
 
     // Local-contrast inputs (only computed when used).
-    let lp: Vec<f32> = if p.clarity != 0.0 || p.texture != 0.0 { img.par_chunks(3).map(|c| fpow(luma([c[0], c[1], c[2]]), 1.0 / 2.2)).collect() } else { vec![] };
+    let lp: Vec<f32> = if p.clarity != 0.0 || p.texture != 0.0 { px3(&img).par_iter().map(|c| fpow(luma(*c), 1.0 / 2.2)).collect() } else { vec![] };
     let big = (p.clarity != 0.0).then(|| blur(&lp, w, h, big_w.max(big_h) / 60.0));
     let small = (p.texture != 0.0).then(|| blur(&lp, w, h, 4.0 * scale.max(0.25)));
     let haze = (p.dehaze != 0.0).then(|| {
-        let dark: Vec<f32> = img.par_chunks(3).map(|c| c[0].min(c[1]).min(c[2])).collect();
+        let dark: Vec<f32> = px3(&img).par_iter().map(|c| c[0].min(c[1]).min(c[2])).collect();
         blur(&dark, w, h, big_w.max(big_h) / 80.0)
     });
     let curves = curve_tables(p);
@@ -1419,10 +1453,10 @@ fn finish(mut img: Rgb32FImage, p: &Params, scale: f32, full: (u32, u32), off: (
     };
     if !on_gpu {
     img.par_chunks_mut(w * 3).enumerate().for_each(|(y, row)| {
-        for (x, px) in row.chunks_mut(3).enumerate() {
+        for (x, px) in px3_mut(row).iter_mut().enumerate() {
             let i = y * w + x;
             let (gx, gy) = ((x + x0) as f32, (y + y0) as f32);
-            let mut c = [px[0], px[1], px[2]];
+            let mut c = *px;
             if let Some(hz) = &haze {
                 let s = (p.dehaze / 100.0 * 0.9).clamp(-0.9, 0.9);
                 c = if s > 0.0 { c.map(|v| ((v - s * hz[i]) / (1.0 - s * hz[i])).max(0.0)) } else { c.map(|v| v + (-s) * 0.25 * (0.6 - v).max(0.0)) };
@@ -1503,7 +1537,7 @@ fn finish(mut img: Rgb32FImage, p: &Params, scale: f32, full: (u32, u32), off: (
                 let amt = p.gr_amt / 100.0 * 0.22 * (0.3 + bump(le, 0.5, 0.7)) * (1.0 - (1.0 - p.gr_hi / 100.0) * smooth(0.55, 0.95, le));
                 e = e.map(|v| v + n * amt);
             }
-            px.copy_from_slice(&e);
+            *px = e;
         }
     });
     }
@@ -1642,16 +1676,16 @@ fn detail(img: &mut Rgb32FImage, p: &Params, scale: f32) {
     if !sharpen && p.nr_lum == 0.0 && p.nr_col == 0.0 && p.o_fringe == 0.0 {
         return;
     }
-    let y: Vec<f32> = img.par_chunks(3).map(|c| luma([c[0], c[1], c[2]])).collect();
-    let cb: Vec<f32> = img.par_chunks(3).zip(&y).map(|(c, l)| c[2] - l).collect();
-    let cr: Vec<f32> = img.par_chunks(3).zip(&y).map(|(c, l)| c[0] - l).collect();
+    let y: Vec<f32> = px3(img).par_iter().map(|c| luma(*c)).collect();
+    let cb: Vec<f32> = px3(img).par_iter().zip(&y).map(|(c, l)| c[2] - l).collect();
+    let cr: Vec<f32> = px3(img).par_iter().zip(&y).map(|(c, l)| c[0] - l).collect();
     let edge_src = blur(&y, w, h, 1.0 * scale.max(0.5));
     let col_sigma = (1.0 + p.nr_col / 12.0) * scale.max(0.25);
     let (cb_b, cr_b) = if p.nr_col > 0.0 || p.o_fringe > 0.0 { (blur(&cb, w, h, col_sigma), blur(&cr, w, h, col_sigma)) } else { (cb.clone(), cr.clone()) };
     let y_nr = (p.nr_lum > 0.0).then(|| blur(&y, w, h, (0.6 + p.nr_lum / 60.0) * scale.max(0.25)));
     let y_sh = sharpen.then(|| blur(&y, w, h, p.sh_rad * scale));
     img.par_chunks_mut(w * 3).enumerate().for_each(|(row_i, row)| {
-        for (x, px) in row.chunks_mut(3).enumerate() {
+        for (x, px) in px3_mut(row).iter_mut().enumerate() {
             let i = row_i * w + x;
             let edge = ((y[i] - edge_src[i]).abs() * 12.0).min(1.0);
             let mut l = y[i];
@@ -1668,7 +1702,7 @@ fn detail(img: &mut Rgb32FImage, p: &Params, scale: f32) {
             let (mut b_, mut r_) = (cb[i] + (cb_b[i] - cb[i]) * t, cr[i] + (cr_b[i] - cr[i]) * t);
             if p.o_fringe > 0.0 {
                 // Purple/green fringes: pull chroma toward the local average on strong edges.
-                let (hue, _, _) = rgb_to_hsv([px[0], px[1], px[2]]);
+                let (hue, _, _) = rgb_to_hsv(*px);
                 let fringe_hue = (250.0..330.0).contains(&hue) || (80.0..160.0).contains(&hue);
                 if fringe_hue {
                     let f = (p.o_fringe / 20.0 * edge * 2.0).min(1.0);
@@ -1680,7 +1714,7 @@ fn detail(img: &mut Rgb32FImage, p: &Params, scale: f32) {
             let r = l + r_;
             let b = l + b_;
             let g = (l - 0.2126 * r - 0.0722 * b) / 0.7152;
-            px.copy_from_slice(&[r, g, b]);
+            *px = [r, g, b];
         }
     });
 }
@@ -1693,7 +1727,7 @@ pub fn auto_tone(src: &Rgb32FImage, p: &Params) -> Params {
     if q.neg.enabled {
         negative::convert(&mut img, &q.neg); // measure the positive, not the orange negative
     }
-    let mut ys: Vec<f32> = img.par_chunks(3).step_by(7).map(|c| luma([c[0], c[1], c[2]])).collect();
+    let mut ys: Vec<f32> = px3(&img).par_iter().step_by(7).map(|c| luma(*c)).collect();
     if ys.is_empty() {
         return q;
     }
@@ -1901,6 +1935,37 @@ mod tests {
         assert!(out.get_pixel(10, 0).0[0] > 0.24, "{:?}", out.get_pixel(10, 0));
         p.rotate(false);
         assert_eq!(p.crop, [0.25, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn quarter_turn_on_a_flipped_photo_turns_the_way_you_asked() {
+        // A bright marker at the source's top-left: flipped, it shows top-right; turned clockwise from there,
+        // it must end up bottom-right (top-right corner goes to bottom-right).
+        let src = Rgb32FImage::from_fn(40, 20, |x, y| image::Rgb([if x < 4 && y < 4 { 1.0 } else { 0.0 }; 3]));
+        let mut p = Params { flip_h: true, ..Default::default() };
+        p.rotate(true);
+        let out = geometry(&src, &p);
+        let (w, h) = out.dimensions();
+        assert_eq!((w, h), (20, 40));
+        assert!(out.get_pixel(w - 2, h - 2).0[0] > 0.5, "marker should be bottom-right");
+        p.rotate(false);
+        assert_eq!(p.rot90, 0);
+    }
+
+    #[test]
+    fn box_blur_matches_the_direct_sum() {
+        let (w, h) = (37, 150);
+        let src: Vec<f32> = (0..w * h).map(|i| ((i * 7919) % 101) as f32 / 101.0).collect();
+        for r in [1, 3, 9, 40] {
+            let mut fast = vec![0f32; w * h];
+            box_cols(&src, &mut fast, w, h, r);
+            for y in 0..h {
+                for x in 0..w {
+                    let want: f32 = (0..=2 * r).map(|k| src[(y + k).saturating_sub(r).min(h - 1) * w + x]).sum::<f32>() / (2 * r + 1) as f32;
+                    assert!((fast[y * w + x] - want).abs() < 1e-4, "r {r} at {x},{y}: {} vs {want}", fast[y * w + x]);
+                }
+            }
+        }
     }
 
     #[test]
