@@ -7,7 +7,7 @@ use crate::load::{self, linear_to_srgb};
 use crate::negative::{self, Kind, Look, STOCKS};
 use crate::widgets::*;
 use crate::keys::{self, Keymap};
-use crate::{ExportOpts, contact_sheet, denoise, export_file, import_xmp_preset, read_params, save_output, scan, write_export, write_params};
+use crate::{ExportOpts, save_contact_sheets, denoise, export_file, import_xmp_preset, read_params, scan, write_export, write_params};
 use eframe::egui;
 use egui::{Align, Align2, Color32, ColorImage, FontId, Layout, Pos2, Rect, RichText, Sense, Stroke, TextureHandle, TextureOptions, Ui, Vec2, pos2, vec2};
 use image::Rgb32FImage;
@@ -19,6 +19,8 @@ const PREVIEW: u32 = 1400;
 /// Smaller copy rendered while a slider is being dragged, so dragging stays smooth (about 4× faster).
 const DRAFT: u32 = 700;
 const THUMB: u32 = 320;
+/// Develop and Negative's settings panel. 360 px gives slider tracks about 175 px: at 320 a pixel was 0.075 EV.
+const RIGHT_W: f32 = 360.0;
 /// Thumbnail textures kept in memory (about 270 KB each); the grid only shows a few dozen at a time.
 const THUMB_KEEP: usize = 600;
 /// Undo steps kept per photo.
@@ -99,6 +101,8 @@ struct CullState {
     focus: bool,
     /// What the last key did ("★★★", "Reject") and when, shown large on the photo for a moment.
     flash: Option<(String, std::time::Instant)>,
+    /// Frames that could not be read: shown as such, never retried every frame.
+    failed: std::collections::HashSet<PathBuf>,
 }
 
 /// Full decodes run one at a time: holding an arrow key would otherwise start one per frame passed, each
@@ -175,7 +179,9 @@ enum Msg {
     /// A preview render finished on the render thread.
     Rendered(Box<RenderOut>),
     Status(String),
-    Cull(PathBuf, Option<CullData>),
+    /// A culling view: the data, or None when it could not be read. A frame skipped because you stepped past
+    /// it sends nothing but `skipped`, so it is tried again when you come back.
+    Cull(PathBuf, Option<CullData>, bool),
     Denoised(PathBuf, Result<Vec<f32>, String>),
     AiInstalled(Result<(), String>),
     /// A 1:1 window finished rendering: the settings and window it shows.
@@ -258,6 +264,8 @@ pub struct App {
     thumb_gen: Arc<std::sync::atomic::AtomicUsize>,
     /// Bumped by every `select`: a load still queued for an earlier frame is dropped before decoding.
     load_gen: Arc<std::sync::atomic::AtomicUsize>,
+    /// Why the open frame could not be opened, shown in place of the photo.
+    open_error: Option<String>,
     /// Edited / film scan / rating / flag of each photo with a sidecar. Read once per folder, not every frame.
     meta: std::collections::HashMap<PathBuf, Meta>,
     /// 0 all, 1 = 1 star or more, 2 = 3 stars or more, 3 = picks only. Rejects are hidden except under "All".
@@ -582,7 +590,7 @@ impl App {
             presets.extend(user);
         }
         Self {
-            module: Module::Library, folder: None, files: vec![], thumbs: Default::default(), thumb_used: Default::default(), thumb_want: Default::default(), thumb_pending: Default::default(), thumb_ready: Default::default(), frame: 0, thumb_gen: Default::default(), load_gen: Default::default(), meta: Default::default(), lib_rating: 0,
+            module: Module::Library, folder: None, files: vec![], thumbs: Default::default(), thumb_used: Default::default(), thumb_want: Default::default(), thumb_pending: Default::default(), thumb_ready: Default::default(), frame: 0, thumb_gen: Default::default(), load_gen: Default::default(), open_error: None, meta: Default::default(), lib_rating: 0,
             subdirs: vec![], tex_scale: 1.0, thumb_size: 190.0, lib_sel: None, lib_query: String::new(),
             lib_filter: [true, true, true, true, false], current: None, photo: None, loading: false, params: Params::default(), prev_params: None,
             rendered: None, render_busy: false, photo_gen: 0, tex: None, before_tex: None, last_rgb: None, hover_rgb: None, shown_w: 0.0, bins: [[0.0; 128]; 3], clip_view: false,
@@ -616,6 +624,7 @@ impl App {
         self.subdirs.sort();
         // Ratings and edit marks arrive with each thumbnail: reading every sidecar here froze the window on cloud folders.
         self.meta.clear();
+        self.cull.failed.clear();
         self.folder = Some(dir);
         self.files = files.clone();
         self.thumbs.clear();
@@ -736,6 +745,7 @@ impl App {
         self.photo = None;
         self.rendered = None;
         self.loading = true;
+        self.open_error = None;
         self.picking_base = false;
         self.last_preset = None;
         self.samples.clear();
@@ -831,15 +841,25 @@ impl App {
                         Ok(o) => {
                             let Opened { full, delta, preview, draft, before, auto_base } = *o;
                             self.before_tex = Some(ctx.load_texture("before", before, TextureOptions::LINEAR));
-                            self.status = format!("{} × {}", full.width(), full.height());
+                            // Keep the damaged-edits warning from `select` visible: the size alone used to replace it
+                            // the moment the photo opened.
+                            self.status = if crate::sidecar_damaged(&p) {
+                                format!("{} × {}. This photo's edits file is damaged: starting fresh, the old file is kept as .damaged", full.width(), full.height())
+                            } else {
+                                format!("{} × {}", full.width(), full.height())
+                            };
                             let full = Arc::new(full);
                             self.photo = Some(Photo { full: full.clone(), orig: full, delta: delta.map(Arc::new), nr_applied: 0.0, preview: Arc::new(preview), draft: Arc::new(draft), auto_base });
                             // The previous photo's picture must not show under this one's name.
                             self.tex = None;
                             self.photo_gen += 1;
                             self.preset_tex.clear();
+                            self.convert_if_negative();
                         }
-                        Err(e) => self.status = format!("Could not open: {e}"),
+                        Err(e) => {
+                            self.status = format!("Could not open: {e}");
+                            self.open_error = Some(e);
+                        }
                     }
                 }
                 Msg::Loaded(..) => {}
@@ -852,10 +872,19 @@ impl App {
                 Msg::Status(s) => self.status = s,
                 Msg::Synced(done) => {
                     self.status = format!("Synced to {} frame{}", done.len(), if done.len() == 1 { "" } else { "s" });
-                    self.meta.extend(done);
+                    // Only what the sync changed: a rating, flag or label set while it ran is newer than the
+                    // thread's copy, and Move rejects reads this list.
+                    for (p, m) in done {
+                        let e = self.meta.entry(p).or_insert(m);
+                        e.edited = m.edited;
+                        e.neg = m.neg;
+                    }
                 }
-                Msg::Cull(p, d) => {
+                Msg::Cull(p, d, skipped) => {
                     self.cull.pending.remove(&p);
+                    if d.is_none() && !skipped {
+                        self.cull.failed.insert(p.clone());
+                    }
                     if let Some(d) = d {
                         let name = p.display().to_string();
                         let tex = ctx.load_texture(format!("cull {name}"), d.img, TextureOptions::LINEAR);
@@ -945,6 +974,17 @@ impl App {
     }
 
     /// Record a history step and save the sidecar once a slider is released.
+    /// In the Negative view, a frame with an orange film base (C-41, ECN-2) is converted straight away, so the
+    /// Positive view shows a positive. Other frames (a slide, B&W, a positive opened here by mistake) wait for the
+    /// switch or a stock. It's an ordinary edit: undo or the switch turns it off.
+    fn convert_if_negative(&mut self) {
+        let Some(base) = self.photo.as_ref().map(|p| p.auto_base) else { return };
+        if self.module == Module::Negative && !self.params.neg.enabled && negative::orange_mask(base) {
+            self.params.neg.enabled = true;
+            self.status = "Orange film base found: converted as a colour negative".into();
+        }
+    }
+
     fn commit(&mut self) {
         if self.history.get(self.hist_pos) == Some(&self.params) {
             return;
@@ -1179,7 +1219,17 @@ impl App {
             crate::output::file_name(&self.export.name, cur, 1, &self.export.roll, &self.params, &shot)
         };
         let name = if load::is_raw(load::copy_of(cur).as_deref().unwrap_or(cur)) || !self.export.name.trim().is_empty() { format!("{stem}.{ext}") } else { format!("{stem}-edit.{ext}") };
-        let Some(out) = rfd::FileDialog::new().set_file_name(name).add_filter(ext.to_uppercase(), &[ext]).save_file() else { return };
+        let Some(mut out) = rfd::FileDialog::new().set_file_name(name).add_filter(ext.to_uppercase(), &[ext]).save_file() else { return };
+        // Some save dialogs (GTK) don't add the extension; the format is chosen from it, so a TIFF would
+        // otherwise come out as a JPEG.
+        if out.extension().is_none() {
+            out.set_extension(ext);
+            if out.exists() {
+                // The dialog only asked about replacing the name without the extension.
+                self.status = format!("{} already exists: print again under another name", out.file_name().unwrap_or_default().to_string_lossy());
+                return;
+            }
+        }
         if out.canonicalize().ok() == cur.canonicalize().ok() {
             self.status = "Print needs a different name: that is the original frame".into();
             return;
@@ -1855,12 +1905,19 @@ impl App {
 
     fn make_contact_sheet(&mut self) {
         let files = self.lib_visible();
-        let Some(out) = rfd::FileDialog::new().set_file_name("contact-sheet.jpg").add_filter("JPEG", &["jpg"]).save_file() else { return };
+        let Some(mut out) = rfd::FileDialog::new().set_file_name("contact-sheet.jpg").add_filter("JPEG", &["jpg"]).save_file() else { return };
+        if out.extension().is_none() {
+            out.set_extension("jpg"); // some save dialogs (GTK) drop it
+        }
         self.status = format!("Making a contact sheet of {} photos…", files.len());
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            let r = save_output(contact_sheet(&files, 6), &out, 90);
-            let _ = tx.send(Msg::Status(match r { Ok(()) => format!("Saved {}", out.file_name().unwrap_or_default().to_string_lossy()), Err(e) => format!("Contact sheet failed: {e}") }));
+            let r = save_contact_sheets(&files, 6, &out);
+            let _ = tx.send(Msg::Status(match r {
+                Ok(w) if w.len() == 1 => format!("Saved {}", out.file_name().unwrap_or_default().to_string_lossy()),
+                Ok(w) => format!("Saved {} contact sheet pages", w.len()),
+                Err(e) => format!("Contact sheet failed: {e}"),
+            }));
         });
     }
 
@@ -1868,16 +1925,17 @@ impl App {
 
     /// Ask for a photo's culling image (fast embedded preview, focus map and raw statistics), off the UI thread.
     fn request_cull(&mut self, ctx: &egui::Context, f: &Path) {
-        if self.cull.cache.contains_key(f) || !self.cull.pending.insert(f.to_path_buf()) {
+        if self.cull.cache.contains_key(f) || self.cull.failed.contains(f) || !self.cull.pending.insert(f.to_path_buf()) {
             return;
         }
         let (f, tx, ctx2, wanted) = (f.to_path_buf(), self.tx.clone(), ctx.clone(), self.cull.wanted.clone());
         std::thread::spawn(move || {
             let _one = DECODE.lock().unwrap_or_else(|e| e.into_inner());
+            if !wanted.lock().is_ok_and(|w| w.contains(&f)) {
+                let _ = tx.send(Msg::Cull(f, None, true)); // stepped past it while it waited
+                return;
+            }
             let data = (|| {
-                if !wanted.lock().ok()?.contains(&f) {
-                    return None; // stepped past it while it waited
-                }
                 let img = load::load_quick(&f, 2560).ok()?;
                 let p = Params { border: Default::default(), ..read_params(&f).unwrap_or_default() };
                 let out = develop::render(&img, &p, 0.3);
@@ -1892,7 +1950,7 @@ impl App {
                 };
                 Some(CullData { focus: focus_map(&out), img: to_color_image(&out), bins, clipped, raw: raw.is_some() })
             })();
-            let _ = tx.send(Msg::Cull(f, data));
+            let _ = tx.send(Msg::Cull(f, data, false));
             ctx2.request_repaint();
         });
     }
@@ -1928,7 +1986,11 @@ impl App {
         for (k, f) in shown.iter().enumerate() {
             let slot = Rect::from_min_size(pos2(avail.left() + k as f32 * (slot_w + 12.0), avail.top()), vec2(slot_w, avail.height() - 30.0));
             let Some(c) = self.cull.cache.get(f) else {
-                ui.put(slot, egui::Spinner::new());
+                if self.cull.failed.contains(f) {
+                    ui.put(slot, egui::Label::new(RichText::new(format!("Can't open {}", f.file_name().unwrap_or_default().to_string_lossy())).color(TEXT2)));
+                } else {
+                    ui.put(slot, egui::Spinner::new());
+                }
                 continue;
             };
             let s = c.tex.size_vec2();
@@ -1955,17 +2017,22 @@ impl App {
             ui.painter().text(pos2(r.left(), y), Align2::LEFT_CENTER, name, FontId::proportional(12.5), if m.flag < 0 { TEXT3 } else { TEXT });
             let mut x = r.right();
             if m.label > 0 {
-                ui.painter().circle_filled(pos2(x - 6.0, y), 5.0, LABEL_COLORS[(m.label - 1).min(4) as usize]);
-                x -= 20.0;
+                ui.painter().circle_filled(pos2(x - 6.0, y), 6.0, LABEL_COLORS[(m.label - 1).min(4) as usize]);
+                x -= 22.0;
             }
+            // Pick or reject in the same filled form as the panel's buttons, so the state reads at a glance.
             if m.flag != 0 {
                 let t = if m.flag > 0 { "Pick" } else { "Reject" };
-                let g = ui.painter().layout_no_wrap(t.into(), FontId::proportional(12.0), BONE);
-                x -= g.size().x;
-                ui.painter().galley(pos2(x, y - g.size().y / 2.0), g, TEXT);
-                x -= 12.0;
+                let g = ui.painter().layout_no_wrap(t.into(), FontId::new(12.5, semi()), INK);
+                let b = Rect::from_min_max(pos2(x - g.size().x - 16.0, y - 11.0), pos2(x, y + 11.0));
+                ui.painter().rect_filled(b, 3.0, if m.flag > 0 { BONE } else { hex(0xE5484D) });
+                ui.painter().galley(b.center() - g.size() / 2.0, g, INK);
+                x = b.left() - 14.0;
             }
-            paint_stars(ui.painter(), pos2(x - 5.0 * 12.0 + 6.0, y), m.rating, 5.0, ACCENT);
+            // All five stars, empty ones dim: an unrated frame shows that it is unrated.
+            let (sr, first) = (7.0, x - 4.0 * 7.0 * 2.4 - 7.0);
+            paint_stars(ui.painter(), pos2(first, y), 5, sr, BTN_BORDER);
+            paint_stars(ui.painter(), pos2(first, y), m.rating, sr, ACCENT);
             // What the key just did, large on the photo, fading out over a second.
             if *f == sel
                 && let Some((text, t0)) = &self.cull.flash
@@ -1995,6 +2062,43 @@ impl App {
 
     fn cull_panel(&mut self, ui: &mut Ui) {
         let sel = self.lib_sel.clone();
+        let k = |id: &str| keys::display(self.keymap.key(id));
+        let (pick_key, reject_key, nav) = (k("pick"), k("reject"), format!("{} {}", k("next"), k("prev")));
+        // Cull's one question is keep or not, so the answer comes first, each control with its key.
+        if let Some(f) = sel.clone() {
+            let m = self.meta.get(&f).copied().unwrap_or_default();
+            ui.label(caps("Rating"));
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                let (r, resp) = ui.allocate_exact_size(vec2(5.0 * 30.0, 30.0), Sense::click());
+                let hover = resp.hover_pos().map(|p| (((p.x - r.left()) / 30.0) as u8 + 1).min(5));
+                let first = pos2(r.left() + 15.0, r.center().y);
+                for i in 0..5u8 {
+                    let lit = i < hover.unwrap_or(m.rating);
+                    paint_stars(ui.painter(), first + vec2(i as f32 * 30.0, 0.0), 1, 10.0, if lit { if hover.is_some() { TEXT2 } else { ACCENT } } else { BTN_BORDER });
+                }
+                if resp.on_hover_text("Click a star, or press 0–5").clicked()
+                    && let Some(n) = hover
+                {
+                    self.rate(&f, Some(if n == m.rating { 0 } else { n }), None, None);
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.label(RichText::new("0–5").monospace().size(11.0).color(TEXT3)));
+            });
+            ui.add_space(4.0);
+            ui.columns(2, |c| {
+                for (i, (flag, name, key)) in [(1i8, "Pick", &pick_key), (-1, "Reject", &reject_key)].into_iter().enumerate() {
+                    let on = m.flag == flag;
+                    let b = egui::Button::new(RichText::new(format!("{name}   {key}")).color(if on { INK } else { TEXT }))
+                        .fill(if on { if flag > 0 { BONE } else { hex(0xE5484D) } } else { Color32::TRANSPARENT })
+                        .stroke(Stroke::new(1.0, if on { Color32::TRANSPARENT } else { BTN_BORDER }))
+                        .min_size(vec2(c[i].available_width(), 32.0));
+                    if c[i].add(b).clicked() {
+                        self.rate(&f, None, Some(if on { 0 } else { flag }), None);
+                    }
+                }
+            });
+            ui.add_space(16.0);
+        }
         let c = sel.as_ref().and_then(|f| self.cull.cache.get(f));
         ui.label(caps(if c.is_some_and(|c| c.raw) { "Raw histogram" } else { "Histogram" }));
         ui.add_space(4.0);
@@ -2026,8 +2130,7 @@ impl App {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| switch(ui, &mut self.cull.compare));
         });
         ui.add_space(14.0);
-        let k = |id: &str| keys::display(self.keymap.key(id));
-        ui.label(RichText::new(format!("{} {} next / previous · 0–5 stars · {} pick · {} reject. Press ? for every key.", k("next"), k("prev"), k("pick"), k("reject"))).size(11.5).color(TEXT3));
+        ui.label(RichText::new(format!("{nav} next / previous. Press ? for every key.")).size(11.5).color(TEXT3));
         ui.add_space(14.0);
         let rejects = self.meta.values().filter(|m| m.flag < 0).count();
         // Only offered when there is something to move.
@@ -2051,8 +2154,9 @@ impl App {
             ui.spacing_mut().item_spacing.x = 2.0;
             for (m, name) in [(Module::Library, "Library"), (Module::Cull, "Cull"), (Module::Develop, "Develop"), (Module::Negative, "Negative")] {
                 if tab(ui, name, self.module == m).clicked() {
-                    self.module = m; // opening the tab doesn't convert: pick a stock or use the switch
+                    self.module = m;
                     self.tool = Tool::None;
+                    self.convert_if_negative();
                 }
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -2090,7 +2194,7 @@ impl App {
             let mut i = order.iter().position(|v| *v == self.view).unwrap_or(0);
             segmented(ui, &mut i, labels);
             self.view = order[i];
-            // Groups: views | tools | copy & paste ... zoom & paper | reset.
+            // Groups: views | tools ... zoom & paper. Copy, paste and reset live under the settings panel.
             let divider = |ui: &mut Ui| {
                 ui.add_space(4.0);
                 let (r, _) = ui.allocate_exact_size(vec2(1.0, 20.0), Sense::hover());
@@ -2108,13 +2212,6 @@ impl App {
                         // Open the matching panel section.
                         match self.tool { Tool::Crop => self.open[6] = true, Tool::Heal => self.open[10] = true, Tool::Mask => self.open[11] = true, Tool::None | Tool::Sample => {} }
                     }
-                }
-                divider(ui);
-                if ghost(ui, "Copy", false).on_hover_text("Ctrl/Cmd+C").clicked() {
-                    self.copied = Some(self.params.clone());
-                }
-                if ui.add_enabled(self.copied.is_some(), egui::Button::new(RichText::new("Paste").color(TEXT2)).fill(Color32::TRANSPARENT).stroke(Stroke::NONE)).clicked() {
-                    self.params = self.params.with_look_of(self.copied.as_ref().unwrap());
                 }
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -2135,60 +2232,75 @@ impl App {
                         self.toggle_zoom([0.5, 0.5]);
                     }
                 }
-                // Negative has its own "Reset conversion" under the panel.
-                if !neg {
-                    divider(ui);
-                }
-                if !neg && ui.button("Reset").on_hover_text("Clear this photo's Develop settings").clicked() {
-                    self.params = Params { neg: self.params.neg.clone(), ..Params::default() };
-                }
             });
         });
     }
 
     fn filmstrip(&mut self, ui: &mut Ui) {
         let mut open = None;
-        egui::ScrollArea::horizontal().auto_shrink([false, true]).show(ui, |ui| {
-            ui.horizontal_centered(|ui| {
-                for f in &self.files {
-                    let size = vec2(93.0, 62.0);
-                    let r = match self.thumb(f) {
-                        Some(t) => ui.add(egui::Image::new(t).uv(cover_uv(t, 1.5)).fit_to_exact_size(size).maintain_aspect_ratio(false).corner_radius(3).sense(Sense::click())),
-                        None => {
-                            let (r, resp) = ui.allocate_exact_size(size, Sense::click());
-                            ui.painter().rect_filled(r, 3.0, CARD);
-                            resp
-                        }
-                    };
-                    // Marks, so a culled roll reads at a glance: stars, label dot, rejects dimmed.
-                    let m = self.meta.get(f).copied().unwrap_or_default();
-                    let p = ui.painter_at(r.rect);
-                    if m.flag < 0 {
-                        p.rect_filled(r.rect, 3.0, Color32::from_black_alpha(150));
-                        p.text(r.rect.center(), Align2::CENTER_CENTER, "×", FontId::proportional(20.0), TEXT2);
-                    }
-                    if m.rating > 0 {
-                        let w = m.rating as f32 * 9.0 + 6.0;
-                        let b = Rect::from_min_size(pos2(r.rect.left() + 3.0, r.rect.bottom() - 15.0), vec2(w, 12.0));
-                        p.rect_filled(b, 3.0, Color32::from_rgba_unmultiplied(20, 20, 22, 210));
-                        paint_stars(&p, pos2(b.left() + 7.5, b.center().y), m.rating, 3.5, BONE);
-                    }
-                    if m.label > 0 {
-                        p.circle_filled(pos2(r.rect.right() - 8.0, r.rect.top() + 8.0), 4.5, LABEL_COLORS[(m.label - 1).min(4) as usize]);
-                        p.circle_stroke(pos2(r.rect.right() - 8.0, r.rect.top() + 8.0), 4.5, Stroke::new(1.0, INK));
-                    }
-                    let here = if self.module == Module::Cull { self.lib_sel.as_ref() } else { self.current.as_ref() };
-                    if Some(f) == here {
-                        ui.painter().rect_stroke(r.rect.expand(2.0), 4.0, Stroke::new(2.0, ACCENT), egui::StrokeKind::Outside);
-                    } else if r.hovered() {
-                        ui.painter().rect_stroke(r.rect.expand(1.0), 4.0, Stroke::new(1.0, hex(0x55555C)), egui::StrokeKind::Outside);
-                    }
-                    if r.clicked() {
-                        open = Some(f.clone());
+        let (size, gap) = (vec2(93.0, 62.0), 6.0);
+        let step = size.x + gap;
+        let here = if self.module == Module::Cull { self.lib_sel.clone() } else { self.current.clone() };
+        let here_i = here.as_ref().and_then(|h| self.files.iter().position(|f| f == h));
+        // Bring the current frame into view when it changes (stepping with the arrow keys).
+        let id = ui.scope_id().with("strip_here");
+        let moved = ui.data(|d| d.get_temp::<Option<usize>>(id)) != Some(here_i);
+        ui.data_mut(|d| d.insert_temp(id, here_i));
+        let mut area = egui::ScrollArea::horizontal().auto_shrink([false, true]);
+        if moved && let Some(i) = here_i {
+            let w = ui.available_width();
+            let (x, visible) = (i as f32 * step, ui.data(|d| d.get_temp::<f32>(id.with("x"))).unwrap_or(0.0));
+            if x < visible || x + size.x > visible + w {
+                area = area.horizontal_scroll_offset((x - (w - size.x) / 2.0).max(0.0));
+            }
+        }
+        // Only the frames in view are drawn: a roll of thousands would otherwise touch (and reload) every thumbnail
+        // each frame, far more than the texture budget holds.
+        let out = area.show_viewport(ui, |ui, vp| {
+            let n = self.files.len();
+            let h = ui.available_height();
+            ui.set_min_size(vec2((n as f32 * step - gap).max(0.0), h));
+            let origin = pos2(ui.max_rect().left(), ui.max_rect().top() + ((h - size.y) / 2.0).max(0.0));
+            let first = (vp.min.x / step).floor().max(0.0) as usize;
+            let last = ((vp.max.x / step).ceil().max(0.0) as usize + 1).min(n);
+            for i in first..last {
+                let f = &self.files[i];
+                let rect = Rect::from_min_size(origin + vec2(i as f32 * step, 0.0), size);
+                let r = ui.interact(rect, ui.scope_id().with(("strip", i)), Sense::click());
+                match self.thumb(f) {
+                    Some(t) => egui::Image::new(t).uv(cover_uv(t, 1.5)).corner_radius(3).paint_at(ui, rect),
+                    None => {
+                        ui.painter().rect_filled(rect, 3.0, CARD);
                     }
                 }
-            });
+                // Marks, so a culled roll reads at a glance: stars, label dot, rejects dimmed.
+                let m = self.meta.get(f).copied().unwrap_or_default();
+                let p = ui.painter_at(rect);
+                if m.flag < 0 {
+                    p.rect_filled(rect, 3.0, Color32::from_black_alpha(150));
+                    p.text(rect.center(), Align2::CENTER_CENTER, "×", FontId::proportional(20.0), TEXT2);
+                }
+                if m.rating > 0 {
+                    let w = m.rating as f32 * 9.0 + 6.0;
+                    let b = Rect::from_min_size(pos2(rect.left() + 3.0, rect.bottom() - 15.0), vec2(w, 12.0));
+                    p.rect_filled(b, 3.0, Color32::from_rgba_unmultiplied(20, 20, 22, 210));
+                    paint_stars(&p, pos2(b.left() + 7.5, b.center().y), m.rating, 3.5, BONE);
+                }
+                if m.label > 0 {
+                    p.circle_filled(pos2(rect.right() - 8.0, rect.top() + 8.0), 4.5, LABEL_COLORS[(m.label - 1).min(4) as usize]);
+                    p.circle_stroke(pos2(rect.right() - 8.0, rect.top() + 8.0), 4.5, Stroke::new(1.0, INK));
+                }
+                if Some(i) == here_i {
+                    ui.painter().rect_stroke(rect.expand(2.0), 4.0, Stroke::new(2.0, ACCENT), egui::StrokeKind::Outside);
+                } else if r.hovered() {
+                    ui.painter().rect_stroke(rect.expand(1.0), 4.0, Stroke::new(1.0, hex(0x55555C)), egui::StrokeKind::Outside);
+                }
+                if r.clicked() {
+                    open = Some(f.clone());
+                }
+            }
         });
+        ui.data_mut(|d| d.insert_temp(id.with("x"), out.state.clamped_offset().x));
         if let Some(f) = open {
             if self.module == Module::Cull {
                 self.lib_sel = Some(f);
@@ -2202,7 +2314,13 @@ impl App {
         let avail = ui.available_rect_before_wrap().shrink(24.0);
         let (Some(tex), Some(before)) = (self.tex.clone(), self.before_tex.clone()) else {
             ui.centered_and_justified(|ui| {
-                if self.loading { ui.spinner(); } else { ui.label(RichText::new("Pick a frame in the Library").color(TEXT3)); }
+                if self.loading {
+                    ui.spinner();
+                } else if let Some(e) = &self.open_error {
+                    ui.label(RichText::new(format!("Can't open this frame\n{e}")).color(TEXT2));
+                } else {
+                    ui.label(RichText::new("Pick a frame in the Library").color(TEXT3));
+                }
             });
             return;
         };
@@ -2406,10 +2524,9 @@ impl App {
             let rgb = self.hover_rgb.map(|c| format!("R {:>3}  G {:>3}  B {:>3}", c[0], c[1], c[2])).unwrap_or_default(); // values appear while the pointer is over the photo
             ui.label(RichText::new(rgb).monospace().size(11.0).color(TEXT3));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let t = if self.clip_view { "Clipping on" } else { "Clipping off" };
-                if small_action(ui, t, self.clip_view).on_hover_text("Show clipped highlights and shadows on the photo (J)").clicked() {
-                    self.clip_view = !self.clip_view;
-                }
+                // A switch, like Cull's Focus check: a button reading "Clipping off" looked like a state, not a control.
+                switch(ui, &mut self.clip_view).on_hover_text("Show clipped highlights and shadows on the photo (J)");
+                ui.label(RichText::new("Clipping").size(12.0).color(LABEL));
             });
         });
     }
@@ -2836,7 +2953,7 @@ impl App {
                 for k in (0..5u8).rev() {
                     let (r, resp) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::click());
                     let on = m.label == k + 1;
-                    ui.painter().circle_filled(r.center(), if on { 6.0 } else { 4.5 }, LABEL_COLORS[k as usize].gamma_multiply(if on { 1.0 } else { 0.55 }));
+                    ui.painter().circle_filled(r.center(), if on { 6.5 } else { 5.5 }, LABEL_COLORS[k as usize].gamma_multiply(if on { 1.0 } else { 0.8 }));
                     if on {
                         ui.painter().circle_stroke(r.center(), 7.5, Stroke::new(1.0, TEXT));
                     }
@@ -3505,6 +3622,23 @@ impl App {
     }
 
     fn develop_footer(&mut self, ui: &mut Ui) {
+        // Everything that moves settings between frames in one place, Reset last and quiet: it throws work away.
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            if ghost(ui, "Copy", false).on_hover_text("Copy these settings (Ctrl/Cmd+C)").clicked() {
+                self.copied = Some(self.params.clone());
+            }
+            if ui.add_enabled(self.copied.is_some(), egui::Button::new(RichText::new("Paste").color(TEXT2)).fill(Color32::TRANSPARENT).stroke(Stroke::NONE))
+                .on_hover_text("Paste the copied settings (Ctrl/Cmd+V); crop and negative conversion stay").clicked() {
+                self.params = self.params.with_look_of(self.copied.as_ref().unwrap());
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ghost(ui, "Reset", false).on_hover_text("Clear this photo's Develop settings (undo brings them back)").clicked() {
+                    self.params = Params { neg: self.params.neg.clone(), ..Params::default() };
+                }
+            });
+        });
+        ui.add_space(4.0);
         ui.columns(2, |c| {
             if c[0].add_enabled(self.prev_params.is_some(), egui::Button::new("Paste previous").min_size(vec2(c[0].available_width(), 32.0))).on_hover_text("Apply the settings of the frame you edited before this one").clicked() {
                 let prev = self.prev_params.clone().unwrap();
@@ -3614,7 +3748,8 @@ impl App {
                         ui.label(caps(s.brand));
                         last_brand = s.brand;
                     }
-                    let on = self.params.neg.stock == s.id;
+                    // Marked only while converting: a highlighted stock on an unconverted frame read as "in use".
+                    let on = self.params.neg.enabled && self.params.neg.stock == s.id;
                     let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::click());
                     if on || resp.hovered() {
                         ui.painter().rect_filled(r, 3.0, if on { BONE } else { CARD });
@@ -3658,6 +3793,8 @@ impl App {
                 if !np.enabled {
                     ui.label(RichText::new("Off. Turn on, or pick a stock, to convert this frame.").size(11.5).color(TEXT2));
                     ui.disable();
+                    ui.visuals_mut().disabled_alpha = 0.7; // still readable, so you can see what turning it on gives
+
                 }
                 ui.add_space(6.0);
 
@@ -3713,9 +3850,9 @@ impl App {
                 let shift = |ch: usize, sign: f32| move |t: f32| { let mut c = [0.5f32; 3]; c[ch] += sign * t / 100.0 * 0.3; enc(c) };
                 slider(ui, "Density", &mut np.density, -100.0, 100.0, 0.0, Some(&|t: f32| enc([0.5 - t / 100.0 * 0.3; 3])));
                 slider(ui, "Contrast", &mut np.contrast, -100.0, 100.0, 0.0, None);
-                slider(ui, "Cyan – Red", &mut np.cy, -100.0, 100.0, 0.0, Some(&shift(0, 1.0)));
-                slider(ui, "Magenta – Green", &mut np.mg, -100.0, 100.0, 0.0, Some(&shift(1, 1.0)));
-                slider(ui, "Yellow – Blue", &mut np.yb, -100.0, 100.0, 0.0, Some(&shift(2, 1.0)));
+                slider(ui, "Cyan–Red", &mut np.cy, -100.0, 100.0, 0.0, Some(&shift(0, 1.0)));
+                slider(ui, "Magenta–Green", &mut np.mg, -100.0, 100.0, 0.0, Some(&shift(1, 1.0)));
+                slider(ui, "Yellow–Blue", &mut np.yb, -100.0, 100.0, 0.0, Some(&shift(2, 1.0)));
                 slider(ui, "Shadow roll-off", &mut np.toe, 0.0, 100.0, d.toe, None);
                 slider(ui, "Highlight roll-off", &mut np.shoulder, 0.0, 100.0, d.shoulder, None);
                 ui.add_space(6.0);
@@ -4201,7 +4338,7 @@ impl eframe::App for App {
                 egui::Panel::left("left").exact_size(260.0).resizable(false)
                     .frame(if neg { side(PANEL) } else { pad(PANEL, 12, 16) })
                     .show(ui, |ui| if neg { self.negative_left(ui) } else { self.develop_left(ui) });
-                egui::Panel::right("right").exact_size(320.0).resizable(false).frame(side(PANEL)).show(ui, |ui| {
+                egui::Panel::right("right").exact_size(RIGHT_W).resizable(false).frame(side(PANEL)).show(ui, |ui| {
                     egui::Panel::bottom("right_footer").frame(pad(PANEL, 16, 10)).show(ui, |ui| if neg { self.negative_footer(ui) } else { self.develop_footer(ui) });
                     egui::Panel::top("hist").frame(pad(PANEL, 16, 12)).show(ui, |ui| self.histogram_block(ui));
                     egui::CentralPanel::default().frame(egui::Frame::new()).show(ui, |ui| if neg { self.negative_right(ui) } else { self.develop_right(ui) });

@@ -248,15 +248,25 @@ pub fn exif_segment(shot: &Shot, description: &str) -> Vec<u8> {
     let mut body = b"Exif\0\0".to_vec();
     body.extend(head);
     body.extend(data);
-    let mut seg = vec![0xFF, 0xE1];
-    seg.extend_from_slice(&((body.len() + 2) as u16).to_be_bytes());
-    seg.extend(body);
-    seg
+    segment(0xE1, &body)
 }
 
-/// Put a segment right after the JPEG's start marker (and its JFIF header, which must come first).
+/// A JPEG marker segment: FF, marker, big-endian length (which counts itself), body.
+pub fn segment(marker: u8, body: &[u8]) -> Vec<u8> {
+    let mut s = vec![0xFF, marker];
+    s.extend_from_slice(&((body.len() + 2) as u16).to_be_bytes());
+    s.extend_from_slice(body);
+    s
+}
+
+/// Where new segments go: right after the start marker, and after a JFIF header, which must come first.
+pub fn insert_at(jpeg: &[u8]) -> usize {
+    if jpeg.get(2..4) == Some(&[0xFF, 0xE0]) { 4 + u16::from_be_bytes([jpeg[4], jpeg[5]]) as usize } else { 2 }
+}
+
+/// Put segments (one or several, back to back) at `insert_at`.
 pub fn insert_segment(jpeg: &[u8], seg: &[u8]) -> Vec<u8> {
-    let at = if jpeg.get(2..4) == Some(&[0xFF, 0xE0]) { 4 + u16::from_be_bytes([jpeg[4], jpeg[5]]) as usize } else { 2 };
+    let at = insert_at(jpeg);
     [&jpeg[..at], seg, &jpeg[at..]].concat()
 }
 

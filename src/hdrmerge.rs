@@ -65,7 +65,7 @@ pub fn merge(imgs: &[Rgb32FImage], shots: &[Shot], progress: &dyn Fn(&str)) -> R
     progress("Merging");
     let mut out = Rgb32FImage::new(w, h);
     let (darkest, brightest) = (order[0], order[order.len() - 1]);
-    out.par_chunks_mut(3).enumerate().for_each(|(p, o)| {
+    crate::develop::px3_mut(&mut out).par_iter_mut().enumerate().for_each(|(p, o)| {
         let px = |i: usize| { let s = &warped[i].as_raw()[p * 3..p * 3 + 3]; [s[0], s[1], s[2]] };
         let refv = px(r).map(|v| v * gain[r]);
         let wr = weight(px(r));
@@ -93,7 +93,7 @@ pub fn merge(imgs: &[Rgb32FImage], shots: &[Shot], progress: &dyn Fn(&str)) -> R
         } else {
             px(brightest).map(|x| x * gain[brightest])
         };
-        o.copy_from_slice(&v);
+        *o = v;
     });
     Ok(out)
 }
@@ -110,12 +110,12 @@ fn warp(img: &Rgb32FImage, hm: &[[f64; 3]; 3]) -> Rgb32FImage {
     let (w, h) = img.dimensions();
     let mut out = Rgb32FImage::new(w, h);
     out.par_chunks_mut(w as usize * 3).enumerate().for_each(|(y, row)| {
-        for (x, px) in row.chunks_mut(3).enumerate() {
+        for (x, px) in crate::develop::px3_mut(row).iter_mut().enumerate() {
             let (xf, yf) = (x as f64, y as f64);
             let z = inv[2][0] * xf + inv[2][1] * yf + inv[2][2];
             let (sx, sy) = ((inv[0][0] * xf + inv[0][1] * yf + inv[0][2]) / z, (inv[1][0] * xf + inv[1][1] * yf + inv[1][2]) / z);
             let v = crate::develop::bilinear(img, (sx as f32).clamp(0.0, (w - 1) as f32), (sy as f32).clamp(0.0, (h - 1) as f32));
-            px.copy_from_slice(&v);
+            *px = v;
         }
     });
     out

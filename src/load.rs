@@ -59,9 +59,10 @@ fn load_other(path: &Path, linearize: bool) -> Result<Rgb32FImage, String> {
     let mut img = DynamicImage::from_decoder(dec).map_err(|e| e.to_string())?;
     img.apply_orientation(orient);
     let hdr = matches!(img, DynamicImage::ImageRgb32F(_) | DynamicImage::ImageRgba32F(_));
+    let eight_bit = matches!(img, DynamicImage::ImageRgb8(_) | DynamicImage::ImageRgba8(_) | DynamicImage::ImageLuma8(_) | DynamicImage::ImageLumaA8(_));
     let mut out = img.to_rgb32f();
     if linearize && !hdr {
-        out.iter_mut().for_each(|v| *v = srgb_to_linear(*v));
+        linearize_srgb(&mut out, eight_bit);
     }
     Ok(out)
 }
@@ -96,7 +97,7 @@ pub fn load_quick(path: &Path, size: u32) -> Result<Rgb32FImage, String> {
         });
         if let Some(img) = embedded.filter(|i| i.width() >= size.min(160)) {
             let mut out = img.thumbnail(size, size).to_rgb32f();
-            out.iter_mut().for_each(|v| *v = srgb_to_linear(*v));
+            linearize_srgb(&mut out, false);
             return Ok(out);
         }
     }
@@ -111,6 +112,18 @@ pub fn fit(img: &Rgb32FImage, size: u32) -> Rgb32FImage {
     }
     let s = size as f32 / w.max(h) as f32;
     image::imageops::resize(img, ((w as f32 * s) as u32).max(1), ((h as f32 * s) as u32).max(1), FilterType::Triangle)
+}
+
+/// sRGB-encoded to linear, in place and on every core. 8-bit sources only have 256 values, so they use a table
+/// (a powf per channel was most of the time it took to open a big JPEG).
+fn linearize_srgb(img: &mut Rgb32FImage, eight_bit: bool) {
+    use rayon::prelude::*;
+    if eight_bit {
+        let t: [f32; 256] = std::array::from_fn(|i| srgb_to_linear(i as f32 / 255.0));
+        img.par_iter_mut().for_each(|v| *v = t[(*v * 255.0).round().clamp(0.0, 255.0) as usize]);
+    } else {
+        img.par_iter_mut().for_each(|v| *v = srgb_to_linear(*v));
+    }
 }
 
 pub fn srgb_to_linear(v: f32) -> f32 {
@@ -154,6 +167,8 @@ pub fn raw_stats(path: &Path) -> Option<RawStats> {
     let (w, h) = (raw.width, raw.height);
     let mut bins = [[0f32; 128]; 3];
     let (mut clip, mut count) = ([0u64; 3], [0u64; 3]);
+    // Bin of each level (gamma 2.2, 128 bins), looked up instead of a powf per sample.
+    let bin_of: [u8; 4096] = std::array::from_fn(|i| ((i as f32 / 4095.0).powf(1.0 / 2.2) * 127.0) as u8);
     // Every second row and column of each 2×2 block is plenty for statistics.
     for y in (0..h).step_by(3) {
         for x in (0..w).step_by(3) {
@@ -169,7 +184,7 @@ pub fn raw_stats(path: &Path) -> Option<RawStats> {
                 clip[c] += 1;
             }
             let n = ((v - black) / (white - black)).clamp(0.0, 1.0);
-            bins[c][((n.powf(1.0 / 2.2)) * 127.0) as usize] += 1.0;
+            bins[c][bin_of[(n * 4095.0) as usize] as usize] += 1.0;
         }
     }
     for b in &mut bins {

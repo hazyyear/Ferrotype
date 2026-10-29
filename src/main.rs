@@ -63,8 +63,36 @@ pub fn import_xmp_preset(path: &Path) -> Option<(String, Params)> {
     Some((name.unwrap_or_else(|| path.file_stem().unwrap_or_default().to_string_lossy().into()), p))
 }
 
-/// One image of a whole roll or folder: numbered frames on black, like a darkroom contact print.
-pub fn contact_sheet(files: &[PathBuf], cols: u32) -> Rgb32FImage {
+/// Frames per contact sheet page: 10 rows of 6. A JPEG can be at most 65,535 px tall (about 760 frames), and a
+/// page keeps memory to one page of frames at a time.
+const CONTACT_PAGE_ROWS: u32 = 10;
+
+/// Contact sheets of `files` saved to `out`, or to `<out>-p1.jpg`, `-p2`… when they need more than one page.
+/// Frames are numbered across the pages. Returns the files written.
+pub fn save_contact_sheets(files: &[PathBuf], cols: u32, out: &Path) -> Result<Vec<PathBuf>, String> {
+    let cols = cols.clamp(1, files.len().max(1) as u32);
+    let per_page = (cols * CONTACT_PAGE_ROWS) as usize;
+    let pages = files.len().div_ceil(per_page).max(1);
+    let mut written = vec![];
+    for (n, chunk) in files.chunks(per_page.max(1)).enumerate() {
+        let path = if pages == 1 {
+            out.to_path_buf()
+        } else {
+            let stem = out.file_stem().unwrap_or_default().to_string_lossy();
+            let ext = out.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_else(|| "jpg".into());
+            out.with_file_name(format!("{stem}-p{}.{ext}", n + 1))
+        };
+        save_output(contact_sheet(chunk, cols, n * per_page), &path, 90)?;
+        written.push(path);
+    }
+    if pages > 1 && std::fs::metadata(out).is_ok_and(|m| m.len() == 0) {
+        let _ = std::fs::remove_file(out); // the empty name claimed for a single sheet
+    }
+    Ok(written)
+}
+
+/// One image of some frames: numbered (from `first` + 1) on black, like a darkroom contact print.
+fn contact_sheet(files: &[PathBuf], cols: u32, first: usize) -> Rgb32FImage {
     use rayon::prelude::*;
     let cell = 600u32; // each frame fits a 600 × 400 box
     let (fw, fh) = (cell, cell * 2 / 3);
@@ -89,7 +117,7 @@ pub fn contact_sheet(files: &[PathBuf], cols: u32) -> Rgb32FImage {
             image::imageops::replace(&mut sheet, &img, (x0 + (fw - iw.min(fw)) / 2) as i64, (y0 + (fh - ih.min(fh)) / 2) as i64);
         }
         let name = f.file_name().unwrap_or_default().to_string_lossy();
-        develop::draw_text(&mut sheet, &format!("{}   {name}", i + 1), (x0 + fw / 2) as f32, (y0 + fh + label / 2) as f32, label as f32 * 0.32, 0.8);
+        develop::draw_text(&mut sheet, &format!("{}   {name}", first + i + 1), (x0 + fw / 2) as f32, (y0 + fh + label / 2) as f32, label as f32 * 0.32, 0.8);
     }
     sheet
 }
@@ -152,10 +180,13 @@ pub fn move_to_rejects(dest: &Path, files: &[PathBuf]) -> std::io::Result<usize>
     Ok(moved)
 }
 
-/// Write to `path.tmp`, then rename over `path`, so a crash or full disk never leaves a half-written file.
+/// Write to a temp file beside `path`, then rename over `path`, so a crash or full disk never leaves a half-written file.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    // A temp name of its own per write: the sync thread and a rating click can save the same sidecar at once.
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
+    tmp.push(format!(".{}.{n}.tmp", std::process::id()));
     std::fs::write(&tmp, bytes).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })?;
@@ -261,27 +292,34 @@ fn render_export_with(full: &Rgb32FImage, p: &Params, o: &ExportOpts, render: im
 /// Export one rendered photo to `out`, as an HDR gain-map JPEG when asked. `src` is the original file (for the
 /// camera and lens details written with `o.meta`).
 pub fn write_export(full: &Rgb32FImage, p: &Params, o: &ExportOpts, out: &Path, src: &Path) -> Result<(), String> {
-    if o.ext == "jpg" && !o.hdr && (o.meta || o.print[0] > 0.0) {
-        let img = render_export(full, p, o);
-        jpeg_fits(&img)?;
-        let mut bytes = vec![];
-        let mut enc = JpegEncoder::new_with_quality(&mut bytes, o.quality.clamp(1, 100));
-        if o.print[0] > 0.0 && o.canvas[0] == 0 {
-            enc.set_pixel_density(image::codecs::jpeg::PixelDensity::dpi(o.print[2].round() as u16));
-        }
-        DynamicImage::ImageRgb32F(img).to_rgb8().write_with_encoder(enc).map_err(|e| e.to_string())?;
-        if o.meta {
-            let shot = lens::shot(src).unwrap_or_default();
-            let desc = [(!o.roll.trim().is_empty()).then(|| format!("Roll {}", o.roll.trim())), output::stock_name(p)].into_iter().flatten().collect::<Vec<_>>().join(" · ");
-            bytes = output::insert_segment(&bytes, &output::exif_segment(&shot, &desc));
-        }
-        return std::fs::write(out, bytes).map_err(|e| e.to_string());
-    }
+    // Camera details and print DPI go in every JPEG that asks for them, HDR or not.
+    let dpi = (o.print[0] > 0.0 && o.canvas[0] == 0).then(|| o.print[2].round() as u16);
+    let exif = if o.meta {
+        let shot = lens::shot(src).unwrap_or_default();
+        let desc = [(!o.roll.trim().is_empty()).then(|| format!("Roll {}", o.roll.trim())), output::stock_name(p)].into_iter().flatten().collect::<Vec<_>>().join(" · ");
+        output::exif_segment(&shot, &desc)
+    } else {
+        vec![]
+    };
     if o.hdr && o.ext == "jpg" {
         let sdr = render_export(full, p, o);
         jpeg_fits(&sdr)?;
         let low = render_export(full, &Params { exposure: p.exposure - hdr::HEADROOM, ..p.clone() }, o);
-        let bytes = hdr::encode_ultrahdr(&sdr, &hdr::gain_map(&sdr, &low), o.quality.clamp(1, 100))?;
+        let bytes = hdr::encode_ultrahdr(&sdr, &hdr::gain_map(&sdr, &low), o.quality.clamp(1, 100), &exif, dpi)?;
+        return std::fs::write(out, bytes).map_err(|e| e.to_string());
+    }
+    if o.ext == "jpg" && (!exif.is_empty() || dpi.is_some()) {
+        let img = render_export(full, p, o);
+        jpeg_fits(&img)?;
+        let mut bytes = vec![];
+        let mut enc = JpegEncoder::new_with_quality(&mut bytes, o.quality.clamp(1, 100));
+        if let Some(d) = dpi {
+            enc.set_pixel_density(image::codecs::jpeg::PixelDensity::dpi(d));
+        }
+        DynamicImage::ImageRgb32F(img).to_rgb8().write_with_encoder(enc).map_err(|e| e.to_string())?;
+        if !exif.is_empty() {
+            bytes = output::insert_segment(&bytes, &exif);
+        }
         return std::fs::write(out, bytes).map_err(|e| e.to_string());
     }
     save_output(render_export(full, p, o), out, o.quality)
@@ -377,23 +415,36 @@ pub fn photos_under(dir: &Path) -> Vec<(PathBuf, PathBuf)> {
     out
 }
 
+/// Megapixels all panorama frames may take together once loaded (about 2.4 GB), and the largest result (1.8 GB).
+const PANO_INPUT_MP: f64 = 200.0;
+const PANO_MAX_MP: f64 = 150.0;
+
 /// Merge photos into a panorama next to the first one (`IMG_0001-pano.tif`, 16-bit), with a crop that trims the
 /// empty edges saved as its edits. Each photo's lens profile (or one found from its EXIF) is applied first.
 pub fn make_pano(files: &[PathBuf], proj: pano::Projection, progress: &dyn Fn(&str)) -> Result<PathBuf, String> {
     use rayon::prelude::*;
     progress("Loading photos");
-    let imgs: Vec<Rgb32FImage> = files.par_iter().map(|f| {
-        let img = load::load(f)?;
-        let prof = read_params(f).filter(|p| !p.lens.is_empty()).map(|p| (p.lens, p.lens_focal, p.lens_f, p.lens_crop)).or_else(|| lens::detect(f));
-        Ok(match prof {
-            Some((lens, lens_focal, lens_f, lens_crop)) => develop::geometry(&img, &Params { lens, lens_focal, lens_f, lens_crop, ..Default::default() }),
-            None => img,
-        })
-    }).collect::<Result<_, String>>()?;
+    // Memory: 12 bytes a pixel. Six 45 MP frames at full size are 3.2 GB before blending, so the frames share a
+    // budget and each is shrunk as soon as it is loaded; two load at a time so full-size copies don't pile up.
+    let per_frame = PANO_INPUT_MP * 1e6 / files.len().max(1) as f64;
+    let mut imgs: Vec<Rgb32FImage> = Vec::with_capacity(files.len());
+    for pair in files.chunks(2) {
+        let done: Vec<Rgb32FImage> = pair.par_iter().map(|f| {
+            let img = load::load(f)?;
+            let prof = read_params(f).filter(|p| !p.lens.is_empty()).map(|p| (p.lens, p.lens_focal, p.lens_f, p.lens_crop)).or_else(|| lens::detect(f));
+            let img = match prof {
+                Some((lens, lens_focal, lens_f, lens_crop)) => develop::geometry(&img, &Params { lens, lens_focal, lens_f, lens_crop, ..Default::default() }),
+                None => img,
+            };
+            let px = img.width() as f64 * img.height() as f64;
+            Ok(if px > per_frame { load::fit(&img, (img.width().max(img.height()) as f64 * (per_frame / px).sqrt()) as u32) } else { img })
+        }).collect::<Result<_, String>>()?;
+        imgs.extend(done);
+    }
     // Focal length in pixels from EXIF (35 mm-equivalent width is 36 mm); the alignment refines it.
     let long = imgs[0].width().max(imgs[0].height()) as f64;
     let hint = lens::shot(&files[0]).filter(|s| s.focal > 0.0).and_then(|s| Some(s.focal as f64 * lens::camera_crop(&s)? as f64 / 36.0 * long));
-    let (pano, crop) = pano::stitch(&imgs, hint, proj, 400.0, progress)?;
+    let (pano, crop) = pano::stitch(&imgs, hint, proj, PANO_MAX_MP, progress)?;
     progress("Saving");
     let dir = files[0].parent().unwrap_or(Path::new("."));
     let out = claim_output(dir, &format!("{}-pano", export_stem(&files[0])), "tif")?;
@@ -669,8 +720,9 @@ fn cli_contact(args: &[String]) -> Result<(), String> {
         Some(o) => o,
         None => claim_output(Path::new("."), "contact", "jpg")?,
     };
-    save_output(contact_sheet(&files, cols), &out, 90)?;
-    println!("{}", out.display());
+    for p in save_contact_sheets(&files, cols, &out)? {
+        println!("{}", p.display());
+    }
     Ok(())
 }
 

@@ -231,6 +231,11 @@ fn stride(img: &Rgb32FImage) -> usize {
 }
 
 /// Auto film base: the brightest 0.2% of the scan, which is the unexposed rebate when it is in frame.
+/// A colour negative's clear film is orange: clearly more red than green, and more green than blue.
+pub fn orange_mask(base: [f32; 3]) -> bool {
+    base[0] > base[1] * 1.15 && base[1] > base[2] * 1.15
+}
+
 pub fn auto_base(img: &Rgb32FImage) -> [f32; 3] {
     [0, 1, 2].map(|c| {
         let mut v: Vec<f32> = img.chunks(3).step_by(stride(img)).map(|p| p[c]).collect();
@@ -243,7 +248,7 @@ fn bw(st: &Stock) -> bool {
 }
 
 fn densities(c: &[f32], base: [f32; 3], mono: bool) -> [f32; 3] {
-    let d = [0, 1, 2].map(|i| -(c[i] / base[i]).clamp(1e-4, 1.0).log10());
+    let d = [0, 1, 2].map(|i| -crate::develop::log2_fast((c[i] / base[i]).clamp(1e-4, 1.0)) * std::f32::consts::LOG10_2);
     if mono { [(d[0] + d[1] + d[2]) / 3.0; 3] } else { d }
 }
 
@@ -273,8 +278,13 @@ pub fn convert(img: &mut Rgb32FImage, np: &NegParams) {
     if st.kind == Kind::Slide {
         return;
     }
-    let (base, auto_levels) = analyse(img, np);
-    let levels = np.levels.unwrap_or(auto_levels);
+    let (base, levels) = match (np.base, np.levels) {
+        (Some(b), Some(l)) => (b, l), // roll lock: nothing to measure
+        _ => {
+            let (b, l) = analyse(img, np);
+            (b, np.levels.unwrap_or(l))
+        }
+    };
     let mono = bw(st);
     let (look_sat, look_warm, look_con, curve) = match np.look {
         Look::Neutral => (1.0, 0.0, 1.0, true),
@@ -287,14 +297,14 @@ pub fn convert(img: &mut Rgb32FImage, np: &NegParams) {
     let warm = st.warm + look_warm;
     let bal = [np.cy / 100.0 * 0.1 + warm, np.mg / 100.0 * 0.1 + st.green, np.yb / 100.0 * 0.1 - warm];
     let dens = np.density / 100.0 * 0.3;
-    img.par_chunks_mut(3).for_each(|px| {
+    crate::develop::px3_mut(img).par_iter_mut().for_each(|px| {
         let d = densities(px, base, mono);
         let mut n = [0, 1, 2].map(|c| (d[c] - levels[c][0]) / (levels[c][1] - levels[c][0]));
         n = [0, 1, 2].map(|c| (0.5 + (n[c] - 0.5 - dens) * gamma) + bal[c]);
         let m = (n[0] + n[1] + n[2]) / 3.0;
         n = n.map(|v| m + (v - m) * sat);
         n = n.map(|v| if curve { roll_off(v, np.toe, np.shoulder) } else { v.clamp(0.0, 1.0) });
-        px.copy_from_slice(&n.map(|v| v.powf(2.2)));
+        *px = n.map(|v| crate::develop::fpow(v, 2.2));
     });
 }
 

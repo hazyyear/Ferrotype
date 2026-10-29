@@ -258,8 +258,11 @@ pub fn apply_delta(img: &Rgb32FImage, delta: &[f32], amount: f32) -> Rgb32FImage
 
 /// Cached result for a photo, so the slow part runs once: `<user cache>/ferrotype/denoise/<hash>.bin` (f32 little-endian deltas).
 fn cache_file(path: &Path) -> Option<PathBuf> {
-    let m = std::fs::metadata(crate::load::copy_of(path).as_deref().unwrap_or(path)).ok()?;
-    let key = format!("{}|{}|{:?}", std::fs::canonicalize(path).unwrap_or(path.into()).display(), m.len(), m.modified().ok());
+    // Keyed on the real file: a virtual copy has the same pixels, so it shares the result instead of running
+    // the model again (its own path doesn't exist on disk).
+    let real = crate::load::copy_of(path).unwrap_or_else(|| path.to_path_buf());
+    let m = std::fs::metadata(&real).ok()?;
+    let key = format!("{}|{}|{:?}", std::fs::canonicalize(&real).unwrap_or(real.clone()).display(), m.len(), m.modified().ok());
     let h: String = Sha256::digest(key.as_bytes()).iter().take(12).map(|b| format!("{b:02x}")).collect();
     Some(crate::keys::dirs_cache()?.join("denoise").join(format!("{h}.bin")))
 }

@@ -179,12 +179,13 @@ pub fn tab(ui: &mut Ui, text: &str, on: bool) -> egui::Response {
     resp
 }
 
-/// Multi-select filter chip (several can be on): bone outline and bone text when on, dim hairline when off.
+/// Multi-select filter chip (several can be on): bone outline and bone text when on, dim text only when off.
 /// Calmer than the inverted `chip`, so a row of them doesn't outshine the photos.
 pub fn filter_chip(ui: &mut Ui, text: &str, on: bool) -> egui::Response {
+    // Off is plain dim text with no box, so on and off differ in shape, not only in a shade of border.
     ui.add(egui::Button::new(RichText::new(text).size(11.5).color(if on { BONE } else { TEXT3 }))
         .fill(if on { CARD } else { Color32::TRANSPARENT })
-        .stroke(Stroke::new(1.0, if on { BONE } else { BORDER }))
+        .stroke(if on { Stroke::new(1.0, BONE) } else { Stroke::NONE })
         .corner_radius(3)
         .min_size(vec2(0.0, 24.0)))
 }
@@ -458,8 +459,10 @@ pub fn slider_ex(ui: &mut Ui, label: &str, swatch: Option<Color32>, v: &mut f32,
     let resp = resp.on_hover_cursor(if over_value { egui::CursorIcon::Text } else { egui::CursorIcon::ResizeHorizontal });
     if over_value {
         resp.on_hover_text("Click to type a value");
-    } else if label_overflows(ui, label, x - rect.left()) {
-        resp.on_hover_text(label);
+    } else {
+        // The fine control is otherwise invisible; name the label too when it was cut short.
+        let tip = "Hold Shift while dragging for fine steps · double-click to reset";
+        if label_overflows(ui, label, x - rect.left()) { resp.on_hover_text(format!("{label}\n{tip}")) } else { resp.on_hover_text(tip) };
     }
     *v != before
 }
