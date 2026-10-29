@@ -3479,9 +3479,16 @@ impl App {
             }
             return;
         }
-        // Which sections hold edits (compared as saved, so every field type counts the same way).
-        let (pj, dj) = (serde_json::to_value(&*p).unwrap_or_default(), serde_json::to_value(&d).unwrap_or_default());
-        let changed = |keys: &[&str]| keys.iter().any(|k| pj.get(k) != dj.get(k));
+        // Which sections hold edits (compared as saved, so every field type counts the same way). The lists that can
+        // grow large (masks with thousands of brush dabs, snapshots holding whole settings) are set aside while the
+        // rest is serialised, since this runs every frame; spots and masks are compared by count instead.
+        let (spots, masks) = (std::mem::take(&mut p.spots), std::mem::take(&mut p.masks));
+        let (snaps, brushes) = (std::mem::take(&mut p.snapshots), std::mem::take(&mut p.brushes));
+        let pj = serde_json::to_value(&*p).unwrap_or_default();
+        (p.spots, p.masks, p.snapshots, p.brushes) = (spots, masks, snaps, brushes);
+        let dj = serde_json::to_value(&d).unwrap_or_default();
+        let (has_spots, has_masks) = (!p.spots.is_empty(), !p.masks.is_empty() || !p.brushes.is_empty() || !p.grads.is_empty());
+        let changed = |keys: &[&str]| keys.iter().any(|k| match *k { "spots" => has_spots, "masks" => has_masks, _ => pj.get(k) != dj.get(k) });
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             section(ui, "Basic", o_basic, changed(&["temp","tint","exposure","contrast","highlights","shadows","whites","blacks","texture","clarity","dehaze","vibrance","saturation"]), |ui| {
                 // The eyedropper sits with "As shot" in the group's header, as Lightroom's does: an action, not a field.
