@@ -20,6 +20,8 @@ pub fn plan(files: &[PathBuf], pattern: &str, roll: &str) -> Vec<(PathBuf, PathB
     let mut taken: HashSet<PathBuf> = HashSet::new();
     let moving: HashSet<PathBuf> = groups.iter().flat_map(|g| g.2.iter().cloned()).collect();
     let mut out = vec![];
+    // Each folder is listed once: listing it again for every photo made big rolls (and network folders) slow.
+    let mut listings: std::collections::HashMap<PathBuf, Vec<(String, PathBuf)>> = Default::default();
     for (n, (dir, stem, members)) in groups.iter().enumerate() {
         let first = &members[0];
         let p = crate::read_params(first).unwrap_or_default();
@@ -49,12 +51,13 @@ pub fn plan(files: &[PathBuf], pattern: &str, roll: &str) -> Vec<(PathBuf, PathB
             // Companions named after the whole file name: sidecar, damaged sidecar, virtual copies.
             let name = m.file_name().unwrap_or_default().to_string_lossy().to_string();
             let new_name = to.file_name().unwrap_or_default().to_string_lossy().to_string();
-            if let Ok(rd) = std::fs::read_dir(dir) {
-                for e in rd.flatten() {
-                    let n = e.file_name().to_string_lossy().to_string();
-                    if let Some(rest) = n.strip_prefix(&format!("{name}.")) {
-                        out.push((e.path(), dir.join(format!("{new_name}.{rest}"))));
-                    }
+            let listing = listings.entry(dir.clone()).or_insert_with(|| {
+                std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| (e.file_name().to_string_lossy().to_string(), e.path())).collect()
+            });
+            let prefix = format!("{name}.");
+            for (n, path) in listing.iter() {
+                if let Some(rest) = n.strip_prefix(&prefix) {
+                    out.push((path.clone(), dir.join(format!("{new_name}.{rest}"))));
                 }
             }
             let xmp = m.with_extension("xmp");

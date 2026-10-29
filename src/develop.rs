@@ -1660,12 +1660,19 @@ fn parse3<'a>(mut it: impl Iterator<Item = &'a str>) -> Result<[f32; 3], String>
     Ok(v)
 }
 
-/// LUTs are read once per path and kept (they're small: a 33³ LUT is about 430 KB).
+/// LUTs are read once and kept (they're small: a 33³ LUT is about 430 KB). Keyed on the file's size and date too,
+/// so a LUT saved again, or one that was missing or half-copied the first time, is read afresh.
 pub fn load_cube(path: &str) -> Option<std::sync::Arc<Lut>> {
     use std::sync::{Arc, Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, Option<Arc<Lut>>>>> = OnceLock::new();
-    let mut c = CACHE.get_or_init(Default::default).lock().ok()?;
-    c.entry(path.to_string()).or_insert_with(|| std::fs::read_to_string(path).ok().and_then(|t| Lut::parse(&t).ok()).map(Arc::new)).clone()
+    type Key = (String, u64, Option<std::time::SystemTime>);
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<Key, Option<Arc<Lut>>>>> = OnceLock::new();
+    let meta = std::fs::metadata(path).ok()?;
+    let key = (path.to_string(), meta.len(), meta.modified().ok());
+    let mut c = CACHE.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    if c.len() > 64 {
+        c.clear(); // only ever a handful in use; this just stops edited files piling up
+    }
+    c.entry(key).or_insert_with(|| std::fs::read_to_string(path).ok().and_then(|t| Lut::parse(&t).ok()).map(Arc::new)).clone()
 }
 
 /// Noise reduction, defringe and sharpening, on the display-encoded image.

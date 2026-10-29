@@ -14,23 +14,31 @@ pub fn gain_map(sdr: &Rgb32FImage, low: &Rgb32FImage) -> GrayImage {
     let (w, h) = sdr.dimensions();
     let (gw, gh) = (w.div_ceil(4), h.div_ceil(4));
     let boost = 2f32.powf(HEADROOM);
-    GrayImage::from_fn(gw, gh, |gx, gy| {
-        // Average a 4×4 block of log gains.
-        let (mut acc, mut n) = (0.0, 0.0);
-        for y in gy * 4..(gy * 4 + 4).min(h) {
-            for x in gx * 4..(gx * 4 + 4).min(w) {
-                let s = sdr.get_pixel(x, y).0;
-                let ys = luma(s.map(srgb_to_linear));
-                let yl = luma(low.get_pixel(x, y).0.map(srgb_to_linear)) * boost;
-                // Only the highlights get brighter; the rest of the picture stays exactly as in SDR.
-                let wgt = smooth(0.55, 0.95, luma(s));
-                let yh = ys + wgt * (yl.max(ys) - ys);
-                acc += ((yh + OFFSET) / (ys + OFFSET)).log2().clamp(0.0, HEADROOM);
-                n += 1.0;
+    // One gain-map row per task: two sRGB decodes and a log per pixel made this the slow half of an HDR export.
+    use rayon::prelude::*;
+    let mut map = GrayImage::new(gw, gh);
+    map.par_chunks_mut(gw as usize).enumerate().for_each(|(gy, row)| {
+        let gy = gy as u32;
+        for (gx, out) in row.iter_mut().enumerate() {
+            let gx = gx as u32;
+            // Average a 4×4 block of log gains.
+            let (mut acc, mut n) = (0.0, 0.0);
+            for y in gy * 4..(gy * 4 + 4).min(h) {
+                for x in gx * 4..(gx * 4 + 4).min(w) {
+                    let s = sdr.get_pixel(x, y).0;
+                    let ys = luma(s.map(srgb_to_linear));
+                    let yl = luma(low.get_pixel(x, y).0.map(srgb_to_linear)) * boost;
+                    // Only the highlights get brighter; the rest of the picture stays exactly as in SDR.
+                    let wgt = smooth(0.55, 0.95, luma(s));
+                    let yh = ys + wgt * (yl.max(ys) - ys);
+                    acc += ((yh + OFFSET) / (ys + OFFSET)).log2().clamp(0.0, HEADROOM);
+                    n += 1.0;
+                }
             }
+            *out = ((acc / n / HEADROOM) * 255.0).round() as u8;
         }
-        image::Luma([((acc / n / HEADROOM) * 255.0).round() as u8])
-    })
+    });
+    map
 }
 
 fn smooth(a: f32, b: f32, x: f32) -> f32 {

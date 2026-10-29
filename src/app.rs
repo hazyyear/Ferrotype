@@ -839,7 +839,13 @@ impl App {
                         Ok(o) => {
                             let Opened { full, delta, preview, draft, before, auto_base } = *o;
                             self.before_tex = Some(ctx.load_texture("before", before, TextureOptions::LINEAR));
-                            self.status = format!("{} × {}", full.width(), full.height());
+                            // Keep the damaged-edits warning from `select` visible: the size alone used to replace it
+                            // the moment the photo opened.
+                            self.status = if crate::sidecar_damaged(&p) {
+                                format!("{} × {}. This photo's edits file is damaged: starting fresh, the old file is kept as .damaged", full.width(), full.height())
+                            } else {
+                                format!("{} × {}", full.width(), full.height())
+                            };
                             let full = Arc::new(full);
                             self.photo = Some(Photo { full: full.clone(), orig: full, delta: delta.map(Arc::new), nr_applied: 0.0, preview: Arc::new(preview), draft: Arc::new(draft), auto_base });
                             // The previous photo's picture must not show under this one's name.
@@ -1193,7 +1199,17 @@ impl App {
             crate::output::file_name(&self.export.name, cur, 1, &self.export.roll, &self.params, &shot)
         };
         let name = if load::is_raw(load::copy_of(cur).as_deref().unwrap_or(cur)) || !self.export.name.trim().is_empty() { format!("{stem}.{ext}") } else { format!("{stem}-edit.{ext}") };
-        let Some(out) = rfd::FileDialog::new().set_file_name(name).add_filter(ext.to_uppercase(), &[ext]).save_file() else { return };
+        let Some(mut out) = rfd::FileDialog::new().set_file_name(name).add_filter(ext.to_uppercase(), &[ext]).save_file() else { return };
+        // Some save dialogs (GTK) don't add the extension; the format is chosen from it, so a TIFF would
+        // otherwise come out as a JPEG.
+        if out.extension().is_none() {
+            out.set_extension(ext);
+            if out.exists() {
+                // The dialog only asked about replacing the name without the extension.
+                self.status = format!("{} already exists: print again under another name", out.file_name().unwrap_or_default().to_string_lossy());
+                return;
+            }
+        }
         if out.canonicalize().ok() == cur.canonicalize().ok() {
             self.status = "Print needs a different name: that is the original frame".into();
             return;
