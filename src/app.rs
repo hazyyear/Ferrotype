@@ -19,6 +19,8 @@ const PREVIEW: u32 = 1400;
 /// Smaller copy rendered while a slider is being dragged, so dragging stays smooth (about 4× faster).
 const DRAFT: u32 = 700;
 const THUMB: u32 = 320;
+/// Develop and Negative's settings panel. 360 px gives slider tracks about 175 px: at 320 a pixel was 0.075 EV.
+const RIGHT_W: f32 = 360.0;
 /// Thumbnail textures kept in memory (about 270 KB each); the grid only shows a few dozen at a time.
 const THUMB_KEEP: usize = 600;
 /// Undo steps kept per photo.
@@ -852,6 +854,7 @@ impl App {
                             self.tex = None;
                             self.photo_gen += 1;
                             self.preset_tex.clear();
+                            self.convert_if_negative();
                         }
                         Err(e) => {
                             self.status = format!("Could not open: {e}");
@@ -971,6 +974,17 @@ impl App {
     }
 
     /// Record a history step and save the sidecar once a slider is released.
+    /// In the Negative view, a frame with an orange film base (C-41, ECN-2) is converted straight away, so the
+    /// Positive view shows a positive. Other frames (a slide, B&W, a positive opened here by mistake) wait for the
+    /// switch or a stock. It's an ordinary edit: undo or the switch turns it off.
+    fn convert_if_negative(&mut self) {
+        let Some(base) = self.photo.as_ref().map(|p| p.auto_base) else { return };
+        if self.module == Module::Negative && !self.params.neg.enabled && negative::orange_mask(base) {
+            self.params.neg.enabled = true;
+            self.status = "Orange film base found: converted as a colour negative".into();
+        }
+    }
+
     fn commit(&mut self) {
         if self.history.get(self.hist_pos) == Some(&self.params) {
             return;
@@ -2003,17 +2017,22 @@ impl App {
             ui.painter().text(pos2(r.left(), y), Align2::LEFT_CENTER, name, FontId::proportional(12.5), if m.flag < 0 { TEXT3 } else { TEXT });
             let mut x = r.right();
             if m.label > 0 {
-                ui.painter().circle_filled(pos2(x - 6.0, y), 5.0, LABEL_COLORS[(m.label - 1).min(4) as usize]);
-                x -= 20.0;
+                ui.painter().circle_filled(pos2(x - 6.0, y), 6.0, LABEL_COLORS[(m.label - 1).min(4) as usize]);
+                x -= 22.0;
             }
+            // Pick or reject in the same filled form as the panel's buttons, so the state reads at a glance.
             if m.flag != 0 {
                 let t = if m.flag > 0 { "Pick" } else { "Reject" };
-                let g = ui.painter().layout_no_wrap(t.into(), FontId::proportional(12.0), BONE);
-                x -= g.size().x;
-                ui.painter().galley(pos2(x, y - g.size().y / 2.0), g, TEXT);
-                x -= 12.0;
+                let g = ui.painter().layout_no_wrap(t.into(), FontId::new(12.5, semi()), INK);
+                let b = Rect::from_min_max(pos2(x - g.size().x - 16.0, y - 11.0), pos2(x, y + 11.0));
+                ui.painter().rect_filled(b, 3.0, if m.flag > 0 { BONE } else { hex(0xE5484D) });
+                ui.painter().galley(b.center() - g.size() / 2.0, g, INK);
+                x = b.left() - 14.0;
             }
-            paint_stars(ui.painter(), pos2(x - 5.0 * 12.0 + 6.0, y), m.rating, 5.0, ACCENT);
+            // All five stars, empty ones dim: an unrated frame shows that it is unrated.
+            let (sr, first) = (7.0, x - 4.0 * 7.0 * 2.4 - 7.0);
+            paint_stars(ui.painter(), pos2(first, y), 5, sr, BTN_BORDER);
+            paint_stars(ui.painter(), pos2(first, y), m.rating, sr, ACCENT);
             // What the key just did, large on the photo, fading out over a second.
             if *f == sel
                 && let Some((text, t0)) = &self.cull.flash
@@ -2043,6 +2062,43 @@ impl App {
 
     fn cull_panel(&mut self, ui: &mut Ui) {
         let sel = self.lib_sel.clone();
+        let k = |id: &str| keys::display(self.keymap.key(id));
+        let (pick_key, reject_key, nav) = (k("pick"), k("reject"), format!("{} {}", k("next"), k("prev")));
+        // Cull's one question is keep or not, so the answer comes first, each control with its key.
+        if let Some(f) = sel.clone() {
+            let m = self.meta.get(&f).copied().unwrap_or_default();
+            ui.label(caps("Rating"));
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                let (r, resp) = ui.allocate_exact_size(vec2(5.0 * 30.0, 30.0), Sense::click());
+                let hover = resp.hover_pos().map(|p| (((p.x - r.left()) / 30.0) as u8 + 1).min(5));
+                let first = pos2(r.left() + 15.0, r.center().y);
+                for i in 0..5u8 {
+                    let lit = i < hover.unwrap_or(m.rating);
+                    paint_stars(ui.painter(), first + vec2(i as f32 * 30.0, 0.0), 1, 10.0, if lit { if hover.is_some() { TEXT2 } else { ACCENT } } else { BTN_BORDER });
+                }
+                if resp.on_hover_text("Click a star, or press 0–5").clicked()
+                    && let Some(n) = hover
+                {
+                    self.rate(&f, Some(if n == m.rating { 0 } else { n }), None, None);
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.label(RichText::new("0–5").monospace().size(11.0).color(TEXT3)));
+            });
+            ui.add_space(4.0);
+            ui.columns(2, |c| {
+                for (i, (flag, name, key)) in [(1i8, "Pick", &pick_key), (-1, "Reject", &reject_key)].into_iter().enumerate() {
+                    let on = m.flag == flag;
+                    let b = egui::Button::new(RichText::new(format!("{name}   {key}")).color(if on { INK } else { TEXT }))
+                        .fill(if on { if flag > 0 { BONE } else { hex(0xE5484D) } } else { Color32::TRANSPARENT })
+                        .stroke(Stroke::new(1.0, if on { Color32::TRANSPARENT } else { BTN_BORDER }))
+                        .min_size(vec2(c[i].available_width(), 32.0));
+                    if c[i].add(b).clicked() {
+                        self.rate(&f, None, Some(if on { 0 } else { flag }), None);
+                    }
+                }
+            });
+            ui.add_space(16.0);
+        }
         let c = sel.as_ref().and_then(|f| self.cull.cache.get(f));
         ui.label(caps(if c.is_some_and(|c| c.raw) { "Raw histogram" } else { "Histogram" }));
         ui.add_space(4.0);
@@ -2074,8 +2130,7 @@ impl App {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| switch(ui, &mut self.cull.compare));
         });
         ui.add_space(14.0);
-        let k = |id: &str| keys::display(self.keymap.key(id));
-        ui.label(RichText::new(format!("{} {} next / previous · 0–5 stars · {} pick · {} reject. Press ? for every key.", k("next"), k("prev"), k("pick"), k("reject"))).size(11.5).color(TEXT3));
+        ui.label(RichText::new(format!("{nav} next / previous. Press ? for every key.")).size(11.5).color(TEXT3));
         ui.add_space(14.0);
         let rejects = self.meta.values().filter(|m| m.flag < 0).count();
         // Only offered when there is something to move.
@@ -2099,8 +2154,9 @@ impl App {
             ui.spacing_mut().item_spacing.x = 2.0;
             for (m, name) in [(Module::Library, "Library"), (Module::Cull, "Cull"), (Module::Develop, "Develop"), (Module::Negative, "Negative")] {
                 if tab(ui, name, self.module == m).clicked() {
-                    self.module = m; // opening the tab doesn't convert: pick a stock or use the switch
+                    self.module = m;
                     self.tool = Tool::None;
+                    self.convert_if_negative();
                 }
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -2138,7 +2194,7 @@ impl App {
             let mut i = order.iter().position(|v| *v == self.view).unwrap_or(0);
             segmented(ui, &mut i, labels);
             self.view = order[i];
-            // Groups: views | tools | copy & paste ... zoom & paper | reset.
+            // Groups: views | tools ... zoom & paper. Copy, paste and reset live under the settings panel.
             let divider = |ui: &mut Ui| {
                 ui.add_space(4.0);
                 let (r, _) = ui.allocate_exact_size(vec2(1.0, 20.0), Sense::hover());
@@ -2156,13 +2212,6 @@ impl App {
                         // Open the matching panel section.
                         match self.tool { Tool::Crop => self.open[6] = true, Tool::Heal => self.open[10] = true, Tool::Mask => self.open[11] = true, Tool::None | Tool::Sample => {} }
                     }
-                }
-                divider(ui);
-                if ghost(ui, "Copy", false).on_hover_text("Ctrl/Cmd+C").clicked() {
-                    self.copied = Some(self.params.clone());
-                }
-                if ui.add_enabled(self.copied.is_some(), egui::Button::new(RichText::new("Paste").color(TEXT2)).fill(Color32::TRANSPARENT).stroke(Stroke::NONE)).clicked() {
-                    self.params = self.params.with_look_of(self.copied.as_ref().unwrap());
                 }
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -2182,13 +2231,6 @@ impl App {
                     if ghost(ui, &label, self.zoom.is_some()).on_hover_text("Z, or double-click the photo: 100% view. Mouse wheel or pinch to zoom; drag or scroll with two fingers to move around").clicked() {
                         self.toggle_zoom([0.5, 0.5]);
                     }
-                }
-                // Negative has its own "Reset conversion" under the panel.
-                if !neg {
-                    divider(ui);
-                }
-                if !neg && ui.button("Reset").on_hover_text("Clear this photo's Develop settings").clicked() {
-                    self.params = Params { neg: self.params.neg.clone(), ..Params::default() };
                 }
             });
         });
@@ -2482,10 +2524,9 @@ impl App {
             let rgb = self.hover_rgb.map(|c| format!("R {:>3}  G {:>3}  B {:>3}", c[0], c[1], c[2])).unwrap_or_default(); // values appear while the pointer is over the photo
             ui.label(RichText::new(rgb).monospace().size(11.0).color(TEXT3));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let t = if self.clip_view { "Clipping on" } else { "Clipping off" };
-                if small_action(ui, t, self.clip_view).on_hover_text("Show clipped highlights and shadows on the photo (J)").clicked() {
-                    self.clip_view = !self.clip_view;
-                }
+                // A switch, like Cull's Focus check: a button reading "Clipping off" looked like a state, not a control.
+                switch(ui, &mut self.clip_view).on_hover_text("Show clipped highlights and shadows on the photo (J)");
+                ui.label(RichText::new("Clipping").size(12.0).color(LABEL));
             });
         });
     }
@@ -2912,7 +2953,7 @@ impl App {
                 for k in (0..5u8).rev() {
                     let (r, resp) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::click());
                     let on = m.label == k + 1;
-                    ui.painter().circle_filled(r.center(), if on { 6.0 } else { 4.5 }, LABEL_COLORS[k as usize].gamma_multiply(if on { 1.0 } else { 0.55 }));
+                    ui.painter().circle_filled(r.center(), if on { 6.5 } else { 5.5 }, LABEL_COLORS[k as usize].gamma_multiply(if on { 1.0 } else { 0.8 }));
                     if on {
                         ui.painter().circle_stroke(r.center(), 7.5, Stroke::new(1.0, TEXT));
                     }
@@ -3581,6 +3622,23 @@ impl App {
     }
 
     fn develop_footer(&mut self, ui: &mut Ui) {
+        // Everything that moves settings between frames in one place, Reset last and quiet: it throws work away.
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            if ghost(ui, "Copy", false).on_hover_text("Copy these settings (Ctrl/Cmd+C)").clicked() {
+                self.copied = Some(self.params.clone());
+            }
+            if ui.add_enabled(self.copied.is_some(), egui::Button::new(RichText::new("Paste").color(TEXT2)).fill(Color32::TRANSPARENT).stroke(Stroke::NONE))
+                .on_hover_text("Paste the copied settings (Ctrl/Cmd+V); crop and negative conversion stay").clicked() {
+                self.params = self.params.with_look_of(self.copied.as_ref().unwrap());
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ghost(ui, "Reset", false).on_hover_text("Clear this photo's Develop settings (undo brings them back)").clicked() {
+                    self.params = Params { neg: self.params.neg.clone(), ..Params::default() };
+                }
+            });
+        });
+        ui.add_space(4.0);
         ui.columns(2, |c| {
             if c[0].add_enabled(self.prev_params.is_some(), egui::Button::new("Paste previous").min_size(vec2(c[0].available_width(), 32.0))).on_hover_text("Apply the settings of the frame you edited before this one").clicked() {
                 let prev = self.prev_params.clone().unwrap();
@@ -3690,7 +3748,8 @@ impl App {
                         ui.label(caps(s.brand));
                         last_brand = s.brand;
                     }
-                    let on = self.params.neg.stock == s.id;
+                    // Marked only while converting: a highlighted stock on an unconverted frame read as "in use".
+                    let on = self.params.neg.enabled && self.params.neg.stock == s.id;
                     let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::click());
                     if on || resp.hovered() {
                         ui.painter().rect_filled(r, 3.0, if on { BONE } else { CARD });
@@ -3734,6 +3793,8 @@ impl App {
                 if !np.enabled {
                     ui.label(RichText::new("Off. Turn on, or pick a stock, to convert this frame.").size(11.5).color(TEXT2));
                     ui.disable();
+                    ui.visuals_mut().disabled_alpha = 0.7; // still readable, so you can see what turning it on gives
+
                 }
                 ui.add_space(6.0);
 
@@ -3789,9 +3850,9 @@ impl App {
                 let shift = |ch: usize, sign: f32| move |t: f32| { let mut c = [0.5f32; 3]; c[ch] += sign * t / 100.0 * 0.3; enc(c) };
                 slider(ui, "Density", &mut np.density, -100.0, 100.0, 0.0, Some(&|t: f32| enc([0.5 - t / 100.0 * 0.3; 3])));
                 slider(ui, "Contrast", &mut np.contrast, -100.0, 100.0, 0.0, None);
-                slider(ui, "Cyan – Red", &mut np.cy, -100.0, 100.0, 0.0, Some(&shift(0, 1.0)));
-                slider(ui, "Magenta – Green", &mut np.mg, -100.0, 100.0, 0.0, Some(&shift(1, 1.0)));
-                slider(ui, "Yellow – Blue", &mut np.yb, -100.0, 100.0, 0.0, Some(&shift(2, 1.0)));
+                slider(ui, "Cyan–Red", &mut np.cy, -100.0, 100.0, 0.0, Some(&shift(0, 1.0)));
+                slider(ui, "Magenta–Green", &mut np.mg, -100.0, 100.0, 0.0, Some(&shift(1, 1.0)));
+                slider(ui, "Yellow–Blue", &mut np.yb, -100.0, 100.0, 0.0, Some(&shift(2, 1.0)));
                 slider(ui, "Shadow roll-off", &mut np.toe, 0.0, 100.0, d.toe, None);
                 slider(ui, "Highlight roll-off", &mut np.shoulder, 0.0, 100.0, d.shoulder, None);
                 ui.add_space(6.0);
@@ -4277,7 +4338,7 @@ impl eframe::App for App {
                 egui::Panel::left("left").exact_size(260.0).resizable(false)
                     .frame(if neg { side(PANEL) } else { pad(PANEL, 12, 16) })
                     .show(ui, |ui| if neg { self.negative_left(ui) } else { self.develop_left(ui) });
-                egui::Panel::right("right").exact_size(320.0).resizable(false).frame(side(PANEL)).show(ui, |ui| {
+                egui::Panel::right("right").exact_size(RIGHT_W).resizable(false).frame(side(PANEL)).show(ui, |ui| {
                     egui::Panel::bottom("right_footer").frame(pad(PANEL, 16, 10)).show(ui, |ui| if neg { self.negative_footer(ui) } else { self.develop_footer(ui) });
                     egui::Panel::top("hist").frame(pad(PANEL, 16, 12)).show(ui, |ui| self.histogram_block(ui));
                     egui::CentralPanel::default().frame(egui::Frame::new()).show(ui, |ui| if neg { self.negative_right(ui) } else { self.develop_right(ui) });

@@ -231,6 +231,11 @@ fn stride(img: &Rgb32FImage) -> usize {
 }
 
 /// Auto film base: the brightest 0.2% of the scan, which is the unexposed rebate when it is in frame.
+/// A colour negative's clear film is orange: clearly more red than green, and more green than blue.
+pub fn orange_mask(base: [f32; 3]) -> bool {
+    base[0] > base[1] * 1.15 && base[1] > base[2] * 1.15
+}
+
 pub fn auto_base(img: &Rgb32FImage) -> [f32; 3] {
     [0, 1, 2].map(|c| {
         let mut v: Vec<f32> = img.chunks(3).step_by(stride(img)).map(|p| p[c]).collect();
