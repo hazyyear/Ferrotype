@@ -241,6 +241,12 @@ fn unspecified_extra_samples<R: Read + Seek>(r: &mut R) -> std::io::Result<Vec<(
 
 /// Every sample of one page, as stored (chunky or planar), as f32 0..1: (width, height, samples, interleaved data).
 pub fn read_samples(path: &Path, page: usize) -> Option<(u32, u32, usize, Vec<f32>)> {
+    let (w, h, s, v) = read_u16(path, page)?;
+    Some((w, h, s, v.iter().map(|&x| x as f32 / 65535.0).collect()))
+}
+
+/// `read_samples` as 16-bit values (half the memory of f32): a full-resolution scan can be billions of samples.
+pub fn read_u16(path: &Path, page: usize) -> Option<(u32, u32, usize, Vec<u16>)> {
     let mut dec = open(path)?;
     if page > 0 {
         dec.seek_to_image(page).ok()?;
@@ -250,20 +256,20 @@ pub fn read_samples(path: &Path, page: usize) -> Option<(u32, u32, usize, Vec<f3
     let planar = dec.find_tag_unsigned::<u16>(Tag::PlanarConfiguration).ok().flatten() == Some(2);
     let mut buf = DecodingResult::U8(vec![]);
     dec.read_image_to_buffer(&mut buf).ok()?;
-    let v: Vec<f32> = match buf {
-        DecodingResult::U8(v) => v.iter().map(|&x| x as f32 / 255.0).collect(),
-        DecodingResult::U16(v) => v.iter().map(|&x| x as f32 / 65535.0).collect(),
-        DecodingResult::F32(v) => v,
+    let v: Vec<u16> = match buf {
+        DecodingResult::U8(v) => v.iter().map(|&x| x as u16 * 257).collect(),
+        DecodingResult::U16(v) => v,
+        DecodingResult::F32(v) => v.iter().map(|&x| (x.clamp(0.0, 1.0) * 65535.0).round() as u16).collect(),
         _ => return None,
     };
-    let n = (w * h) as usize;
+    let n = w as usize * h as usize;
     if v.len() != n * samples {
         return None;
     }
     if !planar || samples == 1 {
         return Some((w, h, samples, v));
     }
-    let mut out = vec![0f32; v.len()];
+    let mut out = vec![0u16; v.len()];
     for s in 0..samples {
         for i in 0..n {
             out[i * samples + s] = v[s * n + i];
@@ -274,7 +280,7 @@ pub fn read_samples(path: &Path, page: usize) -> Option<(u32, u32, usize, Vec<f3
 
 /// Split a multi-page TIFF (Epson Scan 2's "Multi-TIFF": one page per frame of the holder) into one 16-bit TIFF
 /// per page next to it, `name-1.tif`, `name-2.tif`…, keeping the colour profile and the infrared channel. The
-/// original stays. Returns the new files.
+/// original stays, and no file is replaced: a name already taken becomes `name-1-2.tif`. Returns the new files.
 pub fn split_pages(path: &Path) -> Result<Vec<PathBuf>, String> {
     let info = info(path).ok_or("not a TIFF")?;
     if info.pages < 2 {
@@ -282,12 +288,15 @@ pub fn split_pages(path: &Path) -> Result<Vec<PathBuf>, String> {
     }
     let icc = open(path).and_then(|mut d| d.get_tag_u8_vec(Tag::IccProfile).ok());
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("scan");
+    let dir = path.parent().unwrap_or(Path::new("."));
     let mut out = vec![];
     for page in 0..info.pages {
-        let (w, h, samples, data) = read_samples(path, page).ok_or(format!("couldn't read page {}", page + 1))?;
-        let dest = path.with_file_name(format!("{stem}-{}.tif", page + 1));
-        let px: Vec<u16> = data.iter().map(|&v| (v.clamp(0.0, 1.0) * 65535.0).round() as u16).collect();
-        write_tiff(&dest, w, h, samples, 16, &px, icc.as_deref(), &info).map_err(|e| format!("{}: {e}", dest.display()))?;
+        let (w, h, samples, px) = read_u16(path, page).ok_or(format!("couldn't read page {}", page + 1))?;
+        let dest = crate::claim_output(dir, &format!("{stem}-{}", page + 1), "tif")?;
+        write_tiff(&dest, w, h, samples, 16, &px, icc.as_deref(), &info).map_err(|e| {
+            let _ = std::fs::remove_file(&dest);
+            format!("{}: {e}", dest.display())
+        })?;
         out.push(dest);
     }
     Ok(out)
@@ -409,5 +418,15 @@ mod tests {
         assert_eq!(s, 3);
         assert!((d[0] - 3000.0 / 65535.0).abs() < 1e-4);
         assert_eq!(info(&files[2]).unwrap().software, "EPSON Scan 2");
+        // Splitting again never replaces a file: the second set gets new names.
+        let before = std::fs::read(&files[0]).unwrap();
+        std::fs::write(&files[1], b"someone else's scan").unwrap();
+        let again = split_pages(&p).unwrap();
+        assert_eq!(again[0], p.with_file_name("multi-1-2.tif"));
+        assert_eq!(std::fs::read(&files[0]).unwrap(), before);
+        assert_eq!(std::fs::read(&files[1]).unwrap(), b"someone else's scan");
+        for f in files.iter().chain(&again) {
+            let _ = std::fs::remove_file(f);
+        }
     }
 }

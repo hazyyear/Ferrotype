@@ -117,6 +117,7 @@ impl Job {
 }
 
 /// Scan one job on an open session into `out` (a 16-bit TIFF, RGBI with infrared). Work files go in `tmp`.
+#[allow(clippy::too_many_arguments)]
 pub fn capture(session: &mut Session, job: &Job, preview: bool, out: &Path, tmp: &Path, settle: Duration, cancel: &AtomicBool, say: &dyn Fn(String)) -> Result<(), String> {
     let model = session.capabilities.scanner_model().map_err(|e| e.to_string())?;
     let (depth, dpi) = if preview { (model.preview_depth, model.preview_dpi) } else { (16, job.dpi) };
@@ -132,7 +133,7 @@ pub fn capture(session: &mut Session, job: &Job, preview: bool, out: &Path, tmp:
     std::fs::create_dir_all(tmp).map_err(|e| e.to_string())?;
     let mut last = String::new();
     let mut progress = |p: epscan::Progress<'_>| {
-        let pct = if p.total > 0 { p.done * 100 / p.total } else { 0 };
+        let pct = (p.done * 100).checked_div(p.total).unwrap_or(0);
         let line = format!("{} {pct}%", phase(p.phase));
         if line != last {
             say(line.clone());
@@ -142,17 +143,20 @@ pub fn capture(session: &mut Session, job: &Job, preview: bool, out: &Path, tmp:
     };
     let result = session.scan(&settings, &options, &tmp.join("pass"), cancel, &mut progress).map_err(|e| e.to_string())?;
     let rgb = result.rgb.as_ref().and_then(|r| r.tiff.clone()).ok_or("the scanner sent no picture")?;
-    let (w, h, samples, px) = crate::scanfile::read_samples(&rgb, 0).ok_or("couldn't read the scan")?;
-    let ir = result.ir.as_ref().and_then(|r| r.tiff.as_deref()).and_then(|p| crate::scanfile::read_samples(p, 0));
-    let (samples, data) = match ir {
-        Some((iw, ih, 1, ird)) if (iw, ih) == (w, h) => (samples + 1, with_infrared(&px, samples, &ird)),
+    // 16-bit throughout, and the infrared put in place: a medium-format frame at 6400 ppi is 290 million pixels.
+    let (w, h, samples, mut px) = crate::scanfile::read_u16(&rgb, 0).ok_or("couldn't read the scan")?;
+    let ir = result.ir.as_ref().and_then(|r| r.tiff.as_deref()).and_then(|p| crate::scanfile::read_u16(p, 0));
+    let samples = match ir {
+        Some((iw, ih, 1, ird)) if (iw, ih) == (w, h) => {
+            with_infrared(&mut px, samples, &ird);
+            samples + 1
+        }
         Some(_) => {
             say("The infrared pass didn't line up with the picture: saved without it".into());
-            (samples, px)
+            samples
         }
-        None => (samples, px),
+        None => samples,
     };
-    let u: Vec<u16> = data.iter().map(|&v| (v.clamp(0.0, 1.0) * 65535.0).round() as u16).collect();
     let mut sw = format!("Ferrotype {} (direct USB)", env!("CARGO_PKG_VERSION"));
     if job.oversample > 1 && !preview {
         sw += &format!(", {}x sampled", job.oversample);
@@ -161,12 +165,21 @@ pub fn capture(session: &mut Session, job: &Job, preview: bool, out: &Path, tmp:
         sw += ", linear";
     }
     let info = crate::scanfile::Info { software: sw, make: "EPSON".into(), model: model.name.into(), dpi: dpi as f32, ..Default::default() };
-    crate::scanfile::write_tiff(out, w, h, samples, 16, &u, None, &info)
+    crate::scanfile::write_tiff(out, w, h, samples, 16, &px, None, &info)
 }
 
-/// Interleave an infrared channel after each pixel's colours.
-pub fn with_infrared(px: &[f32], samples: usize, ir: &[f32]) -> Vec<f32> {
-    px.chunks_exact(samples).zip(ir).flat_map(|(c, &i)| c.iter().copied().chain(std::iter::once(i))).collect()
+/// Put an infrared sample after each pixel's colours, in place: `px` grows from `samples` to `samples + 1`
+/// per pixel, filled from the end so nothing is overwritten before it moves.
+pub fn with_infrared(px: &mut Vec<u16>, samples: usize, ir: &[u16]) {
+    let n = ir.len().min(px.len() / samples);
+    px.truncate(n * samples);
+    px.resize(n * (samples + 1), 0);
+    for i in (0..n).rev() {
+        for k in (0..samples).rev() {
+            px[i * (samples + 1) + k] = px[i * samples + k];
+        }
+        px[i * (samples + 1) + samples] = ir[i];
+    }
 }
 
 fn phase(p: &str) -> String {
@@ -176,7 +189,7 @@ fn phase(p: &str) -> String {
 }
 
 /// A quick scan of a whole source, for placing frames: saved at `out`.
-pub fn preview(location: &str, source: Source, linear: bool, out: &Path, say: &dyn Fn(String)) -> Result<Scanner, String> {
+pub fn preview(location: &str, source: Source, linear: bool, out: &Path, cancel: &AtomicBool, say: &dyn Fn(String)) -> Result<Scanner, String> {
     if location == "demo" {
         return Err("the demo scanner can't scan".into());
     }
@@ -185,7 +198,7 @@ pub fn preview(location: &str, source: Source, linear: bool, out: &Path, say: &d
     let [w, h] = scanner.area(source);
     let job = Job { source, rect_mm: [0.0, 0.0, w, h], dpi: 0, oversample: 1, linear, infrared: false };
     let tmp = out.with_extension("work");
-    let r = capture(&mut s, &job, true, out, &tmp, Duration::ZERO, &AtomicBool::new(false), say);
+    let r = capture(&mut s, &job, true, out, &tmp, Duration::ZERO, cancel, say);
     s.close();
     let _ = std::fs::remove_dir_all(&tmp);
     r.map(|()| scanner)
@@ -237,7 +250,7 @@ pub fn layouts(model: &ScannerModel) -> Vec<(String, HolderLayout)> {
     let mut out = vec![];
     for h in model.holders {
         if h.formats.is_empty() {
-            out.push((holder_name(h.name), h.clone()));
+            out.push((holder_name(h.name), *h));
         }
         for f in h.formats {
             if let Ok(l) = h.for_format(Some(f.format)) {
@@ -356,7 +369,8 @@ mod tests {
 
     #[test]
     fn infrared_becomes_the_fourth_sample() {
-        let px = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6];
-        assert_eq!(with_infrared(&px, 3, &[0.9, 0.8]), vec![0.1, 0.2, 0.3, 0.9, 0.4, 0.5, 0.6, 0.8]);
+        let mut px = vec![1, 2, 3, 4, 5, 6];
+        with_infrared(&mut px, 3, &[9, 8]);
+        assert_eq!(px, vec![1, 2, 3, 9, 4, 5, 6, 8]);
     }
 }

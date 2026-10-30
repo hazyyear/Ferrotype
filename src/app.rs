@@ -580,7 +580,8 @@ fn cover_uv(tex: &TextureHandle, aspect: f32) -> Rect {
 fn thumb_cache(f: &Path) -> Option<PathBuf> {
     use sha2::{Digest, Sha256};
     let modified = |p: &Path| std::fs::metadata(p).ok().and_then(|m| m.modified().ok());
-    let mut key = format!("{}|{:?}|{:?}", f.display(), modified(load::copy_of(f).as_deref().unwrap_or(f)), modified(&crate::sidecar(f)));
+    // `v2`: embedded colour profiles are read since; older thumbnails of tagged JPEGs (Display P3) are stale.
+    let mut key = format!("v2|{}|{:?}|{:?}", f.display(), modified(load::copy_of(f).as_deref().unwrap_or(f)), modified(&crate::sidecar(f)));
     // TIFF scans: read through their colour profile, and the roll can say its untagged scans are linear.
     if f.to_string_lossy().to_ascii_lowercase().contains(".tif") {
         let data = f.parent().and_then(crate::roll::read).map(|r| r.scan_data).unwrap_or_default();

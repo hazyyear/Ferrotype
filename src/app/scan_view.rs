@@ -93,14 +93,10 @@ enum ScanMsg {
     Checks(PathBuf, Checks),
     Info(Vec<(PathBuf, FrameInfo)>),
     Edits(Vec<(PathBuf, Edit)>, String),
-    /// Scanners SANE found.
-    Devices(Result<Vec<scanner::Device>, String>),
-    /// What one of them can do.
-    Options(String, Result<scanner::Options, String>),
     /// What the open file says about the scanner that made it.
     FileInfo(PathBuf, Option<scanfile::Info>),
-    /// A preview scan: the file and the size of the area it covers, in millimetres.
-    Previewed(Result<(PathBuf, [f32; 2]), String>),
+    /// A multi-page TIFF split into files.
+    Split(Result<Vec<PathBuf>, String>),
 }
 
 pub(super) struct ScanUi {
@@ -126,17 +122,12 @@ pub(super) struct ScanUi {
     pub sc_tx: mpsc::Sender<scanner::Event>,
     sc_rx: mpsc::Receiver<scanner::Event>,
     /// The TWAIN scanner to use ("" = the system's default).
+    #[cfg_attr(not(windows), allow(dead_code))]
     twain: String,
-    /// SANE: the scanners found (None = not looked yet), the chosen one's options, and the settings.
-    devices: Option<Result<Vec<scanner::Device>, String>>,
-    options: Option<(String, Result<scanner::Options, String>)>,
-    sane: scanner::Settings,
     /// Scanning apps on this computer, looked for once.
     apps: Option<Vec<(&'static str, PathBuf)>>,
     /// The open file's scanner tags.
     file_info: Option<(PathBuf, Option<scanfile::Info>)>,
-    /// The last preview scan and the size of the scanner area it shows (mm).
-    preview: Option<(PathBuf, [f32; 2])>,
     /// The Scanner page: Ferrotype driving the scanner over USB.
     pub direct: super::scanner_view::DirectUi,
 }
@@ -147,7 +138,7 @@ impl Default for ScanUi {
         let (sc_tx, sc_rx) = mpsc::channel();
         ScanUi {
             page: 0, strip: None, preview_busy: false, checks: None, focus_checked: false, converted: usize::MAX, roll_len: 2, sel: vec![], anchor: None, info: HashMap::new(), info_folder: None, busy: None, tx, rx,
-            scanning: None, sc_tx, sc_rx, twain: String::new(), devices: None, options: None, sane: scanner::Settings { depth: 16, resolution: 2400, passes: 1, linear: true, ..Default::default() }, apps: None, file_info: None, preview: None, direct: Default::default(),
+            scanning: None, sc_tx, sc_rx, twain: String::new(), apps: None, file_info: None, direct: Default::default(),
         }
     }
 }
@@ -348,41 +339,17 @@ impl App {
                         self.scan.checks = Some((f, Some(c)));
                     }
                 }
-                ScanMsg::Devices(d) => {
-                    if let Ok(d) = &d
-                        && !d.iter().any(|x| x.id == self.scan.sane.device)
-                    {
-                        self.scan.sane.device = d.first().map(|x| x.id.clone()).unwrap_or_default();
-                    }
-                    self.scan.devices = Some(d);
-                }
-                ScanMsg::Options(dev, o) => {
-                    if let Ok(o) = &o {
-                        let s = &mut self.scan.sane;
-                        // Film wants the transparency unit; otherwise keep what was chosen if it's there.
-                        if !o.sources.contains(&s.source) {
-                            s.source = o.sources.iter().find(|x| { let l = x.to_ascii_lowercase(); l.contains("transparen") || l.contains("film") || l.contains("tpu") }).or(o.sources.first()).cloned().unwrap_or_default();
-                        }
-                        if !o.resolutions.is_empty() && !o.resolutions.contains(&s.resolution) {
-                            s.resolution = o.resolutions.iter().copied().filter(|r| *r <= 3200).max().unwrap_or(o.resolutions[0]);
-                        }
-                        if !o.depths.is_empty() && !o.depths.contains(&s.depth) {
-                            s.depth = o.depths.iter().copied().max().unwrap_or(8);
-                        }
-                    }
-                    self.scan.options = Some((dev, o));
-                }
-                ScanMsg::Previewed(r) => {
-                    self.scan.scanning = None;
+                ScanMsg::Split(r) => {
+                    self.scan.busy = None;
                     match r {
-                        Ok((f, bed)) => {
-                            self.status = format!("Preview of {:.0} × {:.0} mm: check the frame boxes, then scan them", bed[0], bed[1]);
-                            self.scan.preview = Some((f.clone(), bed));
-                            self.scan.strip = None;
-                            self.scan.page = 0;
-                            self.select(ctx, f);
+                        Ok(files) => {
+                            self.status = format!("Split into {} files", files.len());
+                            if let Some(first) = files.first() {
+                                self.scan.strip = None;
+                                self.open_path(ctx, first);
+                            }
                         }
-                        Err(e) => self.status = format!("Preview failed: {e}"),
+                        Err(e) => self.status = format!("Couldn't split it: {e}"),
                     }
                 }
                 ScanMsg::FileInfo(f, i) => {
@@ -893,53 +860,34 @@ impl App {
 
     /// Scan from here (TWAIN on Windows, SANE on Linux), or open the scanner's own app; new scans are picked up.
     fn scanner_panel(&mut self, ui: &mut Ui) {
-        let ctx = ui.ctx().clone();
         if let Some(t) = &self.scan.scanning {
             ui.horizontal(|ui| {
                 ui.spinner();
                 ui.label(RichText::new(t).size(12.0).color(TEXT2));
             });
-        } else if scanner::can_scan() {
-            if cfg!(windows) {
+        } else {
+            #[cfg(windows)]
+            {
+                let ctx = ui.ctx().clone();
                 ui.label(RichText::new("Opens your scanner's own window (Epson Scan 2 for a Perfection). Scan there; each picture lands in this folder as a 16-bit TIFF.").size(12.0).color(TEXT2));
-            } else {
-                self.sane_settings(ui);
-            }
-            let ready = cfg!(windows) || !self.scan.sane.device.is_empty();
-            if cfg!(windows) {
-                if primary(ui, "Scan", ready).on_hover_text("Scan into the open folder").clicked() {
+                if primary(ui, "Scan", true).on_hover_text("Scan into the open folder").clicked() {
                     self.start_scan(&ctx);
                 }
-            } else {
-                // Preview, adjust the frames the light table finds on it, then scan just those at full resolution.
-                let frames = self.preview_frames();
                 ui.horizontal(|ui| {
-                    if ui.add_enabled(ready, egui::Button::new("Preview")).on_hover_text("A quick scan of the whole area: the light table finds the frames on it").clicked() {
-                        self.start_preview(&ctx);
-                    }
-                    if let Some(n) = frames.as_ref().map(Vec::len).filter(|n| *n > 0) {
-                        let label = format!("Scan {n} frame{} at {} ppi", if n == 1 { "" } else { "s" }, self.scan.sane.resolution);
-                        if primary(ui, &label, ready).on_hover_text("Scan each frame boxed on the preview, at full resolution, into the open folder").clicked() {
-                            self.start_frames(&ctx, frames.clone().unwrap_or_default());
+                    let shown = if self.scan.twain.is_empty() { "Default scanner".to_string() } else { self.scan.twain.clone() };
+                    ui.label(RichText::new(shown).monospace().size(11.0).color(TEXT3));
+                    if ghost(ui, "Choose…", false).on_hover_text("Pick the scanner from the system's TWAIN list").clicked() {
+                        match scanner::choose_source() {
+                            Ok(n) => self.scan.twain = n,
+                            Err(e) => self.status = e,
                         }
-                    } else if primary(ui, "Scan", ready).on_hover_text("Scan the whole area into the open folder").clicked() {
-                        self.start_scan(&ctx);
                     }
                 });
             }
-            #[cfg(windows)]
-            ui.horizontal(|ui| {
-                let shown = if self.scan.twain.is_empty() { "Default scanner".to_string() } else { self.scan.twain.clone() };
-                ui.label(RichText::new(shown).monospace().size(11.0).color(TEXT3));
-                if ghost(ui, "Choose…", false).on_hover_text("Pick the scanner from the system's TWAIN list").clicked() {
-                    match scanner::choose_source() {
-                        Ok(n) => self.scan.twain = n,
-                        Err(e) => self.status = e,
-                    }
-                }
-            });
-        } else {
-            ui.label(RichText::new("Install sane-utils to scan from here, or scan with your scanner's app below.").size(12.0).color(TEXT2));
+            let hint = if cfg!(windows) { "Or let Ferrotype drive a V800/V850 itself" } else { "Preview, pick frames and scan them" };
+            if ui.add(egui::Button::new("Scanner page…").min_size(vec2(ui.available_width(), 28.0))).on_hover_text(hint).clicked() {
+                self.scan.page = 3;
+            }
         }
         let apps = self.scan.apps.get_or_insert_with(scanner::apps).clone();
         if !apps.is_empty() {
@@ -961,110 +909,8 @@ impl App {
         switch_row(ui, "Pick up new scans", &mut self.watch).on_hover_text("New files in this folder open here within two seconds, from any scanning app");
     }
 
-    /// Linux: which SANE scanner, from which source, how fine and how deep.
-    fn sane_settings(&mut self, ui: &mut Ui) {
-        if self.scan.devices.is_none() {
-            self.scan.devices = Some(Ok(vec![]));
-            let (tx, ctx) = (self.scan.tx.clone(), ui.ctx().clone());
-            self.status = "Looking for scanners…".into();
-            std::thread::spawn(move || {
-                let _ = tx.send(ScanMsg::Devices(scanner::sane_devices()));
-                ctx.request_repaint();
-            });
-        }
-        let devices = match &self.scan.devices {
-            Some(Ok(d)) => d.clone(),
-            Some(Err(e)) => {
-                ui.label(RichText::new(e).size(12.0).color(WARN));
-                vec![]
-            }
-            None => vec![],
-        };
-        let full = ui.available_width();
-        ui.horizontal(|ui| {
-            let shown = devices.iter().find(|d| d.id == self.scan.sane.device).map_or("No scanner found".to_string(), |d| d.name.clone());
-            if !devices.is_empty() {
-                self.scan.sane.device_name = shown.clone();
-            }
-            egui::ComboBox::from_id_salt("sane_dev").width(full - 70.0).selected_text(shown).show_ui(ui, |ui| {
-                for d in &devices {
-                    pick(ui, &mut self.scan.sane.device, d.id.clone(), &d.name);
-                }
-            });
-            if ghost(ui, "Look", false).on_hover_text("Look for scanners again").clicked() {
-                self.scan.devices = None;
-                self.scan.options = None;
-            }
-        });
-        let dev = self.scan.sane.device.clone();
-        if dev.is_empty() {
-            return;
-        }
-        if self.scan.options.as_ref().is_none_or(|(d, _)| *d != dev) {
-            self.scan.options = Some((dev.clone(), Ok(Default::default())));
-            let (tx, ctx) = (self.scan.tx.clone(), ui.ctx().clone());
-            std::thread::spawn(move || {
-                let o = scanner::sane_options(&dev);
-                let _ = tx.send(ScanMsg::Options(dev, o));
-                ctx.request_repaint();
-            });
-        }
-        let Some((_, opts)) = &self.scan.options else { return };
-        let opts = match opts {
-            Ok(o) => o.clone(),
-            Err(e) => {
-                ui.label(RichText::new(e).size(12.0).color(WARN));
-                return;
-            }
-        };
-        let s = &mut self.scan.sane;
-        egui::Grid::new("sane_opts").num_columns(2).spacing(vec2(8.0, 6.0)).show(ui, |ui| {
-            if !opts.sources.is_empty() {
-                ui.label(RichText::new("Source").size(12.0).color(TEXT2));
-                egui::ComboBox::from_id_salt("sane_src").width(150.0).selected_text(s.source.clone()).show_ui(ui, |ui| {
-                    for o in &opts.sources {
-                        pick(ui, &mut s.source, o.clone(), o);
-                    }
-                });
-                ui.end_row();
-            }
-            if !opts.resolutions.is_empty() {
-                ui.label(RichText::new("Resolution").size(12.0).color(TEXT2));
-                egui::ComboBox::from_id_salt("sane_res").width(150.0).selected_text(format!("{} ppi", s.resolution)).show_ui(ui, |ui| {
-                    for &r in &opts.resolutions {
-                        pick(ui, &mut s.resolution, r, format!("{r} ppi"));
-                    }
-                });
-                ui.end_row();
-            }
-            let depths: Vec<u32> = opts.depths.iter().copied().filter(|d| *d >= 8).collect();
-            if depths.len() > 1 {
-                ui.label(RichText::new("Depth").size(12.0).color(TEXT2));
-                egui::ComboBox::from_id_salt("sane_depth").width(150.0).selected_text(format!("{} bits", s.depth)).show_ui(ui, |ui| {
-                    for &d in &depths {
-                        pick(ui, &mut s.depth, d, format!("{d} bits"));
-                    }
-                });
-                ui.end_row();
-            }
-            ui.label(RichText::new("Passes").size(12.0).color(TEXT2));
-            let shown = if s.passes <= 1 { "1 (single scan)".to_string() } else { format!("{} (averaged)", s.passes) };
-            egui::ComboBox::from_id_salt("sane_passes").width(150.0).selected_text(shown).show_ui(ui, |ui| {
-                for (n, label) in [(1, "1 (single scan)"), (2, "2 (averaged)"), (4, "4: half the noise"), (8, "8 (averaged)")] {
-                    pick(ui, &mut s.passes, n, label);
-                }
-            })
-            .response
-            .on_hover_text("Scan each frame several times and average the passes: less noise in the dense parts of a negative, at the cost of time");
-            ui.end_row();
-        });
-        if opts.linear.is_some() {
-            switch_row(ui, "Linear data", &mut s.linear).on_hover_text("Ask the scanner for gamma 1.0, the raw light it measured: what negative conversion wants");
-        }
-    }
-
-    /// The roll folder scans go into, asking for one when none is open (or only a preview is).
-    fn scan_folder(&mut self, ctx: &egui::Context) -> Option<PathBuf> {
+    /// The roll folder scans go into, asking for one when none is open.
+    pub(super) fn scan_folder(&mut self, ctx: &egui::Context) -> Option<PathBuf> {
         if let Some(d) = self.folder.clone() {
             return Some(d);
         }
@@ -1073,55 +919,15 @@ impl App {
         Some(d)
     }
 
-    /// A quick scan of the whole area, opened on the light table so its frames can be found and adjusted.
-    fn start_preview(&mut self, ctx: &egui::Context) {
-        let Some(cache) = crate::keys::dirs_cache() else {
-            self.status = "No cache folder for the preview".into();
-            return;
-        };
-        let dir = cache.join("scan-preview");
-        let _ = std::fs::remove_dir_all(&dir);
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            self.status = format!("Couldn't make the preview folder: {e}");
-            return;
-        }
-        // A new name each time, so nothing cached for the last preview is shown for this one.
-        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
-        let out = dir.join(format!("preview-{stamp}.tif"));
-        self.scan.scanning = Some("Previewing…".into());
-        let (tx, ctx2, settings) = (self.scan.tx.clone(), ctx.clone(), self.scan.sane.clone());
-        std::thread::spawn(move || {
-            let r = scanner::preview(&settings, &out).map(|bed| (out, bed));
-            let _ = tx.send(ScanMsg::Previewed(r));
-            ctx2.request_repaint();
-        });
-    }
-
-    /// The frames boxed on the open preview, as areas on the scanner (skipped ones left out). None when the
-    /// light table isn't showing a preview.
-    fn preview_frames(&self) -> Option<Vec<scanner::Area>> {
-        let (file, bed) = self.scan.preview.as_ref()?;
-        let s = self.scan.strip.as_ref().filter(|s| s.file == *file)?;
-        Some(s.frames.iter().filter(|f| !f.skip).map(|f| scanner::area_of(f.crop, *bed, 1.0)).collect())
-    }
-
-    fn start_frames(&mut self, ctx: &egui::Context, areas: Vec<scanner::Area>) {
-        let Some(dir) = self.scan_folder(ctx) else { return };
-        self.watch = true;
-        self.watch_open = true;
-        self.scan.scanning = Some("Scanning…".into());
-        let ctx2 = ctx.clone();
-        scanner::scan_frames(dir, self.scan.sane.clone(), areas, self.scan.sc_tx.clone(), move || ctx2.request_repaint());
-    }
-
+    #[cfg(windows)]
     fn start_scan(&mut self, ctx: &egui::Context) {
         let Some(dir) = self.scan_folder(ctx) else { return };
         // New scans come in through the folder watch, and the newest opens on the light table.
         self.watch = true;
         self.watch_open = true;
-        self.scan.scanning = Some(if cfg!(windows) { "Opening the scanner…".into() } else { "Scanning…".into() });
+        self.scan.scanning = Some("Opening the scanner…".into());
         let ctx2 = ctx.clone();
-        scanner::scan(dir, self.scan.twain.clone(), self.scan.sane.clone(), self.scan.sc_tx.clone(), move || ctx2.request_repaint());
+        scanner::scan(dir, self.scan.twain.clone(), self.scan.sc_tx.clone(), move || ctx2.request_repaint());
     }
 
     /// What the open scan is: which scanner made it, how to read its values, and pages to split.
@@ -1156,7 +962,8 @@ impl App {
         } else if info.bits >= 16 {
             // Untagged 16-bit data may be linear (a raw scan) or gamma-encoded: the guess can be overruled per roll.
             let dir = cur.parent().map(Path::to_path_buf);
-            let mut roll = dir.as_deref().and_then(crate::roll::read).unwrap_or_default();
+            // The open folder's notes are in memory; read the file only for a photo from elsewhere (a collection).
+            let mut roll = if dir == self.folder { self.roll.clone() } else { dir.as_deref().and_then(crate::roll::read).unwrap_or_default() };
             let was = scanfile::Data::parse(&roll.scan_data);
             let mut i = match was {
                 scanfile::Data::Auto => 0,
@@ -1184,18 +991,16 @@ impl App {
         }
         if info.pages > 1 {
             ui.label(RichText::new(format!("This file holds {} scans (multi-page TIFF): only the first shows.", info.pages)).size(12.0).color(WARN));
-            if ui.add(egui::Button::new(format!("Split into {} files", info.pages)).min_size(vec2(ui.available_width(), 28.0))).clicked() {
+            let busy = self.scan.busy.is_some();
+            if ui.add_enabled(!busy, egui::Button::new(format!("Split into {} files", info.pages)).min_size(vec2(ui.available_width(), 28.0))).clicked() {
+                // A holder of frames at full resolution is gigabytes to read and write: off the window's thread.
                 let real = load::copy_of(&cur).unwrap_or_else(|| cur.clone());
-                match scanfile::split_pages(&real) {
-                    Ok(files) => {
-                        self.status = format!("Split into {} files", files.len());
-                        if let Some(first) = files.first().cloned() {
-                            self.scan.strip = None;
-                            self.open_path(ui.ctx(), &first);
-                        }
-                    }
-                    Err(e) => self.status = format!("Couldn't split it: {e}"),
-                }
+                self.scan.busy = Some(format!("Splitting into {} files…", info.pages));
+                let (tx, ctx) = (self.scan.tx.clone(), ui.ctx().clone());
+                std::thread::spawn(move || {
+                    let _ = tx.send(ScanMsg::Split(scanfile::split_pages(&real)));
+                    ctx.request_repaint();
+                });
             }
         }
     }

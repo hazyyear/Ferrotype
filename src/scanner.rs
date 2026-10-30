@@ -2,13 +2,15 @@
 //!
 //! - Windows: TWAIN. The scanner's own window opens (Epson Scan 2 for a Perfection V600 or V850, with its film
 //!   holders, Digital ICE and frame detection), and each picture it scans arrives here as a 16-bit TIFF.
-//! - Linux: SANE through `scanimage` (sane-utils), with a choice of source, resolution and bit depth.
+//! - The Scanner page: Ferrotype drives the scanner itself, over USB for the V800/V850 (`direct`) and through
+//!   SANE (`scanimage`, from sane-utils) for anything SANE knows, with a preview to pick frames on.
 //! - Everywhere: the scanning apps people already use (Epson Scan 2, VueScan, SilverFast) can be opened from the
 //!   Scan tab, saving into the folder Ferrotype watches.
 //!
 //! A scan runs on its own thread and reports back through `Event`s.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 
 pub mod direct;
@@ -51,7 +53,7 @@ pub struct Options {
     pub linear: Option<(String, String)>,
 }
 
-/// What to scan with on Linux, and how.
+/// How to scan with a SANE scanner.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Settings {
     pub device: String,
@@ -69,42 +71,68 @@ pub struct Settings {
 /// A frame to scan: left, top, width and height in millimetres on the scanner.
 pub type Area = [f32; 4];
 
-/// Whether this build can drive a scanner itself (rather than only open a scanning app).
-pub fn can_scan() -> bool {
-    cfg!(windows) || (cfg!(target_os = "linux") && which("scanimage").is_some())
-}
-
-/// The next free `scan-0001.tif` in `dir`.
+/// The next scan's name in `dir`: `scan-0001.tif`, then one more than the highest number used in the folder
+/// or its `_rejects`, so a new scan never fills the gap a rejected frame left and the roll stays in order.
 pub fn next_name(dir: &Path) -> PathBuf {
-    (1..100_000).map(|n| dir.join(format!("scan-{n:04}.tif"))).find(|p| !p.exists()).unwrap_or_else(|| dir.join("scan.tif"))
+    let number = |p: PathBuf| -> Option<u32> { p.file_stem()?.to_str()?.strip_prefix("scan-")?.parse().ok() };
+    let used = [dir.to_path_buf(), dir.join("_rejects")].into_iter().flat_map(|d| std::fs::read_dir(d).into_iter().flatten().flatten()).filter_map(|e| number(e.path())).max().unwrap_or(0);
+    (used + 1..).map(|n| dir.join(format!("scan-{n:04}.tif"))).find(|p| !p.exists()).unwrap_or_else(|| dir.join("scan.tif"))
 }
 
-/// Scan into `dir` on a thread of its own. On Windows the scanner's own window opens; `source` is the TWAIN
-/// scanner to use ("" = ask). On Linux, `settings` choose the scanner and how to scan.
-pub fn scan(dir: PathBuf, source: String, settings: Settings, tx: Sender<Event>, wake: impl Fn() + Send + 'static) {
+/// Run a scan on a thread of its own, reporting through `tx`. It always ends with `Done`, even if the scan
+/// panics (a driver sending something unexpected), so the Scan tab never stays busy.
+pub fn run(tx: Sender<Event>, wake: impl Fn() + Send + 'static, job: impl FnOnce(&dyn Fn(Event)) -> Result<usize, String> + Send + 'static) {
     std::thread::spawn(move || {
         let say = |e: Event| {
             let _ = tx.send(e);
             wake();
         };
-        #[cfg(windows)]
-        let done = {
-            let _ = &settings;
-            twain::scan(&dir, &source, &say)
-        };
-        #[cfg(not(windows))]
-        let done = {
-            let _ = &source;
-            sane_scan(&dir, &settings, &say)
-        };
+        let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(&say))).unwrap_or_else(|_| Err("the scanner stopped unexpectedly".into()));
         say(Event::Done(done));
     });
+}
+
+/// Open the scanner's own window (TWAIN) and save each picture it scans into `dir`. `source` is the TWAIN
+/// scanner to use ("" = the system's default).
+#[cfg(windows)]
+pub fn scan(dir: PathBuf, source: String, tx: Sender<Event>, wake: impl Fn() + Send + 'static) {
+    run(tx, wake, move |say| twain::scan(&dir, &source, say));
 }
 
 /// Let the user pick a TWAIN scanner (the system's list); returns its name.
 #[cfg(windows)]
 pub fn choose_source() -> Result<String, String> {
     twain::choose()
+}
+
+/// Copy rows of a strip from the scanner into the picture `px` (`w` × `h`, `samples` per pixel), clipped to it:
+/// `rows` rows of `cols` pixels at (`x0`, `y0`), `bpr` bytes apart in `buf`, `bytes` per sample (1 or 2,
+/// little-endian). 8-bit samples become 16-bit.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+pub fn copy_strip(px: &mut [u16], w: usize, h: usize, samples: usize, bytes: usize, buf: &[u8], bpr: usize, cols: usize, rows: usize, x0: usize, y0: usize) {
+    if x0 >= w || bytes == 0 {
+        return;
+    }
+    let n = cols.min(w - x0) * samples;
+    for r in 0..rows {
+        let y = y0.saturating_add(r);
+        let Some(start) = r.checked_mul(bpr).filter(|s| *s < buf.len()) else { break };
+        if y >= h {
+            break;
+        }
+        let line = &buf[start..(start + n * bytes).min(buf.len())];
+        let out = &mut px[(y * w + x0) * samples..][..n.min(line.len() / bytes)];
+        if bytes == 2 {
+            for (o, b) in out.iter_mut().zip(line.chunks_exact(2)) {
+                *o = u16::from_le_bytes([b[0], b[1]]);
+            }
+        } else {
+            for (o, b) in out.iter_mut().zip(line) {
+                *o = *b as u16 * 257;
+            }
+        }
+    }
 }
 
 // ---------- SANE ----------
@@ -114,9 +142,12 @@ fn which(prog: &str) -> Option<PathBuf> {
     std::env::split_paths(&path).map(|d| d.join(prog)).find(|p| p.is_file())
 }
 
-/// Scanners SANE finds (slow: it asks every backend, so call it off the UI thread).
+/// Scanners SANE finds (slow: it asks every backend, so call it off the UI thread). None without SANE.
 pub fn sane_devices() -> Result<Vec<Device>, String> {
-    let out = std::process::Command::new("scanimage").args(["-f", "%d\t%v %m%n"]).output().map_err(|e| format!("scanimage: {e} (install sane-utils)"))?;
+    if which("scanimage").is_none() {
+        return Ok(vec![]);
+    }
+    let out = std::process::Command::new("scanimage").args(["-f", "%d\t%v %m%n"]).output().map_err(|e| format!("scanimage: {e}"))?;
     let text = String::from_utf8_lossy(&out.stdout);
     Ok(parse_devices(&text))
 }
@@ -129,9 +160,21 @@ fn parse_devices(text: &str) -> Vec<Device> {
     }).filter(|d| !d.id.is_empty()).collect()
 }
 
-/// What `device` can do.
-pub fn sane_options(device: &str) -> Result<Options, String> {
-    let out = std::process::Command::new("scanimage").args(["-d", device, "-A"]).output().map_err(|e| format!("scanimage: {e}"))?;
+/// What `device` can do with `source` chosen ("" = its default; a transparency unit has a smaller area than
+/// the glass).
+pub fn sane_options(device: &str, source: &str) -> Result<Options, String> {
+    let ask = |source: &str| {
+        let mut cmd = std::process::Command::new("scanimage");
+        cmd.args(["-d", device]);
+        if !source.is_empty() {
+            cmd.args(["--source", source]);
+        }
+        cmd.arg("-A").output().map_err(|e| format!("scanimage: {e}"))
+    };
+    let mut out = ask(source)?;
+    if !out.status.success() && !source.is_empty() {
+        out = ask("")?;
+    }
     if !out.status.success() {
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
@@ -186,7 +229,6 @@ fn num(s: &str) -> u32 {
 }
 
 /// One pass of `scanimage` into `out`: the whole area, or `area`, at `resolution`.
-#[cfg(not(windows))]
 fn sane_pass(s: &Settings, opts: &Options, area: Option<Area>, resolution: u32, depth: u32, out: &Path) -> Result<(), String> {
     let mut cmd = std::process::Command::new("scanimage");
     cmd.args(["-d", &s.device, "--format=tiff"]);
@@ -220,39 +262,46 @@ fn sane_pass(s: &Settings, opts: &Options, area: Option<Area>, resolution: u32, 
     Ok(())
 }
 
-#[cfg(not(windows))]
-fn sane_scan(dir: &Path, s: &Settings, say: &dyn Fn(Event)) -> Result<usize, String> {
-    sane_frames(dir, s, &[], say)
-}
-
-/// Scan each area (all of the scanner's area when `areas` is empty) into `dir` as `scan-0001.tif` and so on,
-/// with `s.passes` passes each, averaged.
-#[cfg(not(windows))]
-fn sane_frames(dir: &Path, s: &Settings, areas: &[Area], say: &dyn Fn(Event)) -> Result<usize, String> {
+/// Scan each area into `dir` as `scan-0001.tif` and on, with `s.passes` passes each, averaged. `cancel` stops
+/// before the next pass.
+fn sane_frames(dir: &Path, s: &Settings, areas: &[Area], cancel: &AtomicBool, say: &dyn Fn(Event)) -> Result<usize, String> {
     if s.device.is_empty() {
         return Err("choose a scanner first".into());
     }
-    let opts = sane_options_for(&s.device, &s.source)?;
-    let all = [None];
-    let list: Vec<Option<Area>> = if areas.is_empty() { all.to_vec() } else { areas.iter().copied().map(Some).collect() };
+    let opts = sane_options(&s.device, &s.source)?;
     let passes = s.passes.clamp(1, 16);
     let mut saved = 0;
-    for (i, area) in list.iter().enumerate() {
+    for (i, area) in areas.iter().enumerate() {
         let dest = next_name(dir);
-        let part = dir.join(format!(".{}.part", dest.file_name().unwrap_or_default().to_string_lossy()));
-        let what = if list.len() > 1 { format!("frame {} of {}", i + 1, list.len()) } else { "the scan".into() };
-        let mut done = vec![];
-        for p in 0..passes {
-            say(Event::Status(if passes > 1 { format!("Scanning {what}, pass {} of {passes}, at {} ppi…", p + 1, s.resolution) } else { format!("Scanning {what} at {} ppi…", s.resolution) }));
-            let tmp = dir.join(format!(".{}.pass{p}", dest.file_name().unwrap_or_default().to_string_lossy()));
-            sane_pass(s, &opts, *area, s.resolution, s.depth, &tmp)?;
-            done.push(tmp);
+        let name = dest.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let (part, tmp) = (dir.join(format!(".{name}.part")), dir.join(format!(".{name}.pass")));
+        let what = if areas.len() > 1 { format!("frame {} of {}", i + 1, areas.len()) } else { "the frame".into() };
+        let r = (|| {
+            let mut sum: Option<merge::Sum> = None;
+            for p in 0..passes {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err("stopped".to_string());
+                }
+                say(Event::Status(if passes > 1 { format!("Scanning {what}, pass {} of {passes}, at {} ppi…", p + 1, s.resolution) } else { format!("Scanning {what} at {} ppi…", s.resolution) }));
+                sane_pass(s, &opts, Some(*area), s.resolution, s.depth, &tmp)?;
+                // One pass in memory at a time: added to the running sum, then dropped.
+                let (w, h, samples, px) = crate::scanfile::read_u16(&tmp, 0).ok_or("couldn't read what the scanner sent")?;
+                match &mut sum {
+                    None => sum = Some(merge::Sum::new(w, h, samples, &px)),
+                    Some(m) => {
+                        m.add(w, h, samples, &px);
+                    }
+                }
+            }
+            let sum = sum.ok_or("no pass came in")?;
+            let (w, h, samples) = (sum.w, sum.h, sum.samples);
+            write_scan(&part, w, h, samples, &sum.average(), s.resolution as f32, passes, s.linear && opts.linear.is_some(), &s.device_name)
+        })();
+        let _ = std::fs::remove_file(&tmp);
+        if let Err(e) = r {
+            let _ = std::fs::remove_file(&part);
+            return if saved > 0 { Err(format!("{e} (after {saved} saved)")) } else { Err(e) };
         }
-        let r = finish(&done, &part, s.resolution as f32, &opts, s);
-        done.iter().for_each(|f| {
-            let _ = std::fs::remove_file(f);
-        });
-        r?;
         std::fs::rename(&part, &dest).map_err(|e| e.to_string())?;
         saved += 1;
         say(Event::Saved(dest));
@@ -260,83 +309,39 @@ fn sane_frames(dir: &Path, s: &Settings, areas: &[Area], say: &dyn Fn(Event)) ->
     Ok(saved)
 }
 
-/// Average the passes (or keep the one) into a 16-bit TIFF that says what it is.
-#[cfg(not(windows))]
-fn finish(passes: &[PathBuf], out: &Path, dpi: f32, opts: &Options, s: &Settings) -> Result<(), String> {
-    let read: Vec<merge::Pass> = passes.iter().filter_map(|p| crate::scanfile::read_samples(p, 0)).collect();
-    if read.is_empty() {
-        return Err("couldn't read what the scanner sent".into());
-    }
-    let (w, h, samples, data) = merge::average(&read).ok_or("couldn't combine the passes")?;
-    let px: Vec<u16> = data.iter().map(|&v| (v.clamp(0.0, 1.0) * 65535.0).round() as u16).collect();
-    let linear = s.linear && opts.linear.is_some();
+/// A 16-bit TIFF of a scan that says what it is: passes, linear, the scanner.
+#[allow(clippy::too_many_arguments)]
+fn write_scan(out: &Path, w: u32, h: u32, samples: usize, px: &[u16], dpi: f32, passes: u32, linear: bool, device: &str) -> Result<(), String> {
     let mut sw = format!("Ferrotype {}", env!("CARGO_PKG_VERSION"));
-    if read.len() > 1 {
-        sw += &format!(", {} passes", read.len());
+    if passes > 1 {
+        sw += &format!(", {passes} passes");
     }
     if linear {
         sw += ", linear";
     }
-    let (make, model) = s.device_name.split_once(' ').map_or((String::new(), s.device_name.clone()), |(a, b)| (a.to_string(), b.to_string()));
+    let (make, model) = device.split_once(' ').map_or((String::new(), device.to_string()), |(a, b)| (a.to_string(), b.to_string()));
     let info = crate::scanfile::Info { software: sw, make, model, dpi, ..Default::default() };
-    crate::scanfile::write_tiff(out, w, h, samples, 16, &px, None, &info)
-}
-
-/// `sane_options` with `source` chosen (a transparency unit has a smaller area than the glass).
-#[cfg(not(windows))]
-fn sane_options_for(device: &str, source: &str) -> Result<Options, String> {
-    let mut cmd = std::process::Command::new("scanimage");
-    cmd.args(["-d", device]);
-    if !source.is_empty() {
-        cmd.args(["--source", source]);
-    }
-    let out = cmd.arg("-A").output().map_err(|e| format!("scanimage: {e}"))?;
-    if !out.status.success() {
-        return sane_options(device);
-    }
-    Ok(parse_options(&String::from_utf8_lossy(&out.stdout)))
+    crate::scanfile::write_tiff(out, w, h, samples, 16, px, None, &info)
 }
 
 /// A quick low-resolution scan of the whole area, for picking frames: saved at `out`, with the area's size.
 pub fn preview(s: &Settings, out: &Path) -> Result<[f32; 2], String> {
-    #[cfg(windows)]
-    {
-        let _ = (s, out);
-        Err("preview scans come with the next step on Windows".into())
+    if s.device.is_empty() {
+        return Err("choose a scanner first".into());
     }
-    #[cfg(not(windows))]
-    {
-        if s.device.is_empty() {
-            return Err("choose a scanner first".into());
-        }
-        let opts = sane_options_for(&s.device, &s.source)?;
-        let bed = opts.bed_mm.ok_or("the scanner doesn't say how big its scan area is")?;
-        let res = opts.resolutions.iter().copied().filter(|r| *r >= 75).min().unwrap_or(150).max(75).min(300);
-        let res = if opts.resolutions.is_empty() || opts.resolutions.contains(&res) { res } else { opts.resolutions[0] };
-        let part = out.with_extension("part");
-        let quick = Settings { linear: s.linear, ..s.clone() };
-        sane_pass(&quick, &opts, None, res, 16, &part)?;
-        std::fs::rename(&part, out).map_err(|e| e.to_string())?;
-        Ok(bed)
-    }
+    let opts = sane_options(&s.device, &s.source)?;
+    let bed = opts.bed_mm.ok_or("the scanner doesn't say how big its scan area is")?;
+    let res = opts.resolutions.iter().copied().filter(|r| *r >= 75).min().unwrap_or(150).clamp(75, 300);
+    let res = if opts.resolutions.is_empty() || opts.resolutions.contains(&res) { res } else { opts.resolutions[0] };
+    let part = out.with_extension("part");
+    sane_pass(s, &opts, None, res, 16, &part)?;
+    std::fs::rename(&part, out).map_err(|e| e.to_string())?;
+    Ok(bed)
 }
 
-/// Scan these frames (from a preview) into `dir`, on a thread of its own.
-pub fn scan_frames(dir: PathBuf, settings: Settings, areas: Vec<Area>, tx: Sender<Event>, wake: impl Fn() + Send + 'static) {
-    std::thread::spawn(move || {
-        let say = |e: Event| {
-            let _ = tx.send(e);
-            wake();
-        };
-        #[cfg(windows)]
-        let done: Result<usize, String> = {
-            let _ = (&dir, &settings, &areas);
-            Err("scanning chosen frames comes with the next step on Windows".into())
-        };
-        #[cfg(not(windows))]
-        let done = sane_frames(&dir, &settings, &areas, &say);
-        say(Event::Done(done));
-    });
+/// Scan these frames into `dir` on a thread of its own; `cancel` stops before the next pass.
+pub fn scan_frames(dir: PathBuf, settings: Settings, areas: Vec<Area>, cancel: std::sync::Arc<AtomicBool>, tx: Sender<Event>, wake: impl Fn() + Send + 'static) {
+    run(tx, wake, move |say| sane_frames(&dir, &settings, &areas, &cancel, say));
 }
 
 /// A frame found on the preview (left, top, right, bottom trimmed, as fractions) as an area on the scanner,
@@ -464,8 +469,34 @@ mod tests {
     fn next_name_skips_taken_ones() {
         let d = std::env::temp_dir().join(format!("ferro-scanner-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
-        std::fs::write(d.join("scan-0001.tif"), b"x").unwrap();
-        assert_eq!(next_name(&d), d.join("scan-0002.tif"));
+        assert_eq!(next_name(&d), d.join("scan-0001.tif"));
+        for n in [1, 2, 4] {
+            std::fs::write(d.join(format!("scan-{n:04}.tif")), b"x").unwrap();
+        }
+        // Frame 3 was rejected: the next scan comes after 4, never into the gap.
+        assert_eq!(next_name(&d), d.join("scan-0005.tif"));
+        std::fs::create_dir_all(d.join("_rejects")).unwrap();
+        std::fs::rename(d.join("scan-0004.tif"), d.join("_rejects/scan-0004.tif")).unwrap();
+        assert_eq!(next_name(&d), d.join("scan-0005.tif"));
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn strips_from_the_scanner_are_clipped_to_the_picture() {
+        // A 4 × 3 grey picture; a 16-bit strip of 2 rows, 4 bytes apart, at (1, 1).
+        let mut px = vec![0u16; 12];
+        let buf = [1, 0, 2, 0, 3, 0, 4, 0];
+        copy_strip(&mut px, 4, 3, 1, 2, &buf, 4, 2, 2, 1, 1);
+        assert_eq!(px, [0, 0, 0, 0, 0, 1, 2, 0, 0, 3, 4, 0]);
+        // Rows or columns past the picture, an offset past its width or one left unset: nothing breaks.
+        copy_strip(&mut px, 4, 3, 1, 2, &buf, 4, 8, 2, 3, 2);
+        assert_eq!(px[11], 1);
+        copy_strip(&mut px, 4, 3, 1, 2, &buf, 4, 2, 2, 9, 0);
+        copy_strip(&mut px, 4, 3, 1, 2, &buf, 4, 2, 2, u32::MAX as usize, 0);
+        copy_strip(&mut px, 4, 3, 1, 2, &buf, u32::MAX as usize, 2, 2, 0, 0);
+        // 8-bit samples become 16-bit.
+        let mut px8 = vec![0u16; 2];
+        copy_strip(&mut px8, 2, 1, 1, 1, &[255, 1], 2, 2, 1, 0, 0);
+        assert_eq!(px8, [65535, 257]);
     }
 }
