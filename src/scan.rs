@@ -256,21 +256,17 @@ pub fn ir_channel(path: &Path) -> Option<Arc<Ir>> {
 }
 
 fn read_ir(path: &Path) -> Option<Ir> {
-    use tiff::decoder::{Decoder, DecodingResult};
-    let f = std::fs::File::open(path).ok()?;
-    let mut dec = Decoder::new(std::io::BufReader::new(f)).ok()?;
-    let (w, h) = dec.dimensions().ok()?;
-    let samples = match dec.colortype().ok()? {
-        tiff::ColorType::RGBA(_) => 4,
-        tiff::ColorType::Multiband { num_samples, .. } if num_samples >= 4 => num_samples as usize,
-        _ => return None,
-    };
-    let data: Vec<f32> = match dec.read_image().ok()? {
-        DecodingResult::U8(v) => v.chunks_exact(samples).map(|c| c[3] as f32 / 255.0).collect(),
-        DecodingResult::U16(v) => v.chunks_exact(samples).map(|c| c[3] as f32 / 65535.0).collect(),
-        DecodingResult::F32(v) => v.chunks_exact(samples).map(|c| c[3]).collect(),
-        _ => return None,
-    };
+    // Grey + IR (VueScan's 32-bit grey raw) has it second, RGBI fourth; planar files are interleaved for us.
+    let info = crate::scanfile::info(path)?;
+    if info.extra == 0 {
+        return None;
+    }
+    let (w, h, samples, px) = crate::scanfile::read_samples(path, 0)?;
+    let at = info.colours as usize;
+    if at >= samples {
+        return None;
+    }
+    let data: Vec<f32> = px.chunks_exact(samples).map(|c| c[at]).collect();
     if data.len() != (w * h) as usize {
         return None;
     }

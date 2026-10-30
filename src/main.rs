@@ -11,6 +11,8 @@ mod lens;
 mod pano;
 mod keys;
 mod scan;
+mod scanfile;
+mod scanner;
 mod xmp;
 mod rename;
 mod hdrmerge;
