@@ -3639,6 +3639,29 @@ impl App {
                 slider(ui, "Defringe", &mut p.o_fringe, 0.0, 20.0, 0.0, None);
             });
             section(ui, "Transform & crop", o_geo, changed(&["t_vert","t_hor","t_rot","t_scale","flip_h","crop","rot90"]), |ui| {
+                // Upright: found from the photo's straight lines, then written into the three sliders below, so
+                // the result stays adjustable by hand.
+                ui.horizontal(|ui| {
+                    ui.label(caps("Upright"));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if small_action(ui, "Off", false).on_hover_text("Rotate, Vertical and Horizontal back to 0").clicked() {
+                            (p.t_rot, p.t_vert, p.t_hor) = (0.0, 0.0, 0.0);
+                        }
+                        for (m, name) in crate::upright::Mode::ALL.iter().rev() {
+                            let tip = match m {
+                                crate::upright::Mode::Auto => "Level, plus a gentle fix for leaning verticals when the photo clearly has them",
+                                crate::upright::Mode::Level => "Level the horizon from the photo's straight lines",
+                                crate::upright::Mode::Vertical => "Level and make converging verticals parallel (buildings)",
+                                crate::upright::Mode::Full => "Level and straighten verticals and horizontals",
+                            };
+                            if small_action(ui, name, false).on_hover_text(tip).clicked()
+                                && let Some(ph) = photo
+                            {
+                                *p = crate::upright::apply(&ph.preview, p, *m);
+                            }
+                        }
+                    });
+                });
                 slider(ui, "Vertical", &mut p.t_vert, -100.0, 100.0, 0.0, None);
                 slider(ui, "Horizontal", &mut p.t_hor, -100.0, 100.0, 0.0, None);
                 slider(ui, "Rotate", &mut p.t_rot, -45.0, 45.0, 0.0, None);

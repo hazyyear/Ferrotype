@@ -16,6 +16,7 @@ mod rename;
 mod hdrmerge;
 mod gpu;
 mod calib;
+mod upright;
 
 use develop::Params;
 use image::{DynamicImage, Rgb32FImage, codecs::jpeg::JpegEncoder};
@@ -238,6 +239,9 @@ pub struct ExportOpts {
     pub meta: bool,
     /// Exporting a folder: include its subfolders and recreate the folder tree in the destination.
     pub tree: bool,
+    /// Command line: straighten each photo with Upright before exporting.
+    #[serde(skip)]
+    pub upright: Option<upright::Mode>,
 }
 
 impl Default for ExportOpts {
@@ -245,7 +249,7 @@ impl Default for ExportOpts {
         Self {
             ext: "jpg", long_edge: 0, quality: 92, hdr: false, canvas: [0, 0], print: [0.0, 0.0, 300.0], print_fill: false,
             wm_text: String::new(), wm_logo: String::new(), wm_pos: 0, wm_size: 4.0, wm_opacity: 70.0,
-            name: String::new(), roll: String::new(), meta: false, tree: false,
+            name: String::new(), roll: String::new(), meta: false, tree: false, upright: None,
         }
     }
 }
@@ -401,6 +405,9 @@ pub fn export_file(path: &Path, out_dir: &Path, o: &ExportOpts, n: usize, overri
         p.cam_curve = load::camera_curve(path, &raw);
     }
     let img = denoise::prepare(raw, path, &p)?;
+    if let Some(m) = o.upright {
+        p = upright::apply(&img, &p, m);
+    }
     let shot = if !o.name.trim().is_empty() && o.name != "{name}" { lens::shot(path).unwrap_or_default() } else { Default::default() };
     let out = claim_output(out_dir, &output::file_name(&o.name, path, n, &o.roll, &p, &shot), o.ext)?;
     write_export(&img, &p, o, &out, path).inspect_err(|_| {
@@ -477,7 +484,7 @@ pub fn make_pano(files: &[PathBuf], proj: pano::Projection, progress: &dyn Fn(&s
 
 const USAGE: &str = "ferrotype                      open the editor
 ferrotype <folder|file>         open the editor on a folder or photo
-ferrotype export [--out DIR] [--tif|--png|--hdr] [--size PX] [--quality Q] [--neg STOCK] [--lens] FILES...
+ferrotype export [--out DIR] [--tif|--png|--hdr] [--size PX] [--quality Q] [--neg STOCK] [--lens] [--upright MODE] FILES...
                 [--set instagram|story|portfolio] [--print 8x10|20x30cm] [--dpi N] [--watermark TEXT] [--logo PNG]
                 [--name PATTERN] [--roll N] [--meta]
                                 render files with their saved edits (headless); --lens adds the lens profile;
@@ -511,6 +518,10 @@ fn cli_export(args: &[String]) -> Result<(), String> {
             "--quality" => o.quality = it.next().and_then(|v| v.parse().ok()).ok_or("--quality needs 1-100")?,
             "--neg" => neg = Some(it.next().ok_or("--neg needs a stock id")?.clone()),
             "--lens" => lens_auto = true,
+            "--upright" => {
+                let v = it.next().ok_or("--upright needs auto, level, vertical or full")?;
+                o.upright = Some(upright::Mode::parse(v).ok_or("--upright is auto, level, vertical or full")?);
+            }
             "--name" => o.name = it.next().ok_or("--name needs a pattern like \"{roll}-{n}\"")?.clone(),
             "--roll" => o.roll = it.next().ok_or("--roll needs a roll number")?.clone(),
             "--meta" => o.meta = true,

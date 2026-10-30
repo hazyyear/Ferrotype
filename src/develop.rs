@@ -1062,7 +1062,7 @@ impl Mapper {
     }
 
     /// The frame pixel showing source pixel (sx, sy): the inverse of `map`, by Newton's method.
-    fn unmap(&self, sx: f32, sy: f32, guess: (f32, f32)) -> (f32, f32) {
+    pub fn unmap(&self, sx: f32, sy: f32, guess: (f32, f32)) -> (f32, f32) {
         let (mut fx, mut fy) = guess;
         for _ in 0..30 {
             let (gx, gy, ..) = self.map(fx, fy);
