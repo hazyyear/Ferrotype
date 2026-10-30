@@ -187,12 +187,19 @@ pub fn srgb_to_linear(v: f32) -> f32 {
 }
 
 /// sRGB encode through a 4096-step table (linear in between): a powf per channel was a big share of a render.
+/// Extended below 0 (mirrored), so a colour outside sRGB keeps its negative channel for a wide-gamut export.
 pub fn linear_to_srgb(v: f32) -> f32 {
     static T: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
     let t = T.get_or_init(|| (0..=4096).map(|i| srgb_exact(i as f32 / 4096.0)).collect());
-    let x = v.clamp(0.0, 1.0) * 4096.0;
+    let x = v.abs().min(1.0) * 4096.0;
     let i = (x as usize).min(4095);
-    t[i] + (t[i + 1] - t[i]) * (x - i as f32)
+    let e = t[i] + (t[i + 1] - t[i]) * (x - i as f32);
+    if v < 0.0 { -e } else { e }
+}
+
+/// The inverse of `linear_to_srgb`, extended the same way.
+pub fn srgb_to_linear_ext(v: f32) -> f32 {
+    if v < 0.0 { -srgb_to_linear(-v) } else { srgb_to_linear(v) }
 }
 
 fn srgb_exact(v: f32) -> f32 {

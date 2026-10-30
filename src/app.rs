@@ -254,7 +254,9 @@ struct RenderOut {
     /// Which photo this is for (see `App::photo_gen`) and the settings it shows.
     generation: usize,
     key: RenderKey,
+    /// For the screen (its colour profile applied), and plain sRGB for colour readouts.
     image: ColorImage,
+    srgb: ColorImage,
     bins: [[f32; 128]; 3],
     view_map: [f32; 8],
     photo_wh: [f32; 2],
@@ -378,6 +380,9 @@ pub struct App {
     export_dialog: Option<bool>,
     keymap: Keymap,
     keys_open: bool,
+    /// Screen profile and printer proofing settings, and the loaded printer profile.
+    colour: crate::colour::Settings,
+    printer: Option<Arc<crate::colour::Proof>>,
     /// Shortcut being set in the editor: waiting for a key.
     binding: Option<&'static str>,
     picking_wb: bool,
@@ -420,6 +425,10 @@ pub fn run(start: Option<PathBuf>) -> eframe::Result {
     eframe::run_native("Ferrotype", opts, Box::new(move |cc| {
         install_style(&cc.egui_ctx);
         let mut app = App::new();
+        crate::colour::set_screen(&app.colour.screen);
+        if !app.colour.printer.is_empty() {
+            app.load_printer();
+        }
         if let Some(p) = start {
             app.open_path(&cc.egui_ctx, &p);
         }
@@ -455,7 +464,7 @@ fn builtin_presets() -> Vec<(String, Params)> {
 
 /// The preview as shown: the photo rendered, the mask overlay and clipping marks, the border, the paper proof.
 /// Runs on the render thread; `key` and `generation` are filled in by the caller.
-fn render_preview(src: &Rgb32FImage, full_w: u32, shown: &Params, overlay: Option<usize>, clip_view: bool, proof: usize) -> RenderOut {
+fn render_preview(src: &Rgb32FImage, full_w: u32, shown: &Params, overlay: Option<usize>, clip_view: bool, proof: usize, printer: Option<Arc<crate::colour::Proof>>) -> RenderOut {
     let tex_scale = src.width() as f32 / full_w as f32;
     // Histogram from the photo alone; the border is added afterwards so it does not skew it.
     let out = develop::render(src, &Params { border: Default::default(), ..shown.clone() }, tex_scale);
@@ -485,13 +494,27 @@ fn render_preview(src: &Rgb32FImage, full_w: u32, shown: &Params, overlay: Optio
         });
     }
     let mut out = develop::add_border(out, &shown.border);
-    if proof > 0 {
+    // `proof` past the papers: the printer profile (+1), with the gamut warning (+2).
+    let papers = crate::output::PROOF_PAPERS.len();
+    if let Some(pr) = printer.filter(|_| proof > papers) {
+        // Through the printer profile; the gamut warning marks what the print can't hold in grey-blue.
+        let off = (proof == papers + 2).then(|| pr.out_of_gamut(&out));
+        pr.apply(&mut out);
+        if let Some(off) = off {
+            out.par_chunks_mut(3).zip(off.par_iter()).for_each(|(p, o)| {
+                if *o {
+                    p.copy_from_slice(&[0.45, 0.55, 0.75]);
+                }
+            });
+        }
+    } else if proof > 0 && proof <= papers {
         crate::output::proof(&mut out, proof - 1);
     }
     RenderOut {
         generation: 0,
         key: (Params::default(), false, false, 0, None),
         image: to_color_image(&out),
+        srgb: srgb_color_image(&out),
         bins,
         view_map: [cw as f32, ch as f32, ox as f32, oy as f32, fw, fh, fox, foy],
         photo_wh: [w as f32, h as f32],
@@ -499,9 +522,16 @@ fn render_preview(src: &Rgb32FImage, full_w: u32, shown: &Params, overlay: Optio
     }
 }
 
-fn to_color_image(img: &Rgb32FImage) -> ColorImage {
+/// An sRGB-encoded picture as 8-bit sRGB pixels (for colour readouts).
+fn srgb_color_image(img: &Rgb32FImage) -> ColorImage {
     let bytes: Vec<u8> = img.par_iter().map(|v| (v * 255.0 + 0.5) as u8).collect();
     ColorImage::from_rgb([img.width() as usize, img.height() as usize], &bytes)
+}
+
+/// An sRGB-encoded picture as a texture, through the screen's colour profile when one is set.
+fn to_color_image(img: &Rgb32FImage) -> ColorImage {
+    let bytes: Vec<u8> = img.par_iter().map(|v| (v * 255.0 + 0.5) as u8).collect();
+    ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], &crate::colour::for_screen(&bytes))
 }
 
 fn encode(img: &Rgb32FImage) -> Rgb32FImage {
@@ -636,7 +666,7 @@ impl App {
             stock_tab: 0, mixer_tab: 0, open: [true, false, false, false, false, false, false, false, false, false, false, false, false, false], tool: Tool::None,
             zoom: None, curve_chan: 0, curve_grab: None, curve_big: false, samples: vec![], rename_dlg: None, mask_ui: MaskUi::default(), chart: ChartUi::new(), profiles: crate::calib::saved(),
             crop_grab: None, crop_aspect: 0, spot_size: 2.0, heal_clone: false, spot_sel: None, heal_drag: None, view_map: [1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0], photo_wh: [1.0, 1.0],
-            export: ExportOpts::load(), export_dialog: None, export_sel: vec![], export_sets: [false; 3], keymap: Keymap::load(), keys_open: false, binding: None, picking_wb: false,
+            export: ExportOpts::load(), export_dialog: None, export_sel: vec![], export_sets: [false; 3], keymap: Keymap::load(), keys_open: false, colour: crate::colour::Settings::load(), printer: None, binding: None, picking_wb: false,
             thumb_due: false, lens_query: String::new(), lib_multi: vec![], pano_busy: false,
             watch: false, watch_open: true, watch_apply: false, watch_at: 0.0, watch_sizes: Default::default(), wipe: 0.5, wipe_tex: None,
             cull: Default::default(), ai_busy: false, tx, rx, roll: Default::default(), roll_dir: None,
@@ -690,7 +720,7 @@ impl App {
                 let meta = params.as_ref().map(Meta::of);
                 let cached = thumb_cache(f).and_then(|c| image::open(c).ok()).map(|i| {
                     let i = i.to_rgb8();
-                    ColorImage::from_rgb([i.width() as usize, i.height() as usize], i.as_raw())
+                    ColorImage::from_rgba_unmultiplied([i.width() as usize, i.height() as usize], &crate::colour::for_screen(i.as_raw()))
                 });
                 let made = cached.or_else(|| {
                     let (img, toned) = load::load_quick_toned(f, THUMB).ok()?;
@@ -698,13 +728,14 @@ impl App {
                     if toned {
                         p.cam_curve.clear(); // the camera's JPEG already has it
                     }
-                    let ci = to_color_image(&develop::render(&img, &p, 0.05));
+                    let out = develop::render(&img, &p, 0.05);
+                    // The cache keeps sRGB; the screen's profile is applied when it's shown.
                     if let Some(c) = thumb_cache(f) {
                         let _ = std::fs::create_dir_all(c.parent().unwrap());
-                        let rgb: Vec<u8> = ci.pixels.iter().flat_map(|p| [p.r(), p.g(), p.b()]).collect();
-                        let _ = image::save_buffer(&c, &rgb, ci.size[0] as u32, ci.size[1] as u32, image::ExtendedColorType::Rgb8);
+                        let rgb: Vec<u8> = out.iter().map(|v| (v * 255.0 + 0.5) as u8).collect();
+                        let _ = image::save_buffer(&c, &rgb, out.width(), out.height(), image::ExtendedColorType::Rgb8);
                     }
-                    Some(ci)
+                    Some(to_color_image(&out))
                 });
                 // Sent even without a picture, so the rating still arrives.
                 let _ = tx.send(Msg::Thumb(gen_now, f.clone(), made.unwrap_or_default(), meta));
@@ -1094,7 +1125,8 @@ impl App {
             && let Some(rgba) = image::RgbaImage::from_raw(ci.size[0] as u32, ci.size[1] as u32, ci.as_raw().to_vec())
         {
             let small = image::imageops::thumbnail(&rgba, THUMB, THUMB * ci.size[1] as u32 / ci.size[0].max(1) as u32);
-            t.set(ColorImage::from_rgba_unmultiplied([small.width() as usize, small.height() as usize], small.as_raw()), TextureOptions::LINEAR);
+            let rgb: Vec<u8> = small.pixels().flat_map(|p| [p[0], p[1], p[2]]).collect();
+            t.set(ColorImage::from_rgba_unmultiplied([small.width() as usize, small.height() as usize], &crate::colour::for_screen(&rgb)), TextureOptions::LINEAR);
         }
         self.thumb_due = false;
     }
@@ -1128,8 +1160,9 @@ impl App {
         let src = if draft { photo.draft.clone() } else { photo.preview.clone() };
         let full_w = photo.full.width();
         let (proof, clip_view, generation, tx, ctx2) = (self.proof, self.clip_view, self.photo_gen, self.tx.clone(), ctx.clone());
+        let printer = self.printer.clone();
         std::thread::spawn(move || {
-            let out = render_preview(&src, full_w, &shown, overlay, clip_view, proof);
+            let out = render_preview(&src, full_w, &shown, overlay, clip_view, proof, printer);
             let _ = tx.send(Msg::Rendered(Box::new(RenderOut { generation, key, ..out })));
             ctx2.request_repaint();
         });
@@ -1146,7 +1179,7 @@ impl App {
             Some(t) => t.set(r.image.clone(), TextureOptions::LINEAR),
             None => self.tex = Some(ctx.load_texture("preview", r.image.clone(), TextureOptions::LINEAR)),
         }
-        self.last_rgb = Some(r.image);
+        self.last_rgb = Some(r.srgb);
         self.rendered = Some(r.key);
         if self.thumb_due && !draft && !matches!(self.tool, Tool::Crop | Tool::Chart) && overlay.is_none() {
             self.refresh_thumb();
@@ -1526,6 +1559,21 @@ impl App {
                         ui.label(RichText::new("Highlights glow up to 2 stops brighter on HDR screens (recent phones, Macs, Chrome); everywhere else it's a normal JPEG.").size(11.5).color(TEXT2));
                     }
                 }
+                ui.label(caps("Colour space"));
+                let mut si = crate::colour::Space::ALL.iter().position(|x| x.0 == o.space).unwrap_or(0);
+                segmented(ui, &mut si, &crate::colour::Space::ALL.map(|x| x.1));
+                o.space = crate::colour::Space::ALL[si].0;
+                let mut note = o.space.hint().to_string();
+                if o.space != crate::colour::Space::Srgb {
+                    if o.ext == "jpg" && o.hdr {
+                        note = "HDR JPEGs are always sRGB.".into();
+                    } else if o.space == crate::colour::Space::ProPhoto && o.ext != "tif" {
+                        note = "ProPhoto is too wide for 8 bits: smooth skies may band. Use TIFF 16-bit.".into();
+                    } else {
+                        note += ". The profile is embedded in the file.";
+                    }
+                }
+                ui.label(RichText::new(note).size(11.5).color(TEXT2));
                 disclose(ui, "Watermark", "wm", |ui| {
                     ui.add(egui::TextEdit::singleline(&mut o.wm_text).hint_text("© Your name").desired_width(f32::INFINITY));
                     ui.horizontal(|ui| {
@@ -2445,7 +2493,7 @@ impl App {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
                 // Shortcuts is a dialog, not a view: a small button at the end of the bar, not a tab.
-                if ui.add(egui::Button::new(RichText::new("?").family(mono500()).size(13.0).color(TEXT2)).min_size(vec2(28.0, 28.0))).on_hover_text(format!("Keyboard shortcuts\nRendering: {}", crate::gpu::status())).clicked() {
+                if ui.add(egui::Button::new(RichText::new("?").family(mono500()).size(13.0).color(TEXT2)).min_size(vec2(28.0, 28.0))).on_hover_text(format!("Keyboard shortcuts and screen colour\nRendering: {}", crate::gpu::status())).clicked() {
                     self.keys_open = true;
                 }
                 let develop = !matches!(self.module, Module::Library | Module::Cull);
@@ -2499,12 +2547,47 @@ impl App {
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if !neg {
+                    let papers = crate::output::PROOF_PAPERS.len();
                     let names: Vec<&str> = std::iter::once("Screen").chain(crate::output::PROOF_PAPERS.iter().map(|p| p.0)).collect();
-                    egui::ComboBox::from_id_salt("proof").width(96.0).selected_text(if self.proof == 0 { "Proof: off".to_string() } else { format!("Proof: {}", names[self.proof]) }).show_ui(ui, |ui| {
+                    let printer_name = self.printer.as_ref().map(|p| p.name.clone());
+                    let shown = match (self.proof, &printer_name) {
+                        (0, _) => "Proof: off".to_string(),
+                        (k, Some(n)) if k > papers => format!("Proof: {n}"),
+                        (k, _) => format!("Proof: {}", names[k.min(papers)]),
+                    };
+                    let before = (self.proof, self.colour.perceptual, self.colour.paper);
+                    let mut load = false;
+                    egui::ComboBox::from_id_salt("proof").width(110.0).selected_text(shown).show_ui(ui, |ui| {
                         for (k, n) in names.iter().enumerate() {
                             ui.selectable_value(&mut self.proof, k, *n);
                         }
-                    }).response.on_hover_text("Paper preview: roughly how a print on this paper will look");
+                        ui.separator();
+                        if let Some(n) = &printer_name {
+                            ui.selectable_value(&mut self.proof, papers + 1, format!("Printer: {n}"));
+                            let mut warn = self.proof == papers + 2;
+                            if ui.checkbox(&mut warn, "Show what it can't print").changed() {
+                                self.proof = if warn { papers + 2 } else { papers + 1 };
+                            }
+                            ui.checkbox(&mut self.colour.perceptual, "Perceptual (else relative)");
+                            ui.checkbox(&mut self.colour.paper, "Simulate paper and ink");
+                        }
+                        load = ui.button("Printer profile…").on_hover_text("Load the ICC profile for your printer and paper (RGB or CMYK)").clicked();
+                    }).response.on_hover_text("Soft proof: how a print will look. The papers are approximations; a printer profile is exact");
+                    if load
+                        && let Some(f) = rfd::FileDialog::new().add_filter("ICC profile", &["icc", "icm"]).pick_file()
+                    {
+                        self.colour.printer = f.to_string_lossy().to_string();
+                        self.load_printer();
+                        if self.printer.is_some() {
+                            self.proof = papers + 1;
+                        }
+                    }
+                    if before.1 != self.colour.perceptual || before.2 != self.colour.paper {
+                        self.load_printer();
+                    }
+                    if before != (self.proof, self.colour.perceptual, self.colour.paper) {
+                        self.rendered = None;
+                    }
                 }
                 if let Some(t) = &self.tex
                     && self.photo.is_some()
@@ -4651,13 +4734,71 @@ impl App {
     }
 
     /// The shortcut editor: click a key, press the new one.
+    /// (Re)load the printer profile for soft proofing from the settings, and save them.
+    fn load_printer(&mut self) {
+        self.printer = None;
+        if !self.colour.printer.is_empty() {
+            match crate::colour::load_proof(&self.colour.printer, self.colour.perceptual, self.colour.paper) {
+                Ok(p) => self.printer = Some(Arc::new(p)),
+                Err(e) => self.status = format!("Printer profile: {e}"),
+            }
+        }
+        let _ = self.colour.save();
+        self.rendered = None;
+    }
+
+    /// Apply the screen colour setting to every picture shown from now on, and save it.
+    fn apply_screen(&mut self) {
+        let name = crate::colour::set_screen(&self.colour.screen);
+        if self.colour.screen.profile.trim().is_empty() || self.colour.screen.profile == "srgb" {
+            self.status = "Screen colour: sRGB".into();
+        } else {
+            self.status = match name { Some(n) => format!("Screen colour: {n}"), None => "That screen profile can't be used: showing sRGB".into() };
+        }
+        if let Err(e) = self.colour.save() {
+            self.status = format!("Could not save the colour settings: {e}");
+        }
+        // Everything on screen was made for the old screen setting.
+        self.rendered = None;
+        self.thumbs.clear();
+        self.thumb_ready.clear();
+        self.preset_tex.clear();
+    }
+
     fn keys_window(&mut self, ctx: &egui::Context) {
         if !self.keys_open {
             return;
         }
         // Esc while waiting for a key cancels the binding, not the dialog.
         let binding = self.binding.is_some();
-        let open = dialog(ctx, "keys", "Keyboard shortcuts", 380.0, |ui| {
+        let mut screen_changed = false;
+        let open = dialog(ctx, "keys", "Keyboard shortcuts and screen", 380.0, |ui| {
+            ui.label(caps("Screen colour"));
+            let cur = self.colour.screen.profile.clone();
+            let shown = match cur.as_str() {
+                "" | "srgb" => "sRGB (as is)".to_string(),
+                "p3" => "Display P3".into(),
+                "adobe" => "Adobe RGB".into(),
+                "auto" => "System profile".into(),
+                p => Path::new(p).file_name().map_or(p.to_string(), |n| n.to_string_lossy().to_string()),
+            };
+            egui::ComboBox::from_id_salt("screen").width(ui.available_width()).selected_text(shown).show_ui(ui, |ui| {
+                for (v, n) in [("", "sRGB (as is)"), ("p3", "Display P3"), ("adobe", "Adobe RGB"), ("auto", "System profile")] {
+                    if ui.selectable_label(cur == v, n).clicked() {
+                        self.colour.screen.profile = v.into();
+                        screen_changed = true;
+                    }
+                }
+                if ui.button("Profile file…").clicked()
+                    && let Some(f) = rfd::FileDialog::new().add_filter("ICC profile", &["icc", "icm"]).pick_file()
+                {
+                    self.colour.screen.profile = f.to_string_lossy().to_string();
+                    screen_changed = true;
+                }
+            });
+            ui.label(RichText::new("If colours look too strong on a wide-gamut monitor, choose its profile here. macOS usually manages colour itself, so keep sRGB there unless photos look oversaturated.").size(11.5).color(TEXT2));
+            ui.add_space(10.0);
+            ui.label(caps("Shortcuts"));
             ui.label(RichText::new("Click a shortcut, then press the new key (Esc cancels). Undo, copy, paste and Ctrl/Cmd+arrows stay fixed.").size(11.5).color(TEXT2));
             ui.add_space(6.0);
             egui::ScrollArea::vertical().max_height(460.0).show(ui, |ui| {
@@ -4680,6 +4821,9 @@ impl App {
             }
             ui.add_space(4.0);
         });
+        if screen_changed {
+            self.apply_screen();
+        }
         if !open && !(binding && ctx.input(|i| i.key_pressed(egui::Key::Escape))) {
             self.keys_open = false;
             self.binding = None;

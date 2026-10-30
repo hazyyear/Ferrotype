@@ -18,6 +18,7 @@ mod gpu;
 mod calib;
 mod upright;
 mod roll;
+mod colour;
 
 use develop::Params;
 use image::{DynamicImage, Rgb32FImage, codecs::jpeg::JpegEncoder};
@@ -240,6 +241,8 @@ pub struct ExportOpts {
     pub meta: bool,
     /// Exporting a folder: include its subfolders and recreate the folder tree in the destination.
     pub tree: bool,
+    /// Colour space of the file (sRGB, Display P3, Adobe RGB, ProPhoto), with its ICC profile embedded.
+    pub space: colour::Space,
     /// Command line: straighten each photo with Upright before exporting.
     #[serde(skip)]
     pub upright: Option<upright::Mode>,
@@ -250,7 +253,7 @@ impl Default for ExportOpts {
         Self {
             ext: "jpg", long_edge: 0, quality: 92, hdr: false, canvas: [0, 0], print: [0.0, 0.0, 300.0], print_fill: false,
             wm_text: String::new(), wm_logo: String::new(), wm_pos: 0, wm_size: 4.0, wm_opacity: 70.0,
-            name: String::new(), roll: String::new(), meta: false, tree: false, upright: None,
+            name: String::new(), roll: String::new(), meta: false, tree: false, upright: None, space: colour::Space::Srgb,
         }
     }
 }
@@ -280,7 +283,13 @@ impl ExportOpts {
 /// Render at the requested size. A smaller export renders from a downscaled source (much faster),
 /// and radii scale with it so it looks like the full-size render.
 pub fn render_export(full: &Rgb32FImage, p: &Params, o: &ExportOpts) -> Rgb32FImage {
-    render_export_with(full, p, o, develop::render)
+    if o.space == colour::Space::Srgb {
+        return render_export_with(full, p, o, develop::render);
+    }
+    // Wide gamut: render keeping the colours sRGB can't hold, then convert into the export's space.
+    let mut out = render_export_with(full, p, o, develop::render_wide);
+    colour::to_space(&mut out, o.space);
+    out
 }
 
 fn render_export_with(full: &Rgb32FImage, p: &Params, o: &ExportOpts, render: impl Fn(&Rgb32FImage, &Params, f32) -> Rgb32FImage) -> Rgb32FImage {
@@ -335,7 +344,7 @@ pub fn export_description(p: &Params, o: &ExportOpts, src: &Path) -> String {
 
 /// What the export of `src` carries besides pixels: camera details when `o.meta` asks for them, print DPI.
 pub fn export_embed(p: &Params, o: &ExportOpts, src: &Path) -> output::Embed {
-    let mut e = output::Embed { dpi: (o.print[0] > 0.0 && o.canvas[0] == 0).then(|| o.print[2].round() as u16), ..Default::default() };
+    let mut e = output::Embed { dpi: (o.print[0] > 0.0 && o.canvas[0] == 0).then(|| o.print[2].round() as u16), icc: o.space.icc(), ..Default::default() };
     if o.meta {
         let shot = export_shot(src);
         let desc = export_description(p, o, src);
@@ -350,6 +359,9 @@ pub fn export_embed(p: &Params, o: &ExportOpts, src: &Path) -> output::Embed {
 pub fn write_export(full: &Rgb32FImage, p: &Params, o: &ExportOpts, out: &Path, src: &Path) -> Result<(), String> {
     let e = export_embed(p, o, src);
     if o.hdr && o.ext == "jpg" {
+        // The gain map is defined on sRGB here: HDR exports stay sRGB.
+        let o = &ExportOpts { space: colour::Space::Srgb, ..o.clone() };
+        let e = output::Embed { icc: vec![], ..e };
         let sdr = render_export(full, p, o);
         jpeg_fits(&sdr)?;
         let low = render_export(full, &Params { exposure: p.exposure - hdr::HEADROOM, ..p.clone() }, o);
@@ -517,7 +529,7 @@ pub fn make_pano(files: &[PathBuf], proj: pano::Projection, progress: &dyn Fn(&s
 
 const USAGE: &str = "ferrotype                      open the editor
 ferrotype <folder|file>         open the editor on a folder or photo
-ferrotype export [--out DIR] [--tif|--png|--hdr] [--size PX] [--quality Q] [--neg STOCK] [--lens] [--upright MODE] FILES...
+ferrotype export [--out DIR] [--tif|--png|--hdr] [--size PX] [--quality Q] [--neg STOCK] [--lens] [--upright MODE] [--space SPACE] FILES...
                 [--set instagram|story|portfolio] [--print 8x10|20x30cm] [--dpi N] [--watermark TEXT] [--logo PNG]
                 [--name PATTERN] [--roll N] [--meta]
                                 render files with their saved edits (headless); --lens adds the lens profile;
@@ -551,6 +563,10 @@ fn cli_export(args: &[String]) -> Result<(), String> {
             "--quality" => o.quality = it.next().and_then(|v| v.parse().ok()).ok_or("--quality needs 1-100")?,
             "--neg" => neg = Some(it.next().ok_or("--neg needs a stock id")?.clone()),
             "--lens" => lens_auto = true,
+            "--space" => {
+                let v = it.next().ok_or("--space needs srgb, p3, adobe or prophoto")?;
+                o.space = colour::Space::parse(v).ok_or("--space is srgb, p3, adobe or prophoto")?;
+            }
             "--upright" => {
                 let v = it.next().ok_or("--upright needs auto, level, vertical or full")?;
                 o.upright = Some(upright::Mode::parse(v).ok_or("--upright is auto, level, vertical or full")?);

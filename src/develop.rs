@@ -1437,7 +1437,8 @@ fn finish(mut img: Rgb32FImage, p: &Params, scale: f32, full: (u32, u32), off: (
                 let s = (1.0 - smooth(0.0, 0.18, luma(c))) * p.cal_sh / 100.0 * 0.02;
                 c[1] += s;
             }
-            *px = c.map(|v| v.max(0.0));
+            // Negative channels are colours outside sRGB (kept for wide-gamut exports); negative light isn't.
+            *px = if luma(c) < 0.0 { [0.0; 3] } else { c };
         }
     });
 
@@ -1536,9 +1537,9 @@ fn finish(mut img: Rgb32FImage, p: &Params, scale: f32, full: (u32, u32), off: (
             // Saturation / vibrance.
             if sat_on {
                 let yl = luma(c);
-                let (_, sat0, _) = rgb_to_hsv(c);
+                let sat0 = rgb_to_hsv(c).1.min(1.0);
                 let k = 1.0 + p.saturation / 100.0 + p.vibrance / 100.0 * (1.0 - sat0).powi(2) + p.dehaze / 400.0;
-                c = c.map(|v| (yl + (v - yl) * k).max(0.0));
+                c = c.map(|v| yl + (v - yl) * k);
             }
             // Display encode, then perceptual colour work.
             let mut e = c.map(linear_to_srgb);
@@ -1600,8 +1601,22 @@ fn finish(mut img: Rgb32FImage, p: &Params, scale: f32, full: (u32, u32), off: (
     }
 
     detail(&mut img, p, scale);
-    img.iter_mut().for_each(|v| *v = v.clamp(0.0, 1.0));
+    // A wide-gamut export keeps the negative channels (`colour::to_space` maps them into its gamut).
+    let lo = if KEEP_GAMUT.with(|k| k.get()) { -1.0 } else { 0.0 };
+    img.iter_mut().for_each(|v| *v = v.clamp(lo, 1.0));
     img
+}
+
+thread_local! {
+    static KEEP_GAMUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `render`, keeping colours outside sRGB as negative channels (extended sRGB), for a wide-gamut export.
+pub fn render_wide(src: &Rgb32FImage, p: &Params, scale: f32) -> Rgb32FImage {
+    KEEP_GAMUT.with(|k| k.set(true));
+    let out = render(src, p, scale);
+    KEEP_GAMUT.with(|k| k.set(false));
+    out
 }
 
 // ---------- point curves ----------
