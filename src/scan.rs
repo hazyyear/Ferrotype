@@ -10,15 +10,61 @@ pub fn frame(src: &Rgb32FImage, p: &Params) -> Rgb32FImage {
     develop::geometry(src, &Params { crop: [0.0; 4], ..p.clone() })
 }
 
-/// Per pixel: is this picture (not the dark holder, not bare film base)?
+/// Bare light: sprocket holes and gaps in the holder, where the light source shines through with no film.
+/// At least as bright as the film base in every channel and clearly brighter in one (the edges of a hole blend
+/// light with base, so only some channels rise).
+fn bare_light(c: &[f32], base: [f32; 3]) -> bool {
+    (0..3).all(|k| c[k] > base[k] * 0.97) && (0..3).any(|k| c[k] > base[k] * 1.15)
+}
+
+/// Film base of a negative scan: its brightest film, leaving out light through sprocket holes (which
+/// `negative::auto_base` would take, since it is brighter still). Holes are near neutral, so when the film without
+/// near-neutral highlights is orange, that is the base; otherwise (black and white film, slides) the plain auto base.
+pub fn film_base(img: &Rgb32FImage) -> [f32; 3] {
+    let small;
+    let img = if img.width().max(img.height()) > 1600 {
+        small = crate::load::fit(img, 1400);
+        &small
+    } else {
+        img
+    };
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    let light: Vec<bool> = img.chunks(3).map(|c| {
+        let (lo, hi) = (c[0].min(c[1]).min(c[2]), c[0].max(c[1]).max(c[2]));
+        lo > 0.5 && hi < lo * 1.3
+    }).collect();
+    // The edges of each hole blend light with base: leave out a margin around them too.
+    let r = (w.max(h) / 700).max(2) as isize;
+    let near_light = |i: usize| {
+        let (x, y) = ((i % w) as isize, (i / w) as isize);
+        (-r..=r).any(|dy| (-r..=r).any(|dx| {
+            let (nx, ny) = (x + dx, y + dy);
+            nx >= 0 && ny >= 0 && (nx as usize) < w && (ny as usize) < h && light[ny as usize * w + nx as usize]
+        }))
+    };
+    let film: Vec<f32> = img.chunks(3).enumerate().filter(|(i, _)| !near_light(*i)).flat_map(|(_, c)| [c[0], c[1], c[2]]).collect();
+    if film.len() >= 300 {
+        let n = (film.len() / 3) as u32;
+        let b = crate::negative::auto_base(&Rgb32FImage::from_raw(n, 1, film).unwrap());
+        if crate::negative::orange_mask(b) {
+            return b;
+        }
+    }
+    crate::negative::auto_base(img)
+}
+
+/// Per pixel: is this picture (not the dark holder, not bare film base, not light through a sprocket hole)?
 fn content_mask(img: &Rgb32FImage, neg: bool) -> Vec<bool> {
-    let base = crate::negative::auto_base(img);
+    let base = film_base(img);
     let bl = luma(base);
     img.chunks(3).map(|c| {
         let l = luma([c[0], c[1], c[2]]);
-        let holder = l < 0.3 * bl;
+        // The holder is near black and grey. The densest parts of a negative (its highlights) are dark too,
+        // but keep the film's colour cast, so only very dark grey counts as holder.
+        let (lo, hi) = (c[0].min(c[1]).min(c[2]), c[0].max(c[1]).max(c[2]));
+        let holder = l < 0.02 * bl || (l < 0.15 * bl && hi < lo.max(1e-5) * 1.6) || (!neg && l < 0.3 * bl);
         // Bare film (rebate, gaps between frames) is close to the base colour; only negatives have one.
-        let bare = neg && (0..3).all(|k| (c[k] / base[k] - 1.0).abs() < 0.08);
+        let bare = neg && ((0..3).all(|k| (c[k] / base[k] - 1.0).abs() < 0.08) || bare_light(c, base));
         !holder && !bare
     }).collect()
 }
@@ -41,12 +87,31 @@ fn longest_run(on: impl Iterator<Item = bool>) -> Option<(usize, usize)> {
     best
 }
 
+/// Close runs of `false` shorter than `max_gap` that have `true` on both sides: a dark sky or deep shadow in a
+/// frame looks like bare film for a few rows, and must not cut the frame in two.
+fn fill_gaps(mut on: Vec<bool>, max_gap: usize) -> Vec<bool> {
+    let mut last_on = None;
+    for i in 0..on.len() {
+        if on[i] {
+            if let Some(j) = last_on
+                && i - j > 1
+                && i - j - 1 <= max_gap
+            {
+                on[j + 1..i].iter_mut().for_each(|v| *v = true);
+            }
+            last_on = Some(i);
+        }
+    }
+    on
+}
+
 /// Crop [left, top, right, bottom] that trims the holder and film rebate around a single frame.
 pub fn auto_crop(frame: &Rgb32FImage, neg: bool) -> Option<[f32; 4]> {
     let (w, h) = (frame.width() as usize, frame.height() as usize);
     let m = content_mask(frame, neg);
-    let rows = longest_run((0..h).map(|y| m[y * w..(y + 1) * w].iter().filter(|v| **v).count() as f32 > 0.25 * w as f32))?;
-    let cols = longest_run((0..w).map(|x| (rows.0..rows.1).filter(|y| m[y * w + x]).count() as f32 > 0.25 * (rows.1 - rows.0) as f32))?;
+    let gap = w.min(h) / 50;
+    let rows = longest_run(fill_gaps((0..h).map(|y| m[y * w..(y + 1) * w].iter().filter(|v| **v).count() as f32 > 0.2 * w as f32).collect(), gap).into_iter())?;
+    let cols = longest_run(fill_gaps((0..w).map(|x| (rows.0..rows.1).filter(|y| m[y * w + x]).count() as f32 > 0.2 * (rows.1 - rows.0) as f32).collect(), gap).into_iter())?;
     // A little inset so no sliver of edge survives.
     let (ix, iy) = (0.006 * w as f32, 0.006 * h as f32);
     let c = [
@@ -65,7 +130,8 @@ pub fn split_strip(frame: &Rgb32FImage, neg: bool) -> Vec<[f32; 4]> {
     let horizontal = w >= h;
     let (long, short) = if horizontal { (w, h) } else { (h, w) };
     let at = |i: usize, j: usize| if horizontal { m[j * w + i] } else { m[i * w + j] };
-    let filled: Vec<bool> = (0..long).map(|i| (0..short).filter(|j| at(i, *j)).count() as f32 > 0.2 * short as f32).collect();
+    // Gaps between frames are about a tenth of the frame's height; anything much shorter is inside a frame.
+    let filled = fill_gaps((0..long).map(|i| (0..short).filter(|j| at(i, *j)).count() as f32 > 0.2 * short as f32).collect(), short / 40);
     let mut frames = vec![];
     let mut i = 0;
     while i < long {
@@ -84,8 +150,10 @@ pub fn split_strip(frame: &Rgb32FImage, neg: bool) -> Vec<[f32; 4]> {
     }
     frames.iter().map(|&(a, b)| {
         // The frame's extent across the strip.
-        let across = longest_run((0..short).map(|j| (a..b).filter(|i| at(*i, j)).count() as f32 > 0.25 * (b - a) as f32)).unwrap_or((0, short));
-        let inset = 0.006 * long as f32;
+        let rows = fill_gaps((0..short).map(|j| (a..b).filter(|i| at(*i, j)).count() as f32 > 0.2 * (b - a) as f32).collect(), short / 50);
+        let across = longest_run(rows.into_iter()).unwrap_or((0, short));
+        // A few pixels in from each edge (the same number on both axes), so no sliver of gap or rebate survives.
+        let inset = 0.008 * short as f32;
         let (l0, l1) = ((a as f32 + inset) / long as f32, (long as f32 - b as f32 + inset) / long as f32);
         let (s0, s1) = ((across.0 as f32 + inset) / short as f32, (short as f32 - across.1 as f32 + inset) / short as f32);
         if horizontal { [l0, s0, l1, s1] } else { [s0, l0, s1, l1] }
@@ -430,6 +498,45 @@ mod tests {
         assert_eq!(f.len(), 4);
         let w = img.width() as f32;
         assert!((f[1][0] * w - (20.0 + 112.0)).abs() < 3.0, "{:?}", f[1]);
+    }
+
+    /// A camera scan of a strip in a carrier: sprocket holes let bare light through, and the frames' highlights
+    /// are dense (dark, but still tinted by the orange mask).
+    fn strip_with_holes(frames: usize) -> Rgb32FImage {
+        let (fw, gap, border, reb) = (120u32, 10u32, 16u32, 24u32);
+        let w = border * 2 + frames as u32 * fw + (frames as u32 - 1) * gap;
+        let h = border * 2 + 80 + reb * 2;
+        let base = [0.85, 0.45, 0.22];
+        Rgb32FImage::from_fn(w, h, |x, y| {
+            if x < border || x >= w - border || y < border || y >= h - border {
+                return image::Rgb([0.005, 0.005, 0.005]);
+            }
+            let (fy, ry) = (y - border, y - border);
+            if (6..14).contains(&ry) || (reb * 2 + 80 - 14..reb * 2 + 80 - 6).contains(&ry) {
+                if (x - border) % 18 < 9 {
+                    return image::Rgb([0.95, 0.95, 0.95]); // a sprocket hole
+                }
+            }
+            let i = x - border;
+            if i % (fw + gap) >= fw || !(reb..reb + 80).contains(&fy) {
+                return image::Rgb(base);
+            }
+            // Dense sky (bright in the picture) over a thinner ground.
+            let t = if fy < reb + 40 { 0.07 } else { 0.4 + 0.2 * ((x + y) % 5) as f32 / 5.0 };
+            image::Rgb(base.map(|b| b * t))
+        })
+    }
+
+    #[test]
+    fn strip_with_sprocket_holes_and_dense_highlights() {
+        let img = strip_with_holes(5);
+        let b = film_base(&img);
+        assert!((b[0] - 0.85).abs() < 0.03 && (b[2] - 0.22).abs() < 0.03, "{b:?}");
+        let f = split_strip(&img, true);
+        assert_eq!(f.len(), 5, "{f:?}");
+        let h = img.height() as f32;
+        // Top of each frame: the border, the rebate with its holes, then the picture.
+        assert!((f[2][1] * h - (16.0 + 24.0)).abs() < 3.0, "{:?}", f[2]);
     }
 
     #[test]

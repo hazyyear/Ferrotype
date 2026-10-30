@@ -2,7 +2,9 @@
 use crate::develop::{self, HUE_CENTERS, Params, hue_rotate, luma, wb_gains};
 
 mod masks;
+mod scan_view;
 use masks::{Draw, MaskUi};
+use scan_view::ScanUi;
 use crate::load::{self, linear_to_srgb};
 use crate::negative::{self, Kind, Look, STOCKS};
 use crate::widgets::*;
@@ -31,6 +33,8 @@ const THUMB_CACHE_MAX: u64 = 1 << 30;
 #[derive(PartialEq, Clone, Copy)]
 enum Module {
     Library,
+    /// Bringing film in: strip scans, camera scanning, the whole roll.
+    Scan,
     Cull,
     Develop,
     Negative,
@@ -423,6 +427,7 @@ pub struct App {
     wipe: f32,
     wipe_tex: Option<(Params, TextureHandle)>,
     cull: CullState,
+    scan: ScanUi,
     ai_busy: bool,
     tx: mpsc::Sender<Msg>,
     rx: mpsc::Receiver<Msg>,
@@ -688,7 +693,7 @@ impl App {
             export: ExportOpts::load(), export_dialog: None, export_sel: vec![], export_sets: [false; 3], keymap: Keymap::load(), keys_open: false, colour: crate::colour::Settings::load(), printer: None, binding: None, picking_wb: false,
             thumb_due: false, lens_query: String::new(), lib_multi: vec![], pano_busy: false,
             watch: false, watch_open: true, watch_apply: false, watch_at: 0.0, watch_sizes: Default::default(), wipe: 0.5, wipe_tex: None,
-            cull: Default::default(), ai_busy: false, tx, rx, roll: Default::default(), roll_dir: None,
+            cull: Default::default(), scan: ScanUi::default(), ai_busy: false, tx, rx, roll: Default::default(), roll_dir: None,
             search: Default::default(), search_gen: 0, search_busy: false, collections: crate::library::load(), collection: None, new_coll: None, kw_text: String::new(),
         }
     }
@@ -2573,7 +2578,7 @@ impl App {
             ui.label(RichText::new("ferrotype").family(display()).size(17.0).color(BONE).extra_letter_spacing(0.3));
             ui.add_space(18.0);
             ui.spacing_mut().item_spacing.x = 2.0;
-            for (m, name) in [(Module::Library, "Library"), (Module::Cull, "Cull"), (Module::Develop, "Develop"), (Module::Negative, "Negative")] {
+            for (m, name) in [(Module::Library, "Library"), (Module::Scan, "Scan"), (Module::Cull, "Cull"), (Module::Develop, "Develop"), (Module::Negative, "Negative")] {
                 if tab(ui, name, self.module == m).clicked() {
                     self.module = m;
                     self.tool = Tool::None;
@@ -5248,6 +5253,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll(&ctx);
+        self.scan_poll(&ctx);
         self.watch_folder(&ctx);
         self.shortcuts(&ctx);
         if let Some(f) = ctx.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf())) {
@@ -5265,6 +5271,7 @@ impl eframe::App for App {
                     egui::CentralPanel::default().frame(egui::Frame::new().fill(CANVAS)).show(ui, |ui| self.cull_view(ui));
                 });
             }
+            Module::Scan => self.scan_module(ui),
             Module::Library => {
                 egui::Panel::left("lib_left").exact_size(260.0).resizable(false).frame(pad(PANEL, 12, 16)).show(ui, |ui| self.library_left(ui));
                 egui::Panel::right("lib_right").exact_size(320.0).resizable(false).frame(pad(PANEL, 16, 16)).show(ui, |ui| {
