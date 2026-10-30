@@ -39,31 +39,30 @@ pub fn develop(raw: &RawImage) -> Option<Rgb32FImage> {
     let data = r.data.as_f32();
     let (w, h) = (r.width, r.height);
     let cfa = &config.cfa;
-    let colour_at = |y: usize, x: usize| cfa.color_at(y, x) as u8;
-    let pattern: Vec<u8> = (0..h * w).map(|i| colour_at(i / w, i % w)).collect();
+    // The pattern repeats every cfa.width × cfa.height pixels: build one tile and repeat it row by row.
+    let (tw, th) = (cfa.width.max(1), cfa.height.max(1));
+    let tile: Vec<u8> = (0..th * tw).map(|k| cfa.color_at(k / tw, k % tw) as u8).collect();
+    let mut pattern = vec![0u8; w * h];
+    pattern.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        let t = &tile[(y % th) * tw..][..tw];
+        row.iter_mut().enumerate().for_each(|(x, v)| *v = t[x % tw]);
+    });
     let planes = match sensor {
         Sensor::Bayer => rcd(&data, &pattern, w, h),
         Sensor::XTrans => xtrans(&data, &pattern, w, h),
     };
-    let rgb = to_srgb(raw, &planes, w * h)?;
-    // Active area (the sensor's usable part), then the camera's default crop inside it.
-    let mut img = Rgb32FImage::from_raw(w as u32, h as u32, rgb)?;
-    let active = raw.active_area.unwrap_or(rawler::imgop::Rect::new(rawler::imgop::Point::new(0, 0), rawler::imgop::Dim2::new(w, h)));
-    let mut crop = active;
-    if let Some(c) = raw.crop_area {
-        crop = c;
-    }
+    // Active area (the sensor's usable part), then the camera's default crop inside it: converted straight into
+    // the cropped picture, so the full frame is never copied once more.
+    let crop = raw.crop_area.or(raw.active_area).unwrap_or(rawler::imgop::Rect::new(rawler::imgop::Point::new(0, 0), rawler::imgop::Dim2::new(w, h)));
     let (cx, cy) = (crop.p.x.min(w.saturating_sub(1)), crop.p.y.min(h.saturating_sub(1)));
     let (cw, ch) = (crop.d.w.min(w - cx).max(1), crop.d.h.min(h - cy).max(1));
-    if (cx, cy, cw, ch) != (0, 0, w, h) {
-        img = image::imageops::crop_imm(&img, cx as u32, cy as u32, cw as u32, ch as u32).to_image();
-    }
-    Some(img)
+    let rgb = to_srgb(raw, &planes, w, (cx, cy, cw, ch))?;
+    Rgb32FImage::from_raw(cw as u32, ch as u32, rgb)
 }
 
 /// White balance (the camera's as-shot), then camera RGB → linear sRGB with the camera's D65 matrix, as rawler
 /// does, but keeping negative channels (colours sRGB can't show).
-fn to_srgb(raw: &RawImage, planes: &[Vec<f32>; 3], n: usize) -> Option<Vec<f32>> {
+fn to_srgb(raw: &RawImage, planes: &[Vec<f32>; 3], w: usize, (cx, cy, cw, ch): (usize, usize, usize, usize)) -> Option<Vec<f32>> {
     use rawler::imgop::matrix::{multiply, normalize, pseudo_inverse, transform_1d};
     use rawler::imgop::xyz::{Illuminant, SRGB_TO_XYZ_D65};
     let (illu, m) = raw.color_matrix_find_first([Illuminant::D65, Illuminant::A, Illuminant::B, Illuminant::C, Illuminant::D50, Illuminant::D55, Illuminant::D75, Illuminant::Daylight, Illuminant::Flash])?;
@@ -77,8 +76,9 @@ fn to_srgb(raw: &RawImage, planes: &[Vec<f32>; 3], n: usize) -> Option<Vec<f32>>
     let rgb2cam = normalize(multiply(&xyz2cam, &SRGB_TO_XYZ_D65));
     let cam2rgb = pseudo_inverse(rgb2cam);
     let wb = if raw.wb_coeffs[0].is_nan() { [1.0; 4] } else { raw.wb_coeffs };
-    let mut out = vec![0f32; n * 3];
-    out.par_chunks_mut(3).enumerate().for_each(|(i, px)| {
+    let mut out = vec![0f32; cw * ch * 3];
+    out.par_chunks_mut(cw * 3).enumerate().for_each(|(y, row)| for (x, px) in row.chunks_exact_mut(3).enumerate() {
+        let i = (cy + y) * w + cx + x;
         let c = [planes[0][i] * wb[0], planes[1][i] * wb[1], planes[2][i] * wb[2]];
         let mut s = [0, 1, 2].map(|k| cam2rgb[k][0] * c[0] + cam2rgb[k][1] * c[1] + cam2rgb[k][2] * c[2]);
         let max = s[0].max(s[1]).max(s[2]);
@@ -104,15 +104,16 @@ fn bilinear(cfa: &[f32], pattern: &[u8], w: usize, h: usize, radius: usize) -> [
 /// sample is filled in: the caller computes the rest).
 fn bilinear_edges(cfa: &[f32], pattern: &[u8], w: usize, h: usize, radius: usize, edge: Option<usize>) -> [Vec<f32>; 3] {
     let mut out = [vec![0f32; w * h], vec![0f32; w * h], vec![0f32; w * h]];
-    let rows: Vec<Vec<[f32; 3]>> = (0..h).into_par_iter().map(|y| {
-        (0..w).map(|x| {
+    let [rp, gp, bp] = &mut out;
+    rp.par_chunks_mut(w).zip(gp.par_chunks_mut(w)).zip(bp.par_chunks_mut(w)).enumerate().for_each(|(y, ((rr, gg), bb))| {
+        let rows = [rr, gg, bb];
+        for x in 0..w {
             let i = y * w + x;
             if let Some(e) = edge
                 && y >= e && x >= e && y + e < h && x + e < w
             {
-                let mut v = [0f32; 3];
-                v[pattern[i] as usize] = cfa[i];
-                return v;
+                rows[pattern[i] as usize][x] = cfa[i];
+                continue;
             }
             let mut sum = [0f32; 3];
             let mut cnt = [0f32; 3];
@@ -130,18 +131,11 @@ fn bilinear_edges(cfa: &[f32], pattern: &[u8], w: usize, h: usize, radius: usize
                     cnt[c] += wt;
                 }
             }
-            let mut v = [0, 1, 2].map(|c| if cnt[c] > 0.0 { sum[c] / cnt[c] } else { 0.0 });
-            v[pattern[i] as usize] = cfa[i];
-            v
-        }).collect()
-    }).collect();
-    for (y, row) in rows.into_iter().enumerate() {
-        for (x, v) in row.into_iter().enumerate() {
             for c in 0..3 {
-                out[c][y * w + x] = v[c];
+                rows[c][x] = if c == pattern[i] as usize { cfa[i] } else if cnt[c] > 0.0 { sum[c] / cnt[c] } else { 0.0 };
             }
         }
-    }
+    });
     out
 }
 
@@ -242,6 +236,9 @@ pub fn rcd(cfa: &[f32], pattern: &[u8], w: usize, h: usize) -> [Vec<f32>; 3] {
         }
         for x in 3..w - 3 {
             let i = y * w + x;
+            if green(i) {
+                continue; // only read at red and blue sites (and their diagonal neighbours, also red or blue)
+            }
             let c = cfa[i];
             p[x] = sq((at(i, -w3 - 3) - at(i, -w1 - 1) - at(i, w1 + 1) + at(i, w3 + 3)) - 3.0 * (at(i, -w2 - 2) + at(i, w2 + 2)) + 6.0 * c);
             q[x] = sq((at(i, -w3 + 3) - at(i, -w1 + 1) - at(i, w1 - 1) + at(i, w3 - 3)) - 3.0 * (at(i, -w2 + 2) + at(i, w2 - 2)) + 6.0 * c);
@@ -262,8 +259,7 @@ pub fn rcd(cfa: &[f32], pattern: &[u8], w: usize, h: usize) -> [Vec<f32>; 3] {
     drop((p_hpf, q_hpf));
 
     // Step 4.2: the missing one of red and blue at blue and red sites (diagonal colour differences). Reads the
-    // other colour's own samples on the diagonals, so it works from copies and writes in place.
-    let (r_src, b_src) = (rgb[0].clone(), rgb[2].clone());
+    // other colour's own raw samples on the diagonals, so it writes in place.
     {
         let [rp, gp, bp] = &mut rgb;
         let g = &*gp;
@@ -277,7 +273,8 @@ pub fn rcd(cfa: &[f32], pattern: &[u8], w: usize, h: usize) -> [Vec<f32>; 3] {
                     continue;
                 }
                 let c = 2 - pattern[i] as usize;
-                let rc = if c == 0 { &r_src } else { &b_src };
+                // Every place read below is a site of colour `c` itself, so its value is the raw sample.
+                let rc = cfa;
                 let central = pq[i];
                 let neigh = 0.25 * (pq[i - w - 1] + pq[i - w + 1] + pq[i + w - 1] + pq[i + w + 1]);
                 let disc = if (0.5 - central).abs() < (0.5 - neigh).abs() { neigh } else { central };
@@ -297,7 +294,7 @@ pub fn rcd(cfa: &[f32], pattern: &[u8], w: usize, h: usize) -> [Vec<f32>; 3] {
             }
         });
     }
-    drop((r_src, b_src, pq));
+    drop(pq);
 
     // Step 4.3: red and blue at green sites, from their now complete red and blue neighbours.
     let (r_src, b_src) = (rgb[0].clone(), rgb[2].clone());

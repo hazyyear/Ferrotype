@@ -704,14 +704,7 @@ impl App {
         // `ferrotype photo.jpg` has an empty parent: that means the current folder.
         let (dir, file) = if path.is_dir() { (path.to_path_buf(), None) } else { (path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")).to_path_buf(), Some(path.to_path_buf())) };
         let entries: Vec<PathBuf> = std::fs::read_dir(&dir).into_iter().flatten().flatten().map(|e| e.path()).collect();
-        let mut files: Vec<PathBuf> = entries.iter().filter(|p| p.is_file() && load::is_supported(p)).cloned().collect();
-        // Virtual copies: `IMG.NEF.copy2.ferrotype.json` next to `IMG.NEF`.
-        let copies: Vec<PathBuf> = entries.iter().filter_map(|e| {
-            let v = PathBuf::from(e.to_str()?.strip_suffix(".ferrotype.json")?);
-            load::copy_of(&v).filter(|o| files.contains(o)).map(|_| v)
-        }).collect();
-        files.extend(copies);
-        load::sort_photos(&mut files);
+        let files = crate::photos_in(&entries);
         self.subdirs = entries.into_iter().filter(|p| p.is_dir() && !p.file_name().unwrap_or_default().to_string_lossy().starts_with('.')).collect();
         self.subdirs.sort();
         self.collection = None;
@@ -916,11 +909,14 @@ impl App {
                 return; // another frame was chosen while this one waited
             }
             // A finished AI denoise is read back from its cache rather than run again.
-            let r = load::load(&path).map(|full| {
+            // The camera's JPEG (for its tone curve) is read while the RAW decodes.
+            let raw_photo = load::is_raw_photo(&path);
+            let (r, jpg) = rayon::join(|| load::load(&path), || if raw_photo { load::camera_jpeg_lumas(&path) } else { None });
+            let r = r.map(|full| {
                 let delta = if nr { denoise::cached_delta(&path, full.len()) } else { None };
                 let preview = load::fit(&full, PREVIEW);
                 let draft = load::fit(&preview, DRAFT);
-                let cam = if load::is_raw_photo(&path) { load::camera_curve(&path, &full) } else { vec![] };
+                let cam = load::camera_curve_from(&full, jpg);
                 // "Before" is the photo as the camera rendered it: with its tone curve, without edits.
                 let mut shown = preview.clone();
                 develop::apply_cam_curve(&mut shown, &cam);
@@ -1475,7 +1471,8 @@ impl App {
         self.commit();
         // Each photo with the folder it goes into: subfolders mirrored when asked for.
         let jobs: Vec<(PathBuf, PathBuf)> = match (&self.folder, self.export_sel.is_empty() && self.export.tree) {
-            (Some(src), true) => crate::photos_under(src).into_iter().map(|(rel, f)| (dir.join(rel), f)).collect(),
+            // Rejected frames stay out, as they do from every other export.
+            (Some(src), true) => crate::photos_under(src).into_iter().filter(|(_, f)| read_params(f).is_none_or(|p| p.flag >= 0)).map(|(rel, f)| (dir.join(rel), f)).collect(),
             _ => self.print_frames().into_iter().map(|f| (dir.clone(), f)).collect(),
         };
         let files: Vec<PathBuf> = jobs.iter().map(|j| j.1.clone()).collect();
@@ -1506,17 +1503,20 @@ impl App {
             let total = files.len() * sets.len();
             let mut failed = 0;
             let mut done = 0;
-            for (name, canvas, long, q) in &sets {
+            let targets: Vec<Option<(PathBuf, ExportOpts)>> = sets.iter().map(|(name, canvas, long, q)| {
                 let sub = dir.join(name.to_lowercase());
-                if std::fs::create_dir_all(&sub).is_err() {
-                    failed += files.len();
-                    continue;
-                }
-                let o = ExportOpts { ext: "jpg", hdr: false, canvas: *canvas, long_edge: *long, quality: *q, print: [0.0, 0.0, 300.0], ..base.clone() };
-                for (i, f) in files.iter().enumerate() {
-                    if export_file(f, &sub, &o, i + 1, |_| {}).is_err() {
-                        failed += 1;
-                    }
+                std::fs::create_dir_all(&sub).ok()?;
+                Some((sub, ExportOpts { ext: "jpg", hdr: false, canvas: *canvas, long_edge: *long, quality: *q, print: [0.0, 0.0, 300.0], ..base.clone() }))
+            }).collect();
+            // Photo by photo, each decoded once for all its sets (it was decoded again for every set).
+            for (i, f) in files.iter().enumerate() {
+                let src = crate::export_source(f, |_| {});
+                for t in &targets {
+                    let ok = match (t, &src) {
+                        (Some((sub, o)), Ok(src)) => crate::export_prepared(f, src, sub, o, i + 1).is_ok(),
+                        _ => false,
+                    };
+                    failed += !ok as usize;
                     done += 1;
                     let _ = tx.send(Msg::Status(format!("Printed {done}/{total}")));
                 }
