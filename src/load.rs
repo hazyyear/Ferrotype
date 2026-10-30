@@ -1,5 +1,5 @@
 //! Decoding: RAW via rawler, everything else via the `image` crate. Output is linear sRGB-primaries f32.
-use image::{DynamicImage, ImageDecoder, ImageReader, Rgb32FImage, imageops::FilterType, metadata::Orientation};
+use image::{DynamicImage, ImageDecoder, ImageReader, Rgb32FImage, metadata::Orientation};
 use rawler::{decoders::RawDecodeParams, imgop::develop::{ProcessingStep, RawDevelop}, rawsource::RawSource};
 use std::path::Path;
 
@@ -59,14 +59,14 @@ fn load_raw(path: &Path) -> Result<Rgb32FImage, String> {
     if let Some(img) = crate::demosaic::develop(&raw) {
         let mut img = DynamicImage::ImageRgb32F(img);
         img.apply_orientation(orient);
-        return Ok(img.to_rgb32f());
+        return Ok(img.into_rgb32f());
     }
     // Default steps minus the sRGB gamma: we want linear data.
     let steps: Vec<_> = RawDevelop::default().steps.into_iter().filter(|s| *s != ProcessingStep::SRgb).collect();
     let img = RawDevelop::new_with(&steps).develop_intermediate(&raw).map_err(|e| e.to_string())?;
     let mut img = img.to_dynamic_image().ok_or("unsupported raw layout")?;
     img.apply_orientation(orient);
-    Ok(img.to_rgb32f())
+    Ok(img.into_rgb32f())
 }
 
 fn load_other(path: &Path, linearize: bool) -> Result<Rgb32FImage, String> {
@@ -85,7 +85,7 @@ fn load_other(path: &Path, linearize: bool) -> Result<Rgb32FImage, String> {
     let hdr = matches!(img, DynamicImage::ImageRgb32F(_) | DynamicImage::ImageRgba32F(_));
     let eight_bit = matches!(img, DynamicImage::ImageRgb8(_) | DynamicImage::ImageRgba8(_) | DynamicImage::ImageLuma8(_) | DynamicImage::ImageLumaA8(_));
     let grey = matches!(img, DynamicImage::ImageLuma8(_) | DynamicImage::ImageLumaA8(_) | DynamicImage::ImageLuma16(_) | DynamicImage::ImageLumaA16(_));
-    let mut out = img.to_rgb32f();
+    let mut out = img.into_rgb32f();
     if linearize && !hdr {
         // An embedded profile says how to read the values (a scanner's own, Adobe RGB, ProPhoto, a linear one);
         // an untagged raw scan is linear already; everything else is taken as sRGB.
@@ -149,12 +149,23 @@ pub fn load_quick_toned(path: &Path, size: u32) -> Result<(Rgb32FImage, bool), S
 /// linear JPEG brightness) at the same quantiles, as RawTherapee's auto-matched curve does. With it an unedited
 /// RAW looks like the camera's picture instead of flat linear data. Empty without a preview of 640 px or more.
 pub fn camera_curve(path: &Path, linear: &Rgb32FImage) -> Vec<[f32; 2]> {
+    camera_curve_from(linear, camera_jpeg_lumas(path))
+}
+
+/// The camera's own rendering of a RAW (its embedded JPEG) as linear brightness samples, for `camera_curve_from`.
+/// It doesn't need the RAW decode, so opening a photo runs it alongside (it took a fifth of the time to open).
+pub fn camera_jpeg_lumas(path: &Path) -> Option<Vec<f32>> {
     let real = copy_of(path);
     let path = real.as_deref().unwrap_or(path);
-    let Some(prev) = embedded_preview(path).filter(|i| i.width().max(i.height()) >= 640) else { return vec![] };
+    let prev = embedded_preview(path).filter(|i| i.width().max(i.height()) >= 640)?;
     let mut pv = prev.thumbnail(1024, 1024).to_rgb32f();
     linearize_srgb(&mut pv, false);
-    match_curve(lumas(linear), lumas(&pv))
+    Some(lumas(&pv))
+}
+
+/// `camera_curve` with the JPEG's samples already read.
+pub fn camera_curve_from(linear: &Rgb32FImage, jpg: Option<Vec<f32>>) -> Vec<[f32; 2]> {
+    jpg.map_or_else(Vec::new, |j| match_curve(lumas(linear), j))
 }
 
 fn lumas(img: &Rgb32FImage) -> Vec<f32> {
@@ -194,7 +205,51 @@ pub fn fit(img: &Rgb32FImage, size: u32) -> Rgb32FImage {
         return img.clone();
     }
     let s = size as f32 / w.max(h) as f32;
-    image::imageops::resize(img, ((w as f32 * s) as u32).max(1), ((h as f32 * s) as u32).max(1), FilterType::Triangle)
+    shrink(img, ((w as f32 * s) as u32).max(1), ((h as f32 * s) as u32).max(1))
+}
+
+/// Downscale with the same triangle filter as `image::imageops::resize(.., FilterType::Triangle)`, on every core
+/// (that one runs on one: a 12 MP RAW took about 200 ms to make its 1400 px preview).
+fn shrink(img: &Rgb32FImage, nw: u32, nh: u32) -> Rgb32FImage {
+    use rayon::prelude::*;
+    let (w, h) = img.dimensions();
+    // For each output pixel along one axis: the first source pixel it reads and the weights from there.
+    let taps = |src: u32, dst: u32| -> Vec<(usize, Vec<f32>)> {
+        let ratio = src as f32 / dst as f32;
+        let sratio = ratio.max(1.0);
+        (0..dst).map(|o| {
+            let centre = (o as f32 + 0.5) * ratio;
+            let left = ((centre - sratio).floor().max(0.0) as usize).min(src as usize - 1);
+            let right = ((centre + sratio).ceil() as usize).clamp(left + 1, src as usize);
+            let ws: Vec<f32> = (left..right).map(|i| (1.0 - ((i as f32 - (centre - 0.5)) / sratio).abs()).max(0.0)).collect();
+            let sum: f32 = ws.iter().sum();
+            (left, ws.into_iter().map(|v| if sum > 0.0 { v / sum } else { 0.0 }).collect())
+        }).collect()
+    };
+    let (tx, ty) = (taps(w, nw), taps(h, nh));
+    let (w, nw) = (w as usize, nw as usize);
+    let src = img.as_raw();
+    // Across first (each row on its own), then down (each output row from a few of those).
+    let mut across = vec![0f32; nw * h as usize * 3];
+    across.par_chunks_mut(nw * 3).enumerate().for_each(|(y, row)| {
+        let line = &src[y * w * 3..][..w * 3];
+        for (px, (left, ws)) in row.chunks_exact_mut(3).zip(&tx) {
+            let mut acc = [0f32; 3];
+            for (k, wt) in ws.iter().enumerate() {
+                let p = &line[(left + k) * 3..][..3];
+                acc = [acc[0] + p[0] * wt, acc[1] + p[1] * wt, acc[2] + p[2] * wt];
+            }
+            px.copy_from_slice(&acc);
+        }
+    });
+    let mut out = vec![0f32; nw * nh as usize * 3];
+    out.par_chunks_mut(nw * 3).zip(&ty).for_each(|(row, (top, ws))| {
+        for (k, wt) in ws.iter().enumerate() {
+            let line = &across[(top + k) * nw * 3..][..nw * 3];
+            row.iter_mut().zip(line).for_each(|(o, v)| *o += v * wt);
+        }
+    });
+    Rgb32FImage::from_raw(nw as u32, nh, out).expect("size matches")
 }
 
 /// sRGB-encoded to linear, in place and on every core. 8-bit sources only have 256 values, so they use a table
@@ -287,6 +342,17 @@ pub fn raw_stats(path: &Path) -> Option<RawStats> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shrink_matches_the_image_crate() {
+        let img = Rgb32FImage::from_fn(997, 613, |x, y| image::Rgb([(x as f32 * 0.37).sin().abs(), (y % 7) as f32 / 7.0, ((x ^ y) % 13) as f32 / 13.0]));
+        for (nw, nh) in [(400, 246), (100, 61), (996, 612), (1, 1)] {
+            let ours = shrink(&img, nw, nh);
+            let theirs = image::imageops::resize(&img, nw, nh, image::imageops::FilterType::Triangle);
+            let worst = ours.as_raw().iter().zip(theirs.as_raw()).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            assert!(worst < 1e-4, "{nw}x{nh}: {worst}");
+        }
+    }
 
     #[test]
     fn copies_sort_in_number_order_after_their_photo() {

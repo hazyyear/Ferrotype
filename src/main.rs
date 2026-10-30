@@ -169,32 +169,38 @@ pub fn write_params(path: &Path, p: &Params) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Move rejected photos into `dest` (`_rejects`) with their edits and RAW `.xmp`. Never replaces a file already
-/// there: a second `DSC_0001.NEF` lands as `DSC_0001-2.NEF`, its sidecars renamed to match. Returns photos moved.
+/// Move rejected photos into `dest` (`_rejects`) with their edits, RAW `.xmp` and virtual copies. Never replaces a
+/// file already there: a second `DSC_0001.NEF` lands as `DSC_0001-2.NEF`, its sidecars renamed to match. A virtual
+/// copy is only shown next to its photo, so a rejected copy whose photo isn't moving stays where it is (still
+/// marked rejected). Returns photos moved.
 pub fn move_to_rejects(dest: &Path, files: &[PathBuf]) -> std::io::Result<usize> {
     std::fs::create_dir_all(dest)?;
     let free = |p: &Path| !p.exists() && !sidecar(p).exists();
+    let mut listings: std::collections::HashMap<PathBuf, Vec<String>> = Default::default();
     let mut moved = 0;
-    for f in files {
+    for f in files.iter().filter(|f| load::copy_of(f).is_none()) {
         let name = f.file_name().unwrap_or_default().to_string_lossy().to_string();
-        let to = match load::copy_of(f) {
-            // A virtual copy is only its settings file: give it a copy number no other copy there uses.
-            Some(orig) => {
-                let base = orig.file_name().unwrap_or_default().to_string_lossy().to_string();
-                (2..).map(|k| dest.join(format!("{base}.copy{k}"))).find(|p| free(p)).unwrap()
+        let (stem, ext) = (f.file_stem().unwrap_or_default().to_string_lossy().to_string(), f.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default());
+        let to = std::iter::once(dest.join(&name)).chain((2..).map(|k| dest.join(format!("{stem}-{k}{ext}")))).find(|p| free(p) && (xmp_path(p).as_os_str().is_empty() || !xmp_path(p).exists())).unwrap();
+        let mut parts = vec![(f.clone(), to.clone()), (sidecar(f), sidecar(&to))];
+        let x = xmp_path(f);
+        if !x.as_os_str().is_empty() {
+            parts.push((x, xmp_path(&to)));
+        }
+        // Its virtual copies (`<name>.copyN.ferrotype.json`) go with it, under its new name.
+        let dir = f.parent().unwrap_or(Path::new("")).to_path_buf();
+        let listing = listings.entry(dir.clone()).or_insert_with(|| {
+            std::fs::read_dir(if dir.as_os_str().is_empty() { Path::new(".") } else { &dir }).into_iter().flatten().flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect()
+        });
+        let to_name = to.file_name().unwrap_or_default().to_string_lossy().to_string();
+        for entry in listing.iter() {
+            let Some(copy) = entry.strip_suffix(".ferrotype.json").map(|c| dir.join(c)) else { continue };
+            if load::copy_of(&copy).as_deref() != Some(f.as_path()) {
+                continue;
             }
-            None => {
-                let (stem, ext) = (f.file_stem().unwrap_or_default().to_string_lossy().to_string(), f.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default());
-                std::iter::once(dest.join(&name)).chain((2..).map(|k| dest.join(format!("{stem}-{k}{ext}")))).find(|p| free(p) && (xmp_path(p).as_os_str().is_empty() || !xmp_path(p).exists())).unwrap()
-            }
-        };
-        let mut parts = vec![(sidecar(f), sidecar(&to))];
-        if load::copy_of(f).is_none() {
-            parts.insert(0, (f.clone(), to.clone()));
-            let x = xmp_path(f);
-            if !x.as_os_str().is_empty() {
-                parts.push((x, xmp_path(&to)));
-            }
+            let n = copy.file_name().and_then(|c| c.to_str()).and_then(|c| c.rsplit_once(".copy")).map_or("2", |(_, n)| n).to_string();
+            let target = std::iter::once(n.clone()).chain((2..).map(|k| k.to_string())).map(|k| dest.join(format!("{to_name}.copy{k}"))).find(|p| free(p)).unwrap();
+            parts.push((sidecar(&copy), sidecar(&target)));
         }
         let mut any = false;
         for (a, b) in parts.into_iter().filter(|(a, _)| a.exists()) {
@@ -443,6 +449,12 @@ pub fn export_stem(path: &Path) -> String {
 
 /// Render one file with its sidecar edits. `n` is its number in the batch (for `{n}` in the name pattern).
 pub fn export_file(path: &Path, out_dir: &Path, o: &ExportOpts, n: usize, overrides: impl Fn(&mut Params)) -> Result<PathBuf, String> {
+    export_prepared(path, &export_source(path, overrides)?, out_dir, o, n)
+}
+
+/// A photo ready to export: its edits, and its picture after infrared clean and AI denoise. Several exports of one
+/// photo (export sets) share it rather than decoding the RAW again for each.
+pub fn export_source(path: &Path, overrides: impl Fn(&mut Params)) -> Result<(Params, Rgb32FImage), String> {
     // A damaged edits file would otherwise print the frame unedited, which looks like a success.
     if sidecar_damaged(path) {
         return Err("its edits file is damaged, so it was not printed unedited (open it in the app to start fresh)".into());
@@ -456,41 +468,51 @@ pub fn export_file(path: &Path, out_dir: &Path, o: &ExportOpts, n: usize, overri
     }
     let raw = scan::prepare_ir(raw, path, &p);
     let img = denoise::prepare(raw, path, &p)?;
-    if let Some(m) = o.upright {
-        p = upright::apply(&img, &p, m);
-    }
+    Ok((p, img))
+}
+
+/// Write one export of a prepared photo (see `export_source`) into `out_dir`.
+pub fn export_prepared(path: &Path, (p, img): &(Params, Rgb32FImage), out_dir: &Path, o: &ExportOpts, n: usize) -> Result<PathBuf, String> {
+    let p = match o.upright {
+        Some(m) => upright::apply(img, p, m),
+        None => p.clone(),
+    };
     let shot = if !o.name.trim().is_empty() && o.name != "{name}" { export_shot(path) } else { Default::default() };
     // {roll}: the one given for this export, else the folder's roll notes.
     let roll = if o.roll.trim().is_empty() { roll::for_photo(path).map(|r| r.0.roll).unwrap_or_default() } else { o.roll.clone() };
     let out = claim_output(out_dir, &output::file_name(&o.name, path, n, &roll, &p, &shot), o.ext)?;
-    write_export(&img, &p, o, &out, path).inspect_err(|_| {
+    write_export(img, &p, o, &out, path).inspect_err(|_| {
         let _ = std::fs::remove_file(&out);
     })?;
     Ok(out)
 }
 
-/// Every photo in `dir` and its subfolders, with the subfolder it's in (relative to `dir`). Hidden folders and
-/// `_rejects` are left out.
+/// The photos among one folder's `entries`, with their virtual copies (`IMG.NEF.copy2`, kept only as
+/// `IMG.NEF.copy2.ferrotype.json`; the Scan tab makes a strip's frames this way), in library order.
+pub fn photos_in(entries: &[PathBuf]) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = entries.iter().filter(|p| load::is_supported(p) && p.is_file()).cloned().collect();
+    let real: std::collections::HashSet<&Path> = files.iter().map(PathBuf::as_path).collect();
+    let copies: Vec<PathBuf> = entries.iter().filter_map(|e| {
+        let v = PathBuf::from(e.to_str()?.strip_suffix(".ferrotype.json")?);
+        load::copy_of(&v).is_some_and(|o| real.contains(o.as_path())).then_some(v)
+    }).collect();
+    files.extend(copies);
+    load::sort_photos(&mut files);
+    files
+}
+
+/// Every photo (and virtual copy) in `dir` and its subfolders, with the subfolder it's in (relative to `dir`).
+/// Hidden folders and `_rejects` are left out.
 pub fn photos_under(dir: &Path) -> Vec<(PathBuf, PathBuf)> {
     let mut out = vec![];
     let mut stack = vec![PathBuf::new()];
     while let Some(rel) = stack.pop() {
         let Ok(rd) = std::fs::read_dir(dir.join(&rel)) else { continue };
-        let mut entries: Vec<_> = rd.flatten().map(|e| e.path()).collect();
-        entries.sort();
-        for p in entries {
-            let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
-            if name.starts_with('.') {
-                continue;
-            }
-            if p.is_dir() {
-                if name != "_rejects" {
-                    stack.push(rel.join(&name));
-                }
-            } else if load::is_supported(&p) {
-                out.push((rel.clone(), p));
-            }
-        }
+        let entries: Vec<_> = rd.flatten().map(|e| e.path()).filter(|p| !p.file_name().unwrap_or_default().to_string_lossy().starts_with('.')).collect();
+        let mut subdirs: Vec<&PathBuf> = entries.iter().filter(|p| p.is_dir() && p.file_name().is_some_and(|n| n != "_rejects")).collect();
+        subdirs.sort();
+        stack.extend(subdirs.into_iter().rev().map(|p| rel.join(p.file_name().unwrap_or_default())));
+        out.extend(photos_in(&entries).into_iter().map(|p| (rel.clone(), p)));
     }
     out
 }
@@ -704,6 +726,32 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dest.join("D.NEF")).unwrap(), "first card");
         assert_eq!(std::fs::read_to_string(dest.join("D-2.NEF")).unwrap(), "second card");
         assert!(dest.join("D-2.NEF.ferrotype.json").exists() && dest.join("D-2.xmp").exists() && !photo.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rejects_take_their_copies_and_leave_lone_copies_visible() {
+        let dir = std::env::temp_dir().join(format!("ferrotype-rejc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dest = dir.join("_rejects");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("s.tif"), "older s.tif").unwrap();
+        for f in ["s.tif", "keep.tif"] {
+            std::fs::write(dir.join(f), f).unwrap();
+        }
+        for c in ["s.tif.copy2", "s.tif.copy3", "keep.tif.copy2"] {
+            write_params(&dir.join(c), &Params { flag: -1, ..Default::default() }).unwrap();
+        }
+        // The scan and one of its frames are rejected; a frame of another scan is rejected on its own.
+        let rejects = [dir.join("s.tif"), dir.join("s.tif.copy2"), dir.join("keep.tif.copy2")];
+        assert_eq!(move_to_rejects(&dest, &rejects).unwrap(), 1);
+        // Both of the scan's frames went with it, under its new name; the lone copy stayed next to its photo.
+        let in_rejects: Vec<PathBuf> = photos_in(&std::fs::read_dir(&dest).unwrap().flatten().map(|e| e.path()).collect::<Vec<_>>());
+        assert_eq!(in_rejects, ["s-2.tif", "s-2.tif.copy2", "s-2.tif.copy3", "s.tif"].map(|n| dest.join(n)));
+        let left: Vec<PathBuf> = photos_in(&std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()).collect::<Vec<_>>());
+        assert_eq!(left, [dir.join("keep.tif"), dir.join("keep.tif.copy2")]);
+        // A folder export of the tree sees the frames too.
+        assert_eq!(photos_under(&dir).len(), 2);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
