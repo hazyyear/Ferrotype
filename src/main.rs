@@ -17,6 +17,7 @@ mod hdrmerge;
 mod gpu;
 mod calib;
 mod upright;
+mod roll;
 
 use develop::Params;
 use image::{DynamicImage, Rgb32FImage, codecs::jpeg::JpegEncoder};
@@ -308,54 +309,83 @@ fn render_export_with(full: &Rgb32FImage, p: &Params, o: &ExportOpts, render: im
     out
 }
 
+/// Camera and lens details of `src` for an export, with the folder's roll notes filling in what a film scan
+/// lacks (camera, lens, speed, date, and the frame's aperture, shutter and focal length).
+pub fn export_shot(src: &Path) -> lens::Shot {
+    let mut s = lens::shot(src).unwrap_or_default();
+    roll::fill_shot(src, &mut s);
+    s
+}
+
+/// The one-line description written with the camera details: roll, film stock (and push), developer, frame note.
+pub fn export_description(p: &Params, o: &ExportOpts, src: &Path) -> String {
+    match roll::for_photo(src) {
+        Some((mut r, f)) => {
+            if !o.roll.trim().is_empty() {
+                r.roll = o.roll.trim().to_string();
+            }
+            if p.neg.enabled {
+                r.stock = p.neg.stock.clone();
+            }
+            [r.summary(), f.note.trim().to_string()].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ")
+        }
+        None => [(!o.roll.trim().is_empty()).then(|| format!("Roll {}", o.roll.trim())), output::stock_name(p)].into_iter().flatten().collect::<Vec<_>>().join(" · "),
+    }
+}
+
+/// What the export of `src` carries besides pixels: camera details when `o.meta` asks for them, print DPI.
+pub fn export_embed(p: &Params, o: &ExportOpts, src: &Path) -> output::Embed {
+    let mut e = output::Embed { dpi: (o.print[0] > 0.0 && o.canvas[0] == 0).then(|| o.print[2].round() as u16), ..Default::default() };
+    if o.meta {
+        let shot = export_shot(src);
+        let desc = export_description(p, o, src);
+        e.exif = output::exif_tiff(&shot, &desc);
+        e.xmp = output::xmp_packet(&shot, &desc, &[]);
+    }
+    e
+}
+
 /// Export one rendered photo to `out`, as an HDR gain-map JPEG when asked. `src` is the original file (for the
 /// camera and lens details written with `o.meta`).
 pub fn write_export(full: &Rgb32FImage, p: &Params, o: &ExportOpts, out: &Path, src: &Path) -> Result<(), String> {
-    // Camera details and print DPI go in every JPEG that asks for them, HDR or not.
-    let dpi = (o.print[0] > 0.0 && o.canvas[0] == 0).then(|| o.print[2].round() as u16);
-    let exif = if o.meta {
-        let shot = lens::shot(src).unwrap_or_default();
-        let desc = [(!o.roll.trim().is_empty()).then(|| format!("Roll {}", o.roll.trim())), output::stock_name(p)].into_iter().flatten().collect::<Vec<_>>().join(" · ");
-        output::exif_segment(&shot, &desc)
-    } else {
-        vec![]
-    };
+    let e = export_embed(p, o, src);
     if o.hdr && o.ext == "jpg" {
         let sdr = render_export(full, p, o);
         jpeg_fits(&sdr)?;
         let low = render_export(full, &Params { exposure: p.exposure - hdr::HEADROOM, ..p.clone() }, o);
-        let bytes = hdr::encode_ultrahdr(&sdr, &hdr::gain_map(&sdr, &low), o.quality.clamp(1, 100), &exif, dpi)?;
+        let segs = output::jpeg_segments(&output::Embed { xmp: String::new(), ..e.clone() });
+        let bytes = hdr::encode_ultrahdr(&sdr, &hdr::gain_map(&sdr, &low), o.quality.clamp(1, 100), &segs, e.dpi)?;
         return std::fs::write(out, bytes).map_err(|e| e.to_string());
     }
-    if o.ext == "jpg" && (!exif.is_empty() || dpi.is_some()) {
-        let img = render_export(full, p, o);
-        jpeg_fits(&img)?;
-        let mut bytes = vec![];
-        let mut enc = JpegEncoder::new_with_quality(&mut bytes, o.quality.clamp(1, 100));
-        if let Some(d) = dpi {
-            enc.set_pixel_density(image::codecs::jpeg::PixelDensity::dpi(d));
-        }
-        DynamicImage::ImageRgb32F(img).to_rgb8().write_with_encoder(enc).map_err(|e| e.to_string())?;
-        if !exif.is_empty() {
-            bytes = output::insert_segment(&bytes, &exif);
-        }
-        return std::fs::write(out, bytes).map_err(|e| e.to_string());
-    }
-    save_output(render_export(full, p, o), out, o.quality)
+    save_output_with(render_export(full, p, o), out, o.quality, &e)
 }
 
 /// Save a rendered (sRGB-encoded) image. `.tif` → 16-bit TIFF, `.png` → 8-bit PNG, anything else → JPEG.
 /// Nothing but pixels is written, so exports never carry the camera's GPS location or other metadata.
 pub fn save_output(img: Rgb32FImage, out: &Path, quality: u8) -> Result<(), String> {
+    save_output_with(img, out, quality, &output::Embed::default())
+}
+
+/// `save_output`, plus what `e` holds (camera details, colour profile, DPI) in whichever format it is.
+pub fn save_output_with(img: Rgb32FImage, out: &Path, quality: u8, e: &output::Embed) -> Result<(), String> {
     let ext = out.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     let dynimg = DynamicImage::ImageRgb32F(img);
     match ext.as_str() {
-        "tif" | "tiff" => dynimg.to_rgb16().save(out).map_err(|e| e.to_string()),
-        "png" => dynimg.to_rgb8().save(out).map_err(|e| e.to_string()),
+        "tif" | "tiff" => output::write_tiff(&dynimg.to_rgb16(), out, e),
+        "png" => output::write_png(&dynimg.to_rgb8(), out, e),
         _ => {
             jpeg_fits(dynimg.as_rgb32f().unwrap())?;
-            let f = std::fs::File::create(out).map_err(|e| e.to_string())?;
-            dynimg.to_rgb8().write_with_encoder(JpegEncoder::new_with_quality(std::io::BufWriter::new(f), quality.clamp(1, 100))).map_err(|e| e.to_string())
+            let mut bytes = vec![];
+            let mut enc = JpegEncoder::new_with_quality(&mut bytes, quality.clamp(1, 100));
+            if let Some(d) = e.dpi {
+                enc.set_pixel_density(image::codecs::jpeg::PixelDensity::dpi(d));
+            }
+            dynimg.to_rgb8().write_with_encoder(enc).map_err(|e| e.to_string())?;
+            let segs = output::jpeg_segments(e);
+            if !segs.is_empty() {
+                bytes = output::insert_segment(&bytes, &segs);
+            }
+            std::fs::write(out, bytes).map_err(|e| e.to_string())
         }
     }
 }
@@ -408,8 +438,10 @@ pub fn export_file(path: &Path, out_dir: &Path, o: &ExportOpts, n: usize, overri
     if let Some(m) = o.upright {
         p = upright::apply(&img, &p, m);
     }
-    let shot = if !o.name.trim().is_empty() && o.name != "{name}" { lens::shot(path).unwrap_or_default() } else { Default::default() };
-    let out = claim_output(out_dir, &output::file_name(&o.name, path, n, &o.roll, &p, &shot), o.ext)?;
+    let shot = if !o.name.trim().is_empty() && o.name != "{name}" { export_shot(path) } else { Default::default() };
+    // {roll}: the one given for this export, else the folder's roll notes.
+    let roll = if o.roll.trim().is_empty() { roll::for_photo(path).map(|r| r.0.roll).unwrap_or_default() } else { o.roll.clone() };
+    let out = claim_output(out_dir, &output::file_name(&o.name, path, n, &roll, &p, &shot), o.ext)?;
     write_export(&img, &p, o, &out, path).inspect_err(|_| {
         let _ = std::fs::remove_file(&out);
     })?;

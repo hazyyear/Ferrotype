@@ -273,6 +273,9 @@ struct Photo {
 
 pub struct App {
     module: Module,
+    /// Roll notes of the open folder (see `roll`), and which folder they were read from.
+    roll: crate::roll::Roll,
+    roll_dir: Option<PathBuf>,
     folder: Option<PathBuf>,
     files: Vec<PathBuf>,
     /// Thumbnail textures, at most THUMB_KEEP; the rest are reloaded from the disk cache when they come into view.
@@ -628,7 +631,7 @@ impl App {
             export: ExportOpts::load(), export_dialog: None, export_sel: vec![], export_sets: [false; 3], keymap: Keymap::load(), keys_open: false, binding: None, picking_wb: false,
             thumb_due: false, lens_query: String::new(), lib_multi: vec![], pano_busy: false,
             watch: false, watch_open: true, watch_apply: false, watch_at: 0.0, watch_sizes: Default::default(), wipe: 0.5, wipe_tex: None,
-            cull: Default::default(), ai_busy: false, tx, rx,
+            cull: Default::default(), ai_busy: false, tx, rx, roll: Default::default(), roll_dir: None,
         }
     }
 
@@ -1264,8 +1267,9 @@ impl App {
         let ext = self.export.ext;
         // A JPEG/PNG/TIFF source would be offered its own name: suggest "-edit" so one click can't replace it.
         let stem = if self.export.name.trim().is_empty() { stem } else {
-            let shot = crate::lens::shot(cur).unwrap_or_default();
-            crate::output::file_name(&self.export.name, cur, 1, &self.export.roll, &self.params, &shot)
+            let shot = crate::export_shot(cur);
+            let roll = if self.export.roll.trim().is_empty() { crate::roll::for_photo(cur).map(|r| r.0.roll).unwrap_or_default() } else { self.export.roll.clone() };
+            crate::output::file_name(&self.export.name, cur, 1, &roll, &self.params, &shot)
         };
         let name = if load::is_raw(load::copy_of(cur).as_deref().unwrap_or(cur)) || !self.export.name.trim().is_empty() { format!("{stem}.{ext}") } else { format!("{stem}-edit.{ext}") };
         let Some(mut out) = rfd::FileDialog::new().set_file_name(name).add_filter(ext.to_uppercase(), &[ext]).save_file() else { return };
@@ -3230,6 +3234,138 @@ impl App {
         });
     }
 
+    /// Roll notes for the open folder, and the selected frame's own notes. Saved as they are typed.
+    fn roll_panel(&mut self, ui: &mut Ui) {
+        let Some(dir) = self.folder.clone() else { return };
+        if self.roll_dir.as_ref() != Some(&dir) {
+            self.roll = crate::roll::read(&dir).unwrap_or_default();
+            self.roll_dir = Some(dir.clone());
+        }
+        ui.add_space(20.0);
+        ui.horizontal(|ui| {
+            ui.label(caps("Roll notes"));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(RichText::new("for this folder").size(11.0).color(TEXT3));
+            });
+        });
+        ui.add_space(4.0);
+        let mut changed = false;
+        let r = &mut self.roll;
+        let row = |ui: &mut Ui, label: &str, add: &mut dyn FnMut(&mut Ui) -> egui::Response| -> bool {
+            ui.horizontal(|ui| {
+                ui.add_sized(vec2(78.0, 22.0), egui::Label::new(RichText::new(label).size(12.0).color(TEXT3)));
+                add(ui).changed()
+            }).inner
+        };
+        fn text<'a>(v: &'a mut String, hint: &'a str) -> impl FnMut(&mut Ui) -> egui::Response + 'a {
+            move |ui: &mut Ui| ui.add(egui::TextEdit::singleline(v).hint_text(hint).desired_width(f32::INFINITY))
+        }
+        changed |= row(ui, "Roll", &mut text(&mut r.roll, "12"));
+        changed |= row(ui, "Camera", &mut text(&mut r.camera, "Nikon FM2"));
+        changed |= row(ui, "Lens", &mut text(&mut r.lens, "50mm f/1.8"));
+        // Film: one of the known stocks (so the conversion can use it), or any name.
+        let known = negative::STOCKS.iter().find(|s| s.id == r.stock);
+        let shown = known.map_or_else(|| if r.stock.is_empty() { "Not noted".to_string() } else { r.stock.clone() }, |s| format!("{} {}", s.brand, s.name));
+        changed |= row(ui, "Film", &mut |ui: &mut Ui| {
+            let mut resp = egui::ComboBox::from_id_salt("roll_stock").selected_text(shown.clone()).width(ui.available_width()).height(320.0).show_ui(ui, |ui| {
+                let mut c = false;
+                if ui.selectable_label(r.stock.is_empty(), "Not noted").clicked() {
+                    r.stock.clear();
+                    c = true;
+                }
+                for s in STOCKS {
+                    if ui.selectable_label(r.stock == s.id, format!("{} {}", s.brand, s.name)).clicked() {
+                        r.stock = s.id.to_string();
+                        // Fill in the box speed from the name when it has one ("Portra 400").
+                        if let Some(iso) = s.name.split_whitespace().filter_map(|w| w.trim_end_matches(['D', 'T']).parse::<f32>().ok()).last() {
+                            r.iso = iso;
+                        }
+                        c = true;
+                    }
+                }
+                c
+            });
+            if resp.inner == Some(true) {
+                resp.response.mark_changed();
+            }
+            resp.response
+        });
+        if known.is_none() {
+            changed |= row(ui, "", &mut text(&mut r.stock, "or type a film name"));
+        }
+        changed |= row(ui, "Box speed", &mut |ui: &mut Ui| ui.add(egui::DragValue::new(&mut r.iso).range(0.0..=25600.0).speed(5.0).suffix(" ISO")));
+        changed |= row(ui, "Shot at", &mut |ui: &mut Ui| {
+            let resp = ui.add(egui::DragValue::new(&mut r.ei).range(0.0..=25600.0).speed(5.0).custom_formatter(|v, _| if v <= 0.0 { "box speed".into() } else { format!("{v:.0} EI") }));
+            let p = r.push_label();
+            if !p.is_empty() {
+                ui.label(RichText::new(p).size(11.5).color(TEXT2));
+            }
+            resp
+        });
+        changed |= row(ui, "Developer", &mut text(&mut r.developer, "D-76 1+1, 9:45"));
+        changed |= row(ui, "Date", &mut text(&mut r.date, "YYYY-MM-DD"));
+        ui.add_space(2.0);
+        changed |= ui.add(egui::TextEdit::multiline(&mut r.notes).hint_text("Notes for the roll").desired_rows(2).desired_width(f32::INFINITY)).changed();
+        // This frame's settings, when one is selected.
+        if let Some(f) = self.lib_sel.clone() {
+            let key = crate::roll::frame_key(&f);
+            let mut fr = r.frames.get(&key).cloned().unwrap_or_default();
+            ui.add_space(10.0);
+            ui.label(caps("This frame"));
+            let mut fc = false;
+            fc |= row(ui, "Aperture", &mut |ui: &mut Ui| ui.add(egui::DragValue::new(&mut fr.aperture).range(0.0..=64.0).speed(0.1).custom_formatter(|v, _| if v <= 0.0 { "—".into() } else { format!("f/{v:.1}") })));
+            fc |= row(ui, "Shutter", &mut text(&mut fr.shutter, "1/125"));
+            fc |= row(ui, "Focal length", &mut |ui: &mut Ui| ui.add(egui::DragValue::new(&mut fr.focal).range(0.0..=2000.0).speed(0.5).custom_formatter(|v, _| if v <= 0.0 { "roll's lens".into() } else { format!("{v:.0} mm") })));
+            fc |= row(ui, "Note", &mut text(&mut fr.note, ""));
+            if fc {
+                if fr.is_empty() {
+                    r.frames.remove(&key);
+                } else {
+                    r.frames.insert(key, fr);
+                }
+                changed = true;
+            }
+        }
+        if changed {
+            if let Err(e) = crate::roll::write(&dir, &self.roll) {
+                self.status = format!("Could not save the roll notes: {e}");
+            }
+        }
+        // The film and its push set up every frame's conversion in one go.
+        let usable = negative::STOCKS.iter().any(|s| s.id == self.roll.stock) || self.my_stocks.iter().any(|(_, c)| c.name == self.roll.stock.trim());
+        if usable {
+            ui.add_space(8.0);
+            let push = self.roll.push_label();
+            let label = if push.is_empty() { "Convert the roll with this film".to_string() } else { format!("Convert the roll with this film ({push})") };
+            if ui.add(egui::Button::new(label).min_size(vec2(ui.available_width(), 28.0)))
+                .on_hover_text("Every frame in this folder becomes a negative of this film; a push adds contrast, a pull takes it away").clicked()
+            {
+                let mut n = 0;
+                for f in self.files.clone() {
+                    let mut q = read_params(&f).unwrap_or_default();
+                    let before = q.neg.clone();
+                    // Re-applying shouldn't stack the push contrast: start from the stock's own contrast.
+                    if q.neg.enabled && q.neg.stock == self.roll.stock {
+                        q.neg.contrast = 0.0;
+                    }
+                    crate::roll::apply_stock(&self.roll, &mut q);
+                    if q.neg != before && write_params(&f, &q).is_ok() {
+                        self.meta.insert(f.clone(), Meta::of(&q));
+                        n += 1;
+                    }
+                }
+                if let Some(cur) = self.current.clone()
+                    && cur.parent() == Some(dir.as_path())
+                    && let Some(q) = read_params(&cur)
+                {
+                    self.params.neg = q.neg;
+                    self.commit();
+                }
+                self.status = format!("{n} frame{} set to {}", if n == 1 { "" } else { "s" }, self.roll.stock_name());
+            }
+        }
+    }
+
     // ---------- Develop ----------
 
     fn develop_left(&mut self, ui: &mut Ui) {
@@ -4659,7 +4795,12 @@ impl eframe::App for App {
             }
             Module::Library => {
                 egui::Panel::left("lib_left").exact_size(260.0).resizable(false).frame(pad(PANEL, 12, 16)).show(ui, |ui| self.library_left(ui));
-                egui::Panel::right("lib_right").exact_size(320.0).resizable(false).frame(pad(PANEL, 16, 16)).show(ui, |ui| self.library_info(ui));
+                egui::Panel::right("lib_right").exact_size(320.0).resizable(false).frame(pad(PANEL, 16, 16)).show(ui, |ui| {
+                    egui::ScrollArea::vertical().id_salt("lib_info").auto_shrink([false, false]).show(ui, |ui| {
+                        self.library_info(ui);
+                        self.roll_panel(ui);
+                    });
+                });
                 egui::CentralPanel::default().frame(egui::Frame::new().fill(BG)).show(ui, |ui| {
                     if !self.files.is_empty() { egui::Panel::top("lib_tools").exact_size(48.0).frame(pad(BG, 16, 0)).show(ui, |ui| self.library_toolbar(ui)); }
                     egui::CentralPanel::default().frame(pad(BG, 16, 16)).show(ui, |ui| self.library_grid(ui));
