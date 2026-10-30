@@ -15,9 +15,10 @@ fn rem_e(a: f32, b: f32) -> f32 { let r = a - b * trunc(a / b); return select(r,
 fn pw(x: f32, y: f32) -> f32 { return select(pow(x, y), 0.0, x <= 0.0); }
 fn on(i: u32) -> bool { return P[i] > 0.5; }
 
+// Extended sRGB: mirrored below 0, so colours outside sRGB (a negative channel) survive to a wide-gamut export.
 fn srgb(v: f32) -> f32 {
-    let x = clamp(v, 0.0, 1.0);
-    return select(1.055 * pw(x, 1.0 / 2.4) - 0.055, x * 12.92, x <= 0.0031308);
+    let x = min(abs(v), 1.0);
+    return sign(v) * select(1.055 * pw(x, 1.0 / 2.4) - 0.055, x * 12.92, x <= 0.0031308);
 }
 
 fn table(k: u32, v: f32) -> f32 {
@@ -127,9 +128,9 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     }
     if on(15u) {
         let yl = luma(c);
-        let sat0 = rgb_to_hsv(c).y;
+        let sat0 = min(rgb_to_hsv(c).y, 1.0);
         let k = 1.0 + P[16] / 100.0 + P[17] / 100.0 * (1.0 - sat0) * (1.0 - sat0) + P[9] / 400.0;
-        c = max(vec3f(yl) + (c - vec3f(yl)) * k, vec3f(0.0));
+        c = vec3f(yl) + (c - vec3f(yl)) * k;
     }
     var e = vec3f(srgb(c.x), srgb(c.y), srgb(c.z));
     if on(18u) {

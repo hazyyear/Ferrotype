@@ -119,6 +119,10 @@ pub struct Params {
     /// photo, not to a look. Not used on negatives, whose inversion needs linear data.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub cam_curve: Vec<[f32; 2]>,
+    /// Keywords (tags) for finding the photo again; also written to its XMP as dc:subject. Per photo, like the
+    /// rating: never copied by paste, presets or sync.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub keywords: Vec<String>,
     /// 1 = made before the camera curve existed (settings tuned on the flat look, so it never gets one);
     /// 2 = starts from the camera's look. `read_params` marks a sidecar without the field as 1.
     pub process: u8,
@@ -288,7 +292,7 @@ impl Default for Params {
             grads: vec![],
             brushes: vec![],
             masks: vec![],
-            rot90: 0, label: 0, ai_nr: 0.0, ir_clean: 0.0, snapshots: vec![],
+            rot90: 0, label: 0, ai_nr: 0.0, ir_clean: 0.0, keywords: vec![], snapshots: vec![],
             lens: String::new(), lens_focal: 0.0, lens_f: 0.0, lens_crop: 1.0, lens_dist: 100.0, lens_vig: 100.0,
             profile: None,
             cam_curve: vec![],
@@ -313,6 +317,7 @@ impl Params {
         // So does the camera or scanner profile: the negative conversion was measured with it.
         p.profile = self.profile.clone();
         (p.cam_curve, p.process) = (self.cam_curve.clone(), self.process);
+        p.keywords = self.keywords.clone();
         p
     }
 
@@ -389,7 +394,7 @@ impl Params {
 
     /// True when the photo has edits, ignoring its rating, flag, label and snapshots.
     pub fn is_edited(&self) -> bool {
-        Params { rating: 0, flag: 0, label: 0, snapshots: vec![], cam_curve: vec![], process: 2, ..self.clone() } != Params::default()
+        Params { rating: 0, flag: 0, label: 0, snapshots: vec![], cam_curve: vec![], process: 2, keywords: vec![], ..self.clone() } != Params::default()
     }
 
     /// Turn a quarter clockwise (or back), carrying the crop, spots, filters and brush strokes along.
@@ -1437,7 +1442,8 @@ fn finish(mut img: Rgb32FImage, p: &Params, scale: f32, full: (u32, u32), off: (
                 let s = (1.0 - smooth(0.0, 0.18, luma(c))) * p.cal_sh / 100.0 * 0.02;
                 c[1] += s;
             }
-            *px = c.map(|v| v.max(0.0));
+            // Negative channels are colours outside sRGB (kept for wide-gamut exports); negative light isn't.
+            *px = if luma(c) < 0.0 { [0.0; 3] } else { c };
         }
     });
 
@@ -1536,9 +1542,9 @@ fn finish(mut img: Rgb32FImage, p: &Params, scale: f32, full: (u32, u32), off: (
             // Saturation / vibrance.
             if sat_on {
                 let yl = luma(c);
-                let (_, sat0, _) = rgb_to_hsv(c);
+                let sat0 = rgb_to_hsv(c).1.min(1.0);
                 let k = 1.0 + p.saturation / 100.0 + p.vibrance / 100.0 * (1.0 - sat0).powi(2) + p.dehaze / 400.0;
-                c = c.map(|v| (yl + (v - yl) * k).max(0.0));
+                c = c.map(|v| yl + (v - yl) * k);
             }
             // Display encode, then perceptual colour work.
             let mut e = c.map(linear_to_srgb);
@@ -1600,8 +1606,22 @@ fn finish(mut img: Rgb32FImage, p: &Params, scale: f32, full: (u32, u32), off: (
     }
 
     detail(&mut img, p, scale);
-    img.iter_mut().for_each(|v| *v = v.clamp(0.0, 1.0));
+    // A wide-gamut export keeps the negative channels (`colour::to_space` maps them into its gamut).
+    let lo = if KEEP_GAMUT.with(|k| k.get()) { -1.0 } else { 0.0 };
+    img.iter_mut().for_each(|v| *v = v.clamp(lo, 1.0));
     img
+}
+
+thread_local! {
+    static KEEP_GAMUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `render`, keeping colours outside sRGB as negative channels (extended sRGB), for a wide-gamut export.
+pub fn render_wide(src: &Rgb32FImage, p: &Params, scale: f32) -> Rgb32FImage {
+    KEEP_GAMUT.with(|k| k.set(true));
+    let out = render(src, p, scale);
+    KEEP_GAMUT.with(|k| k.set(false));
+    out
 }
 
 // ---------- point curves ----------

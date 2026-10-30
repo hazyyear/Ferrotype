@@ -1361,6 +1361,7 @@ dependencies = [
  "image",
  "jxl-oxide",
  "libloading",
+ "moxcms",
  "ort",
  "png",
  "pollster 1.0.1",
