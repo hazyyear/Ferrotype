@@ -11,6 +11,8 @@ mod lens;
 mod pano;
 mod keys;
 mod scan;
+mod scanfile;
+mod scanner;
 mod xmp;
 mod rename;
 mod hdrmerge;
@@ -424,7 +426,7 @@ fn jpeg_fits(img: &Rgb32FImage) -> Result<(), String> {
 
 /// Claim `dir/stem.ext`, or `stem-2.ext`, `stem-3.ext`… when taken. Never replaces a file (an original
 /// JPEG, or the other half of a RAW+JPEG pair), and parallel exports can't pick the same name.
-fn claim_output(dir: &Path, stem: &str, ext: &str) -> Result<PathBuf, String> {
+pub fn claim_output(dir: &Path, stem: &str, ext: &str) -> Result<PathBuf, String> {
     for i in 1..10_000 {
         let out = dir.join(if i == 1 { format!("{stem}.{ext}") } else { format!("{stem}-{i}.{ext}") });
         match std::fs::OpenOptions::new().write(true).create_new(true).open(&out) {
