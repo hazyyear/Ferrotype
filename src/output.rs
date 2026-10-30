@@ -345,7 +345,7 @@ pub fn xmp_packet(shot: &Shot, description: &str, keywords: &[String]) -> String
     }
     // "2026:05:04 12:00:00" → "2026-05-04T12:00:00"
     let t = shot.taken.trim();
-    if t.len() >= 19 {
+    if t.len() >= 19 && t.is_ascii() {
         add("exif:DateTimeOriginal", format!("{}T{}", t[..10].replace(':', "-"), &t[11..19]));
     }
     let mut x = String::from("<?xpacket begin=\"\u{feff}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n");

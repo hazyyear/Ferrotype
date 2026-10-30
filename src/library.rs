@@ -21,11 +21,20 @@ pub struct Entry {
 
 /// Gather the searchable details of `path` (reads its EXIF, so do it off the UI thread).
 pub fn entry(path: &Path, p: &Params) -> Entry {
-    let shot = crate::export_shot(path);
+    let roll = path.parent().and_then(crate::roll::read);
+    entry_in(path, p, roll.as_ref())
+}
+
+/// `entry`, with the roll notes of the photo's folder already read (`Rolls` reads each folder's once).
+pub fn entry_in(path: &Path, p: &Params, roll: Option<&crate::roll::Roll>) -> Entry {
+    let mut shot = crate::lens::shot(path).unwrap_or_default();
+    if let Some(r) = roll {
+        crate::roll::fill_shot_from(r, &r.frame(path), &mut shot);
+    }
     let mut words = vec![path.file_name().unwrap_or_default().to_string_lossy().to_string()];
     words.extend(p.keywords.iter().cloned());
     words.extend([shot.make.clone(), shot.model.clone(), shot.lens.clone()]);
-    if let Some((r, f)) = crate::roll::for_photo(path) {
+    if let Some((r, f)) = roll.map(|r| (r, r.frame(path))) {
         words.extend([r.roll.clone(), r.stock_name(), r.developer.clone(), r.notes.clone(), f.note.clone()]);
         if !r.roll.trim().is_empty() {
             words.push(format!("roll {}", r.roll.trim()));
@@ -41,8 +50,7 @@ pub fn entry(path: &Path, p: &Params) -> Entry {
         }
         words.push("negative film scan".into());
     }
-    let t: Vec<&str> = shot.taken.split([':', ' ', 'T', '-']).collect();
-    let date = if t.len() >= 3 && t[0].len() == 4 { format!("{}-{}-{}", t[0], t[1], t[2]) } else { String::new() };
+    let date = crate::roll::date_ymd(&shot.taken).map_or_else(String::new, |(y, m, d)| format!("{y:04}-{m:02}-{d:02}"));
     words.push(date.clone());
     if p.label > 0 {
         words.push(crate::xmp::LABELS[p.label.min(5) as usize].to_string());
@@ -172,12 +180,28 @@ pub fn members(c: &Collection) -> Vec<PathBuf> {
     if !c.is_smart() {
         return c.files.iter().filter(|f| f.exists() || crate::load::copy_of(f).is_some_and(|o| o.exists())).cloned().collect();
     }
+    let rolls = Rolls::default();
     let mut out: Vec<PathBuf> = crate::photos_under(&c.folder).into_iter().map(|(_, p)| p).filter(|p| {
         let params = crate::read_params(p).unwrap_or_default();
-        matches(&entry(p, &params), &c.query)
+        matches(&rolls.entry(p, &params), &c.query)
     }).collect();
     out.sort();
     out
+}
+
+/// Roll notes read once per folder while a search indexes many photos (it used to read the file once per photo).
+#[derive(Default)]
+pub struct Rolls(std::sync::Mutex<std::collections::HashMap<PathBuf, Option<std::sync::Arc<crate::roll::Roll>>>>);
+
+impl Rolls {
+    pub fn entry(&self, path: &Path, p: &Params) -> Entry {
+        let dir = path.parent().unwrap_or(Path::new("")).to_path_buf();
+        let roll = {
+            let mut m = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            m.entry(dir).or_insert_with_key(|d| crate::roll::read(d).map(std::sync::Arc::new)).clone()
+        };
+        entry_in(path, p, roll.as_deref())
+    }
 }
 
 /// Keywords as typed ("street, Lisbon; night") → a clean list without duplicates (case-insensitive).

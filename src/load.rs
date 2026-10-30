@@ -31,6 +31,18 @@ pub fn copy_of(path: &Path) -> Option<std::path::PathBuf> {
     (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).then(|| path.with_file_name(orig))
 }
 
+/// Sort photos by name, each one's virtual copies right after it in number order (`copy2` … `copy10`; a plain
+/// sort put `copy10` before `copy2`, which scrambled strips of ten frames or more).
+pub fn sort_photos(files: &mut [std::path::PathBuf]) {
+    files.sort_by_cached_key(|p| match copy_of(p) {
+        Some(orig) => {
+            let n = p.file_name().and_then(|f| f.to_str()).and_then(|f| f.rsplit_once(".copy")).and_then(|(_, n)| n.parse::<u64>().ok());
+            (orig, n.unwrap_or(0))
+        }
+        None => (p.clone(), 0),
+    });
+}
+
 /// Full-quality decode, linear light.
 pub fn load(path: &Path) -> Result<Rgb32FImage, String> {
     let real = copy_of(path);
@@ -265,6 +277,16 @@ pub fn raw_stats(path: &Path) -> Option<RawStats> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn copies_sort_in_number_order_after_their_photo() {
+        let mut v: Vec<std::path::PathBuf> = ["b.tif", "a.tif.copy10", "a.tif.copy2", "a.tif", "a.tif.copy3"].iter().map(Into::into).collect();
+        sort_photos(&mut v);
+        let names: Vec<_> = v.iter().map(|p| p.to_string_lossy().to_string()).collect();
+        assert_eq!(names, ["a.tif", "a.tif.copy2", "a.tif.copy3", "a.tif.copy10", "b.tif"]);
+    }
+
     #[test]
     fn matched_curve_follows_the_jpeg() {
         // The "JPEG" is the RAW through a gamma-like curve: the match recovers it and stops where the JPEG clips.

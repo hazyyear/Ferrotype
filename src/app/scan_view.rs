@@ -990,20 +990,19 @@ impl App {
                 p.neg.levels = Some(l);
             }
         }
-        // An earlier Add on this scan made copies: they are replaced, not added to.
-        let old: Vec<PathBuf> = self.files.iter().filter(|f| load::copy_of(f).as_deref() == Some(cur.as_path())).cloned().collect();
-        if self.scan.strip.as_ref().is_some_and(|s| s.added.is_some()) {
-            for f in old {
-                self.remove_copy(&f);
-            }
+        // An earlier Add on this scan (in this session or an earlier one) made frames: they are replaced, not
+        // added to. Copies made by hand aren't marked as strip frames and stay.
+        let old: Vec<PathBuf> = self.files.iter().filter(|f| load::copy_of(f).as_deref() == Some(cur.as_path()) && crate::read_params(f).is_some_and(|p| p.strip_frame)).cloned().collect();
+        for f in old {
+            self.remove_copy(&f);
         }
         let n = all.len();
         let first = all.remove(0);
         let dust: usize = first.spots.len() + all.iter().map(|p| p.spots.len()).sum::<usize>();
         self.params = Params { rating: self.params.rating, flag: self.params.flag, label: self.params.label, snapshots: std::mem::take(&mut self.params.snapshots), ..first };
-        let made: Vec<PathBuf> = all.iter().filter_map(|p| self.virtual_copy(&cur, p)).collect();
+        let made: Vec<PathBuf> = all.iter().filter_map(|p| self.virtual_copy_as(&cur, &Params { strip_frame: true, ..p.clone() })).collect();
         // Copies go in frame order (each is inserted next to the scan, which would reverse them).
-        self.files.sort();
+        load::sort_photos(&mut self.files);
         self.commit();
         // Every frame needs its own thumbnail: copies start with the whole strip's, and the scan's has changed.
         for f in made.iter().chain(std::iter::once(&cur)) {
