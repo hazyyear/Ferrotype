@@ -3,6 +3,7 @@ use crate::develop::{self, HUE_CENTERS, Params, hue_rotate, luma, wb_gains};
 
 mod masks;
 mod scan_view;
+mod scanner_view;
 use masks::{Draw, MaskUi};
 use scan_view::ScanUi;
 use crate::load::{self, linear_to_srgb};
@@ -579,7 +580,8 @@ fn cover_uv(tex: &TextureHandle, aspect: f32) -> Rect {
 fn thumb_cache(f: &Path) -> Option<PathBuf> {
     use sha2::{Digest, Sha256};
     let modified = |p: &Path| std::fs::metadata(p).ok().and_then(|m| m.modified().ok());
-    let mut key = format!("{}|{:?}|{:?}", f.display(), modified(load::copy_of(f).as_deref().unwrap_or(f)), modified(&crate::sidecar(f)));
+    // `v2`: embedded colour profiles are read since; older thumbnails of tagged JPEGs (Display P3) are stale.
+    let mut key = format!("v2|{}|{:?}|{:?}", f.display(), modified(load::copy_of(f).as_deref().unwrap_or(f)), modified(&crate::sidecar(f)));
     // TIFF scans: read through their colour profile, and the roll can say its untagged scans are linear.
     if f.to_string_lossy().to_ascii_lowercase().contains(".tif") {
         let data = f.parent().and_then(crate::roll::read).map(|r| r.scan_data).unwrap_or_default();
@@ -632,7 +634,7 @@ fn stock_iso(s: &negative::Stock) -> String {
 }
 
 fn kind_label(k: Kind) -> &'static str {
-    match k { Kind::Color => "C-41 color negative", Kind::Cine => "ECN-2 motion picture", Kind::Bw => "Black & white", Kind::Slide => "E-6 slide, no inversion" }
+    match k { Kind::Color => "C-41 colour negative", Kind::Cine => "ECN-2 motion picture", Kind::Bw => "Black & white", Kind::Slide => "E-6 slide, no inversion" }
 }
 
 /// Human label + value for the most significant change between two settings (history list).
@@ -893,7 +895,7 @@ impl App {
         }
         self.params = read_params(&path).unwrap_or_default();
         if crate::sidecar_damaged(&path) {
-            self.status = "This photo's edits file is damaged: starting fresh, the old file is kept as .damaged".into();
+            self.status = "This photo's edits file was damaged, so it starts fresh. The old file is kept as .damaged".into();
         }
         self.history = vec![self.params.clone()];
         self.hist_pos = 0;
@@ -1014,7 +1016,7 @@ impl App {
                             // Keep the damaged-edits warning from `select` visible: the size alone used to replace it
                             // the moment the photo opened.
                             self.status = if crate::sidecar_damaged(&p) {
-                                format!("{} × {}. This photo's edits file is damaged: starting fresh, the old file is kept as .damaged", full.width(), full.height())
+                                format!("{} × {}. This photo's edits file was damaged, so it starts fresh. The old file is kept as .damaged", full.width(), full.height())
                             } else {
                                 format!("{} × {}", full.width(), full.height())
                             };
@@ -1139,7 +1141,7 @@ impl App {
                 Msg::Hdr(r) => {
                     self.pano_busy = false;
                     match r {
-                        Ok(outs) if outs.is_empty() => self.status = "No exposure brackets found (photos taken within 3 seconds at different exposures)".into(),
+                        Ok(outs) if outs.is_empty() => self.status = "No exposure brackets found. A bracket is photos taken within 3 seconds at different exposures".into(),
                         Ok(outs) => {
                             self.status = if outs.len() == 1 { format!("HDR saved as {}", outs[0].file_name().unwrap_or_default().to_string_lossy()) } else { format!("Merged {} brackets into HDR photos", outs.len()) };
                             if let Some(d) = self.folder.clone() {
@@ -1181,7 +1183,7 @@ impl App {
         let Some(base) = self.auto_base() else { return };
         if self.module == Module::Negative && !self.params.neg.enabled && negative::orange_mask(base) {
             self.params.neg.enabled = true;
-            self.status = "Orange film base found: converted as a colour negative".into();
+            self.status = "Found an orange film base, so this was converted as a colour negative".into();
         }
     }
 
@@ -1372,7 +1374,7 @@ impl App {
         self.tool = Tool::Heal;
         self.module = Module::Develop;
         self.open[10] = true;
-        self.status = if n == 0 { "No dust found".into() } else { format!("Found {n} specks: right-click any circle that isn't dust") };
+        self.status = if n == 0 { "No dust found".into() } else { format!("Found {n} specks. Right-click any circle that isn't dust") };
     }
 
     /// A new virtual copy of `f` with these settings; returns its path.
@@ -1452,7 +1454,7 @@ impl App {
             }
         }
         if out.canonicalize().ok() == cur.canonicalize().ok() {
-            self.status = "Print needs a different name: that is the original frame".into();
+            self.status = "Pick a different name, because that one belongs to the original frame".into();
             return;
         }
         let (orig, delta, params, tx, o, cur) = (photo.orig.clone(), photo.delta.clone(), self.params.clone(), self.tx.clone(), self.export.clone(), cur.clone());
@@ -1624,7 +1626,7 @@ impl App {
                     let mut pi = cur;
                     egui::ComboBox::from_id_salt("paper").width(140.0).selected_text(crate::output::PAPERS[pi].0).show_ui(ui, |ui| {
                         for (k, p) in crate::output::PAPERS.iter().enumerate() {
-                            ui.selectable_value(&mut pi, k, p.0);
+                            pick(ui, &mut pi, k, p.0);
                         }
                     });
                     if pi != cur {
@@ -1653,7 +1655,7 @@ impl App {
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| switch(ui, &mut o.hdr));
                     });
                     if o.hdr {
-                        ui.label(RichText::new("Highlights glow up to 2 stops brighter on HDR screens (recent phones, Macs, Chrome); everywhere else it's a normal JPEG.").size(11.5).color(TEXT2));
+                        ui.label(RichText::new("Highlights glow up to 2 stops brighter on HDR screens, such as recent phones, Macs and Chrome. Everywhere else it shows as a normal JPEG.").size(11.5).color(TEXT2));
                     }
                 }
                 ui.label(caps("Colour space"));
@@ -1665,7 +1667,7 @@ impl App {
                     if o.ext == "jpg" && o.hdr {
                         note = "HDR JPEGs are always sRGB.".into();
                     } else if o.space == crate::colour::Space::ProPhoto && o.ext != "tif" {
-                        note = "ProPhoto is too wide for 8 bits: smooth skies may band. Use TIFF 16-bit.".into();
+                        note = "ProPhoto is too wide for 8 bits, so smooth skies may show bands. Use 16-bit TIFF instead.".into();
                     } else {
                         note += ". The profile is embedded in the file.";
                     }
@@ -1675,7 +1677,7 @@ impl App {
                     ui.add(egui::TextEdit::singleline(&mut o.wm_text).hint_text("© Your name").desired_width(f32::INFINITY));
                     ui.horizontal(|ui| {
                         let logo = if o.wm_logo.is_empty() { "Logo image…".to_string() } else { Path::new(&o.wm_logo).file_name().unwrap_or_default().to_string_lossy().to_string() };
-                        if ui.button(logo).on_hover_text("A PNG with transparency works best; it replaces the text").clicked()
+                        if ui.button(logo).on_hover_text("A PNG with transparency works best. It replaces the text").clicked()
                             && let Some(f) = rfd::FileDialog::new().add_filter("Image", &["png", "jpg", "jpeg", "webp"]).pick_file()
                         {
                             o.wm_logo = f.display().to_string();
@@ -1709,7 +1711,7 @@ impl App {
                     }
                     ui.label(RichText::new("One click makes each set in its own subfolder, padded to shape with the border colour.").size(11.5).color(TEXT2));
                 });
-                ui.label(RichText::new("Prints hold pixels only unless you add the details above: never GPS or serial numbers.").size(11.5).color(TEXT2));
+                ui.label(RichText::new("Prints hold only the picture unless you add the details above. GPS and serial numbers are never included.").size(11.5).color(TEXT2));
                 ui.add_space(4.0);
                 let sets = self.export_sets.iter().any(|b| *b);
                 go = primary(ui, if sets { "Print sets to folder…" } else if all { "Print to folder…" } else { "Print to file…" }, true).clicked();
@@ -1861,7 +1863,7 @@ impl App {
                 ui.add_space(6.0);
                 ui.label(RichText::new("Shoot or scan the chart under the same light as your photos, without clipping the white patch. Then drag the numbered markers onto the centres of the corner patches.").size(12.0).color(TEXT2));
                 ui.add_space(4.0);
-                let first = if self.chart.target.cols == 6 { "1 on dark skin (brown), 2 on bluish green, 3 on black, 4 on white" } else { "1 on A1, 2 on the last patch of row A, 3 on the last patch of the last row, 4 on its first" };
+                let first = if self.chart.target.cols == 6 { "1 on dark skin (brown), 2 on bluish green, 3 on black and 4 on white" } else { "1 on A1, 2 on the last patch of row A, 3 on the last patch of the last row and 4 on the first patch of the last row" };
                 ui.label(RichText::new(first).size(12.0).color(TEXT2));
                 ui.add_space(10.0);
                 ui.label(caps("Chart"));
@@ -1871,7 +1873,7 @@ impl App {
                         self.chart.target = crate::calib::colorchecker();
                         self.chart.fit = None;
                     }
-                    if small_action(ui, if cc { "IT8 reference…" } else { &self.chart.target.name }, !cc).on_hover_text("An IT8.7 chart: open the reference file (CGATS .txt) that came with it").clicked()
+                    if small_action(ui, if cc { "IT8 reference…" } else { &self.chart.target.name }, !cc).on_hover_text("For an IT8.7 chart, open the reference file (CGATS .txt) that came with it").clicked()
                         && let Some(f) = rfd::FileDialog::new().add_filter("IT8 reference", &["txt", "it8", "cie", "cgats"]).pick_file()
                     {
                         let name = f.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
@@ -1886,7 +1888,7 @@ impl App {
                 });
                 ui.add_space(10.0);
                 ui.label(caps("Profile name"));
-                ui.add(egui::TextEdit::singleline(&mut self.chart.name).hint_text("e.g. X-T5 daylight, or Scanner + CRI light").desired_width(ui.available_width()));
+                ui.add(egui::TextEdit::singleline(&mut self.chart.name).hint_text("for example X-T5 daylight, or Scanner + CRI light").desired_width(ui.available_width()));
                 ui.add_space(8.0);
                 let can = self.photo.is_some() && !self.chart.name.trim().is_empty() && !self.chart.busy;
                 if primary(ui, if self.chart.busy { "Building…" } else { "Build profile" }, can).on_disabled_hover_text("Name the profile first").clicked() {
@@ -1896,9 +1898,9 @@ impl App {
                 match &self.chart.fit {
                     Some(Ok(f)) => {
                         ui.label(RichText::new(format!("Average colour error ΔE {:.1} → {:.1} (worst patch {:.1}), from {} patches.", f.de_before, f.de_after, f.de_worst, f.used)).size(12.0).color(TEXT));
-                        ui.label(RichText::new("Saved and applied to this photo. Pick it under Calibration › Profile for other photos, or paste these settings onto them. Set white balance on the chart's grey patch as usual.").size(11.5).color(TEXT2));
+                        ui.label(RichText::new("Saved and applied to this photo. For other photos, pick it under Calibration › Profile or paste these settings onto them. Set white balance on the chart's grey patch as usual.").size(11.5).color(TEXT2));
                         if f.de_after > 6.0 {
-                            ui.label(RichText::new("The error is still high: check that each marker sits on the right patch.").size(11.5).color(WARN));
+                            ui.label(RichText::new("The error is still high. Check that each marker sits on the right patch.").size(11.5).color(WARN));
                         }
                     }
                     Some(Err(e)) => {
@@ -2545,7 +2547,7 @@ impl App {
                     }
                 });
             });
-            ui.label(RichText::new(if c.raw { "From the sensor data: what can still be recovered." } else { "From the picture as rendered." }).size(11.0).color(TEXT3));
+            ui.label(RichText::new(if c.raw { "From the sensor data, so it shows what can still be recovered." } else { "From the picture as rendered." }).size(11.0).color(TEXT3));
         } else {
             ui.add_space(72.0);
         }
@@ -2607,8 +2609,8 @@ impl App {
                     self.open_path(ui.ctx(), &d);
                 }
                 if !develop {
-                    ui.add(egui::TextEdit::singleline(&mut self.lib_query).hint_text("Search: keyword, camera, lens, iso>1600…").desired_width(260.0).margin(vec2(10.0, 6.0)))
-                        .on_hover_text("Words match the name, keywords, camera, lens, date, roll and film notes; -word leaves out. Also iso>1600, focal<35, f<2.8, stars>=3, date:2026-05, \"two words\".");
+                    ui.add(egui::TextEdit::singleline(&mut self.lib_query).hint_text("Search keywords, camera, lens, iso>1600…").desired_width(260.0).margin(vec2(10.0, 6.0)))
+                        .on_hover_text("Words match the name, keywords, camera, lens, date, roll and film notes. Put a minus in front to leave a word out (-word). You can also use iso>1600, focal<35, f<2.8, stars>=3, date:2026-05 and \"two words\".");
                     self.ensure_search();
                 } else {
                     let name = self.current.as_ref().and_then(|c| c.file_name()).map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
@@ -2636,8 +2638,8 @@ impl App {
             };
             if !neg {
                 divider(ui);
-                for (t, name, tip) in [(Tool::Crop, "Crop", "Drag the corners; drag inside to move"), (Tool::Heal, "Heal", "Click a spot to heal it; right-click a circle to remove it"),
-                                       (Tool::Mask, "Mask", "Local adjustments: gradients, circles, painting, brightness and colour ranges"), (Tool::Sample, "Sample", "Click to pin a colour readout (up to 8); right-click one to remove it")] {
+                for (t, name, tip) in [(Tool::Crop, "Crop", "Drag the corners, or drag inside to move"), (Tool::Heal, "Heal", "Click a spot to heal it. Right-click a circle to remove it"),
+                                       (Tool::Mask, "Mask", "Adjust part of the photo with gradients, circles, painting, or brightness and colour ranges"), (Tool::Sample, "Sample", "Click to pin a colour readout (up to 8). Right-click one to remove it")] {
                     if ghost(ui, name, self.tool == t).on_hover_text(tip).clicked() {
                         self.tool = if self.tool == t { Tool::None } else { t };
                         self.view = View::After;
@@ -2661,11 +2663,11 @@ impl App {
                     let mut load = false;
                     egui::ComboBox::from_id_salt("proof").width(110.0).selected_text(shown).show_ui(ui, |ui| {
                         for (k, n) in names.iter().enumerate() {
-                            ui.selectable_value(&mut self.proof, k, *n);
+                            pick(ui, &mut self.proof, k, *n);
                         }
                         ui.separator();
                         if let Some(n) = &printer_name {
-                            ui.selectable_value(&mut self.proof, papers + 1, format!("Printer: {n}"));
+                            pick(ui, &mut self.proof, papers + 1, format!("Printer: {n}"));
                             let mut warn = self.proof == papers + 2;
                             if ui.checkbox(&mut warn, "Show what it can't print").changed() {
                                 self.proof = if warn { papers + 2 } else { papers + 1 };
@@ -2674,7 +2676,7 @@ impl App {
                             ui.checkbox(&mut self.colour.paper, "Simulate paper and ink");
                         }
                         load = ui.button("Printer profile…").on_hover_text("Load the ICC profile for your printer and paper (RGB or CMYK)").clicked();
-                    }).response.on_hover_text("Soft proof: how a print will look. The papers are approximations; a printer profile is exact");
+                    }).response.on_hover_text("Soft proof shows how a print will look. The papers listed are approximations, and a printer profile is exact");
                     if load
                         && let Some(f) = rfd::FileDialog::new().add_filter("ICC profile", &["icc", "icm"]).pick_file()
                     {
@@ -2696,7 +2698,7 @@ impl App {
                 {
                     let pct = self.shown_w / (t.size()[0] as f32 / self.tex_scale) * 100.0 * ui.ctx().pixels_per_point();
                     let label = match &self.zoom { Some(z) if z.from_fit.is_none() => format!("{:.0}%", z.scale * 100.0), Some(_) => "…".into(), None => format!("Fit {pct:.0}%") };
-                    if ghost(ui, &label, self.zoom.is_some()).on_hover_text("Z, or double-click the photo: 100% view. Mouse wheel or pinch to zoom; drag or scroll with two fingers to move around").clicked() {
+                    if ghost(ui, &label, self.zoom.is_some()).on_hover_text("Press Z or double-click the photo for a 100% view. Zoom with the mouse wheel or a pinch, and move around by dragging or scrolling with two fingers").clicked() {
                         self.toggle_zoom([0.5, 0.5]);
                     }
                 }
@@ -3092,7 +3094,7 @@ impl App {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| switch(ui, v));
             });
         };
-        toggle(ui, "Pick up new frames", &mut self.watch, "For a scanner or tethered camera saving into this folder: new files appear within two seconds");
+        toggle(ui, "Pick up new frames", &mut self.watch, "For a scanner or tethered camera that saves into this folder. New files appear within two seconds");
         if self.watch {
             toggle(ui, "Open each new photo", &mut self.watch_open, "Jump straight to the newest arrival");
             toggle(ui, "Give it these settings", &mut self.watch_apply, "New frames get the open photo's look and film conversion (handy when scanning a roll)");
@@ -3231,7 +3233,7 @@ impl App {
                                         export_sel = true;
                                         ui.close();
                                     }
-                                    if ui.add_enabled(!pano_busy, egui::Button::new(format!("Merge {multi} photos to HDR"))).on_hover_text("An exposure bracket of one scene: aligned and merged into a 32-bit photo with all the highlight and shadow detail").clicked() {
+                                    if ui.add_enabled(!pano_busy, egui::Button::new(format!("Merge {multi} photos to HDR"))).on_hover_text("Lines up an exposure bracket of one scene and merges it into a 32-bit photo that keeps the highlight and shadow detail").clicked() {
                                         hdr = Some(true);
                                         ui.close();
                                     }
@@ -3413,7 +3415,7 @@ impl App {
                 let q = self.lib_query.trim().to_string();
                 if !q.is_empty()
                     && let Some(dir) = self.folder.clone()
-                    && small_action(ui, "Save search", false).on_hover_text("A smart collection: this search over this folder and its subfolders, kept up to date").clicked()
+                    && small_action(ui, "Save search", false).on_hover_text("A smart collection runs this search over this folder and its subfolders, and stays up to date").clicked()
                 {
                     let name = format!("{q} · {}", dir.file_name().unwrap_or_default().to_string_lossy());
                     self.collections.push(crate::library::Collection { name, query: q, folder: dir, ..Default::default() });
@@ -3463,7 +3465,7 @@ impl App {
                 open = Some(i);
             }
             resp.context_menu(|ui| {
-                if ui.button("Delete collection").on_hover_text("Only the collection: the photos stay where they are").clicked() {
+                if ui.button("Delete collection").on_hover_text("Deletes only the collection. The photos stay where they are").clicked() {
                     delete = Some(i);
                     ui.close();
                 }
@@ -3640,10 +3642,8 @@ impl App {
 
     /// Roll notes for the open folder, and the selected frame's own notes. Saved as they are typed.
     fn roll_panel(&mut self, ui: &mut Ui) {
-        let Some(dir) = self.folder.clone() else { return };
-        if self.roll_dir.as_ref() != Some(&dir) {
-            self.roll = crate::roll::read(&dir).unwrap_or_default();
-            self.roll_dir = Some(dir.clone());
+        if self.folder.is_none() {
+            return;
         }
         ui.add_space(20.0);
         ui.horizontal(|ui| {
@@ -3653,6 +3653,23 @@ impl App {
             });
         });
         ui.add_space(4.0);
+        self.roll_fields(ui);
+    }
+
+    /// The roll notes of the open folder, read when the folder changes.
+    pub(super) fn roll_loaded(&mut self) -> Option<&crate::roll::Roll> {
+        let dir = self.folder.clone()?;
+        if self.roll_dir.as_ref() != Some(&dir) {
+            self.roll = crate::roll::read(&dir).unwrap_or_default();
+            self.roll_dir = Some(dir);
+        }
+        Some(&self.roll)
+    }
+
+    /// The roll notes' fields, without a heading.
+    pub(super) fn roll_fields(&mut self, ui: &mut Ui) {
+        let Some(dir) = self.folder.clone() else { return };
+        self.roll_loaded();
         let mut changed = false;
         let r = &mut self.roll;
         let row = |ui: &mut Ui, label: &str, add: &mut dyn FnMut(&mut Ui) -> egui::Response| -> bool {
@@ -3676,12 +3693,12 @@ impl App {
         changed |= row(ui, "Film", &mut |ui: &mut Ui| {
             let mut resp = egui::ComboBox::from_id_salt("roll_stock").selected_text(shown.clone()).width(ui.available_width()).height(320.0).show_ui(ui, |ui| {
                 let mut c = false;
-                if ui.selectable_label(r.stock.is_empty(), "Not noted").clicked() {
+                if picked(ui, r.stock.is_empty(), "Not noted").clicked() {
                     r.stock.clear();
                     c = true;
                 }
                 for s in STOCKS {
-                    if ui.selectable_label(r.stock == s.id, format!("{} {}", s.brand, s.name)).clicked() {
+                    if picked(ui, r.stock == s.id, format!("{} {}", s.brand, s.name)).clicked() {
                         r.stock = s.id.to_string();
                         // Fill in the box speed from the name when it has one ("Portra 400").
                         if let Some(iso) = s.name.split_whitespace().filter_map(|w| w.trim_end_matches(['D', 'T']).parse::<f32>().ok()).last() {
@@ -3745,7 +3762,7 @@ impl App {
             let push = self.roll.push_label();
             let label = if push.is_empty() { "Convert the roll with this film".to_string() } else { format!("Convert the roll with this film ({push})") };
             if ui.add(egui::Button::new(label).min_size(vec2(ui.available_width(), 28.0)))
-                .on_hover_text("Every frame in this folder becomes a negative of this film; a push adds contrast, a pull takes it away").clicked()
+                .on_hover_text("Every frame in this folder is converted as this film. A push adds contrast and a pull takes it away").clicked()
             {
                 let mut n = 0;
                 for f in self.files.clone() {
@@ -3885,7 +3902,7 @@ impl App {
             if current {
                 ui.painter().circle_filled(pos2(r.right() - 10.0, r.center().y), 3.0, ACCENT);
             }
-            let resp = resp.on_hover_text("Click to go back to it; right-click to delete");
+            let resp = resp.on_hover_text("Click to go back to it. Right-click to delete");
             if resp.clicked() {
                 restore = Some(i);
             }
@@ -4042,7 +4059,7 @@ impl App {
                             (p.temp, p.tint) = (d.temp, d.tint);
                         }
                         pick_wb = small_action(ui, if picking_wb { "Cancel" } else { "Pick neutral" }, picking_wb)
-                            .on_hover_text("Eyedropper (W): click something that should be grey or white").clicked();
+                            .on_hover_text("Eyedropper (W). Click something that should be grey or white").clicked();
                     });
                 });
                 slider(ui, "Temp", &mut p.temp, 2000.0, 12000.0, d.temp, Some(&temp_g));
@@ -4079,7 +4096,7 @@ impl App {
                 } else {
                     ui.label(RichText::new("The curve is open in its own window.").size(11.5).color(TEXT2));
                 }
-                switch_row(ui, "Brightness only", &mut p.curve_lum).on_hover_text("Luminosity mode: the RGB curve changes brightness without shifting colours or saturation");
+                switch_row(ui, "Brightness only", &mut p.curve_lum).on_hover_text("In luminosity mode the RGB curve changes brightness without shifting colours or saturation");
                 ui.label(RichText::new("Click to add a point, drag to move it, double-click to remove it.").size(11.5).color(TEXT2));
                 group(ui, "Regions", None);
                 slider(ui, "Highlights", &mut p.c_hi, -100.0, 100.0, 0.0, None);
@@ -4126,10 +4143,10 @@ impl App {
                 group(ui, "AI denoise", None);
                 if denoise::installed() {
                     slider(ui, "Strength", &mut p.ai_nr, 0.0, 100.0, 0.0, None);
-                    ui.label(RichText::new(if ai_busy { "Working… the first run on a photo takes a while; the result is kept for next time." } else { "Removes noise with a neural network (RawNIND on RAW files, SCUNet on others), then the sliders above fine-tune it." }).size(11.5).color(TEXT2));
+                    ui.label(RichText::new(if ai_busy { "Working… The first run on a photo takes a while, and the result is kept for next time." } else { "Removes noise with a neural network (RawNIND for RAW files, SCUNet for the rest). The sliders above fine-tune the result." }).size(11.5).color(TEXT2));
                 } else {
                     install_ai = ui.add_enabled(!ai_busy, egui::Button::new(if ai_busy { "Downloading…" } else { "Download AI denoise (about 140 MB)" }).min_size(vec2(ui.available_width(), 28.0))).clicked();
-                    ui.label(RichText::new("Optional. Downloads ONNX Runtime and the RawNIND and SCUNet models once; Ferrotype itself stays small.").size(11.5).color(TEXT2));
+                    ui.label(RichText::new("Optional. Downloads ONNX Runtime and the RawNIND and SCUNet models once, so ferrotype itself stays small.").size(11.5).color(TEXT2));
                 }
             });
             section(ui, "Lens corrections", o_lens, changed(&["o_dist","o_vig","o_fringe","lens","lens_dist","lens_vig"]), |ui| {
@@ -4163,7 +4180,7 @@ impl App {
                         let name = l.name();
                         let low = name.to_lowercase();
                         if words.iter().all(|w| low.contains(w)) {
-                            if ui.selectable_label(p.lens == name, RichText::new(&name).size(12.0)).clicked() {
+                            if ui.selectable_label(p.lens == name, RichText::new(&name).size(12.0).color(if p.lens == name { INK } else { TEXT })).clicked() {
                                 lens_pick = Some(name);
                             }
                             shown += 1;
@@ -4255,7 +4272,7 @@ impl App {
                         dust = ui.button("Find dust").on_hover_text("Marks small dark specks (dust on the scan or sensor) for healing").clicked();
                     });
                 });
-                ui.label(RichText::new("Choose Heal in the toolbar, then click a spot or paint over a larger area. Drag the thin source circle to take texture from somewhere else. Right-click a spot to remove it. Clone copies the source exactly; Heal blends it in.").size(11.5).color(TEXT2));
+                ui.label(RichText::new("Choose Heal in the toolbar, then click a spot or paint over a larger area. Drag the thin source circle to take texture from somewhere else, and right-click a spot to remove it. Clone copies the source exactly, while Heal blends it in.").size(11.5).color(TEXT2));
             });
             section(ui, "Masks", o_masks, changed(&["masks"]), |ui| {
                 mask_tool_on = masks::masks_panel(ui, mask_ui, p);
@@ -4273,7 +4290,7 @@ impl App {
                 slider(ui, "Threshold", &mut p.hal_thr, 0.0, 100.0, d.hal_thr, Some(&grey_ramp(0.15, 1.0)));
                 egui::ComboBox::from_id_salt("match_stock").width(ui.available_width()).selected_text("Match a film stock's grain and halation…").show_ui(ui, |ui| {
                     for st in STOCKS {
-                        if ui.selectable_label(false, format!("{} {}", st.brand, st.name)).clicked() {
+                        if picked(ui, false, format!("{} {}", st.brand, st.name)).clicked() {
                             (p.gr_amt, p.gr_size, p.hal_amt, p.gr_hi) = negative::character(st);
                         }
                     }
@@ -4296,8 +4313,8 @@ impl App {
                 segmented(ui, &mut a, &["Photo", "1:1", "4:5", "9:16", "3:2"]);
                 p.border.aspect = aspects[a];
                 group(ui, "Caption", None);
-                ui.add(egui::TextEdit::singleline(&mut p.border.caption).id(egui::Id::NULL.with("caption")).hint_text("Optional, e.g. Portra 400 · Lisbon").desired_width(f32::INFINITY).margin(vec2(8.0, 5.0)));
-                ui.label(RichText::new("Width is a share of the long side. Canvas pads the frame out to a fixed shape, e.g. 4:5 for Instagram posts. A caption adds a band under the photo.").size(11.5).color(TEXT2));
+                ui.add(egui::TextEdit::singleline(&mut p.border.caption).id(egui::Id::NULL.with("caption")).hint_text("Optional, for example Portra 400 · Lisbon").desired_width(f32::INFINITY).margin(vec2(8.0, 5.0)));
+                ui.label(RichText::new("Width is a share of the long side. Canvas pads the frame out to a fixed shape, such as 4:5 for Instagram posts. A caption adds a band under the photo.").size(11.5).color(TEXT2));
             });
             section(ui, "Color look (LUT)", o_lut, changed(&["lut","lut_amt"]), |ui| {
                 let name = std::path::Path::new(&p.lut).file_name().map(|n| n.to_string_lossy().to_string());
@@ -4320,7 +4337,7 @@ impl App {
                     }
                     slider(ui, "Amount", &mut p.lut_amt, 0.0, 100.0, 100.0, None);
                 }
-                ui.label(RichText::new("Applied after the tone and color settings, on display-ready colors (Rec.709 / sRGB LUTs).").size(11.5).color(TEXT2));
+                ui.label(RichText::new("Applied after the tone and colour settings, on display-ready colours (Rec.709 / sRGB LUTs).").size(11.5).color(TEXT2));
             });
             section(ui, "Calibration", o_cal, changed(&["cal_sh","cal","profile"]), |ui| {
                 ui.horizontal(|ui| {
@@ -4331,11 +4348,11 @@ impl App {
                         }
                         let shown = p.profile.as_ref().map_or("Standard", |c| c.name.as_str());
                         egui::ComboBox::from_id_salt("cal_profile").width(ui.available_width() - 8.0).selected_text(shown).show_ui(ui, |ui| {
-                            if ui.selectable_label(p.profile.is_none(), "Standard").clicked() {
+                            if picked(ui, p.profile.is_none(), "Standard").clicked() {
                                 pick_profile = Some(None);
                             }
                             for c in profiles {
-                                if ui.selectable_label(p.profile.as_ref().is_some_and(|x| x.name == c.name), &c.name).clicked() {
+                                if picked(ui, p.profile.as_ref().is_some_and(|x| x.name == c.name), &c.name).clicked() {
                                     pick_profile = Some(Some(c.clone()));
                                 }
                             }
@@ -4406,8 +4423,8 @@ impl App {
             }
             None => {
                 self.status = match crate::lens::shot(&cur) {
-                    Some(s) if !s.lens.is_empty() => format!("No profile for \u{201c}{}\u{201d}: search for the lens by name", s.lens),
-                    _ => "This photo doesn't say which lens took it: search for the lens by name".into(),
+                    Some(s) if !s.lens.is_empty() => format!("No profile for \"{}\". Search for the lens by name", s.lens),
+                    _ => "This photo doesn't say which lens took it. Search for the lens by name".into(),
                 };
             }
         }
@@ -4496,7 +4513,7 @@ impl App {
                 self.copied = Some(self.params.clone());
             }
             if ui.add_enabled(self.copied.is_some(), egui::Button::new(RichText::new("Paste").color(TEXT2)).fill(Color32::TRANSPARENT).stroke(Stroke::NONE))
-                .on_hover_text("Paste the copied settings (Ctrl/Cmd+V); crop and negative conversion stay").clicked() {
+                .on_hover_text("Paste the copied settings (Ctrl/Cmd+V). Crop and negative conversion are kept").clicked() {
                 self.params = self.params.with_look_of(self.copied.as_ref().unwrap());
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -4739,7 +4756,7 @@ impl App {
                     ui.label(RichText::new("Lock balance across roll").size(12.0));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| switch(ui, &mut locked));
                 });
-                ui.label(RichText::new(if np.levels.is_some() { "Base and levels are fixed from this frame. Use Apply to roll so every frame matches." } else { "Each frame is balanced on its own." }).size(12.0).color(TEXT2));
+                ui.label(RichText::new(if np.levels.is_some() { "Base and levels come from this frame. Use Apply to roll so every frame matches." } else { "Each frame is balanced on its own." }).size(12.0).color(TEXT2));
                 if locked != np.levels.is_some() {
                     if locked {
                         if let Some(ph) = &self.photo {
@@ -4772,13 +4789,13 @@ impl App {
                     if c[0].add(egui::Button::new("Find frame").min_size(vec2(w, 28.0))).on_hover_text("Crop away the holder and film edge").clicked() {
                         scan_action = Some(0);
                     }
-                    if c[1].add(egui::Button::new("Split strip").min_size(vec2(w, 28.0))).on_hover_text("One scan of several frames: each frame becomes its own photo (virtual copies)").clicked() {
+                    if c[1].add(egui::Button::new("Split strip").min_size(vec2(w, 28.0))).on_hover_text("Splits a scan of several frames so each frame becomes its own photo (as virtual copies)").clicked() {
                         scan_action = Some(1);
                     }
                     if c[0].add(egui::Button::new("Find dust").min_size(vec2(w, 28.0))).on_hover_text("Mark specks on the scan for healing").clicked() {
                         scan_action = Some(2);
                     }
-                    if c[1].add(egui::Button::new("Base from shot…").min_size(vec2(w, 28.0))).on_hover_text("Use a photo of blank film (no frame) as the film base, e.g. for the whole roll").clicked() {
+                    if c[1].add(egui::Button::new("Base from shot…").min_size(vec2(w, 28.0))).on_hover_text("Use a photo of blank film (no frame) as the film base, for example for the whole roll").clicked() {
                         scan_action = Some(3);
                     }
                 });
@@ -4824,7 +4841,7 @@ impl App {
         let (Some(ph), Some(cur)) = (&self.photo, self.current.clone()) else { return };
         let frames = scan::split_strip(&scan::frame(&ph.preview, &self.params), self.params.neg.enabled);
         if frames.len() < 2 {
-            self.status = "Found only one frame: try Find frame instead".into();
+            self.status = "Found only one frame. Try Find frame instead".into();
             return;
         }
         let n = frames.len();
@@ -5038,7 +5055,7 @@ impl App {
         if self.colour.screen.profile.trim().is_empty() || self.colour.screen.profile == "srgb" {
             self.status = "Screen colour: sRGB".into();
         } else {
-            self.status = match name { Some(n) => format!("Screen colour: {n}"), None => "That screen profile can't be used: showing sRGB".into() };
+            self.status = match name { Some(n) => format!("Screen colour: {n}"), None => "That screen profile can't be used, so colours are shown as sRGB".into() };
         }
         if let Err(e) = self.colour.save() {
             self.status = format!("Could not save the colour settings: {e}");
@@ -5069,7 +5086,7 @@ impl App {
             };
             egui::ComboBox::from_id_salt("screen").width(ui.available_width()).selected_text(shown).show_ui(ui, |ui| {
                 for (v, n) in [("", "sRGB (as is)"), ("p3", "Display P3"), ("adobe", "Adobe RGB"), ("auto", "System profile")] {
-                    if ui.selectable_label(cur == v, n).clicked() {
+                    if picked(ui, cur == v, n).clicked() {
                         self.colour.screen.profile = v.into();
                         screen_changed = true;
                     }

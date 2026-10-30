@@ -248,7 +248,7 @@ impl Session {
     fn new() -> Result<Session, String> {
         // SAFETY: TWAINDSM.dll is the TWAIN Working Group's manager; DSM_Entry has the signature above.
         let lib = unsafe { libloading::Library::new("TWAINDSM.dll") }
-            .map_err(|_| "No TWAIN driver found. Install your scanner's software (Epson Scan 2 includes the TWAIN driver), or scan with it and let Ferrotype pick up the files.".to_string())?;
+            .map_err(|_| "No TWAIN driver found. Install your scanner's software (Epson Scan 2 includes the TWAIN driver), or scan with it and let ferrotype pick up the files.".to_string())?;
         let entry: DsmEntry = unsafe { *lib.get::<DsmEntry>(b"DSM_Entry\0").map_err(|e| e.to_string())? };
         let class = wide("STATIC");
         let title = wide("Ferrotype scanner");
@@ -476,7 +476,6 @@ fn take(s: &mut Session, src: &mut Identity) -> Result<Option<Picture>, String> 
     } as usize;
     let mut buf = vec![0u8; size];
     let mut px = vec![0u16; w * h * samples];
-    let row_px = w * samples;
     loop {
         let mut x = ImageMemXfer {
             compression: TWON_DONTCARE16,
@@ -495,25 +494,9 @@ fn take(s: &mut Session, src: &mut Identity) -> Result<Option<Picture>, String> 
         if rc != TWRC_SUCCESS && rc != TWRC_XFERDONE {
             return Err(format!("the transfer from the scanner failed (code {rc})"));
         }
-        let (bpr, cols, rows, x0, y0) = (x.bytes_per_row as usize, x.columns as usize, x.rows as usize, x.x_offset as usize, x.y_offset as usize);
-        for r in 0..rows {
-            let y = y0 + r;
-            if y >= h || r * bpr >= buf.len() {
-                break;
-            }
-            let n = (cols * samples).min((w.saturating_sub(x0)) * samples);
-            let line = &buf[r * bpr..(r * bpr + n * bytes).min(buf.len())];
-            let out = &mut px[y * row_px + x0 * samples..][..n.min(line.len() / bytes)];
-            if bytes == 2 {
-                for (o, b) in out.iter_mut().zip(line.chunks_exact(2)) {
-                    *o = u16::from_le_bytes([b[0], b[1]]);
-                }
-            } else {
-                for (o, b) in out.iter_mut().zip(line) {
-                    *o = *b as u16 * 257;
-                }
-            }
-        }
+        // A source that leaves an offset unset would send it as "don't care": count that as 0.
+        let at = |v: u32| if v == TWON_DONTCARE32 { 0 } else { v as usize };
+        super::copy_strip(&mut px, w, h, samples, bytes, &buf, x.bytes_per_row as usize, x.columns as usize, x.rows as usize, at(x.x_offset), at(x.y_offset));
         if rc == TWRC_XFERDONE {
             break;
         }
@@ -538,7 +521,9 @@ fn icc(s: &mut Session, src: &mut Identity) -> Option<Vec<u8>> {
         } else {
             Some(std::slice::from_raw_parts(mem as *const u8, len).to_vec())
         };
-        if flags & TWMF_DSOWNS == 0 && flags & TWMF_HANDLE != 0 {
+        // Ours to free unless the source keeps it. A pointer comes from a fixed global allocation, which
+        // GlobalFree takes as well.
+        if flags & TWMF_DSOWNS == 0 {
             GlobalFree(mem);
         }
         bytes.filter(|b| b.len() > 128)
