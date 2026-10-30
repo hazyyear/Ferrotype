@@ -67,13 +67,22 @@ fn load_other(path: &Path, linearize: bool) -> Result<Rgb32FImage, String> {
     r.no_limits();
     let mut dec = r.into_decoder().map_err(|e| e.to_string())?;
     let orient = dec.orientation().unwrap_or(Orientation::NoTransforms);
+    let icc = dec.icc_profile().ok().flatten();
     let mut img = DynamicImage::from_decoder(dec).map_err(|e| e.to_string())?;
     img.apply_orientation(orient);
     let hdr = matches!(img, DynamicImage::ImageRgb32F(_) | DynamicImage::ImageRgba32F(_));
     let eight_bit = matches!(img, DynamicImage::ImageRgb8(_) | DynamicImage::ImageRgba8(_) | DynamicImage::ImageLuma8(_) | DynamicImage::ImageLumaA8(_));
+    let grey = matches!(img, DynamicImage::ImageLuma8(_) | DynamicImage::ImageLumaA8(_) | DynamicImage::ImageLuma16(_) | DynamicImage::ImageLumaA16(_));
     let mut out = img.to_rgb32f();
     if linearize && !hdr {
-        linearize_srgb(&mut out, eight_bit);
+        // An embedded profile says how to read the values (a scanner's own, Adobe RGB, ProPhoto, a linear one);
+        // an untagged raw scan is linear already; everything else is taken as sRGB.
+        if icc.as_deref().is_some_and(|icc| crate::colour::input_to_linear(&mut out, icc, grey)) {
+            return Ok(out);
+        }
+        if !crate::scanfile::is_linear(path) {
+            linearize_srgb(&mut out, eight_bit);
+        }
     }
     Ok(out)
 }
@@ -281,3 +290,4 @@ mod tests {
         assert!(super::is_raw_photo(std::path::Path::new("IMG_1.NEF.copy2")) && !super::is_raw(std::path::Path::new("IMG_1.NEF.copy2")));
     }
 }
+

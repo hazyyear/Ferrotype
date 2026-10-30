@@ -579,7 +579,12 @@ fn cover_uv(tex: &TextureHandle, aspect: f32) -> Rect {
 fn thumb_cache(f: &Path) -> Option<PathBuf> {
     use sha2::{Digest, Sha256};
     let modified = |p: &Path| std::fs::metadata(p).ok().and_then(|m| m.modified().ok());
-    let key = format!("{}|{:?}|{:?}", f.display(), modified(load::copy_of(f).as_deref().unwrap_or(f)), modified(&crate::sidecar(f)));
+    let mut key = format!("{}|{:?}|{:?}", f.display(), modified(load::copy_of(f).as_deref().unwrap_or(f)), modified(&crate::sidecar(f)));
+    // TIFF scans: read through their colour profile, and the roll can say its untagged scans are linear.
+    if f.to_string_lossy().to_ascii_lowercase().contains(".tif") {
+        let data = f.parent().and_then(crate::roll::read).map(|r| r.scan_data).unwrap_or_default();
+        key += &format!("|scan2|{data}");
+    }
     let h: String = Sha256::digest(key.as_bytes()).iter().take(12).map(|b| format!("{b:02x}")).collect();
     Some(crate::keys::dirs_cache()?.join("thumbs").join(format!("{h}.jpg")))
 }
