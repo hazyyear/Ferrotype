@@ -3,6 +3,7 @@ use crate::develop::{self, HUE_CENTERS, Params, hue_rotate, luma, wb_gains};
 
 mod masks;
 mod scan_view;
+mod scanner_view;
 use masks::{Draw, MaskUi};
 use scan_view::ScanUi;
 use crate::load::{self, linear_to_srgb};
@@ -1624,7 +1625,7 @@ impl App {
                     let mut pi = cur;
                     egui::ComboBox::from_id_salt("paper").width(140.0).selected_text(crate::output::PAPERS[pi].0).show_ui(ui, |ui| {
                         for (k, p) in crate::output::PAPERS.iter().enumerate() {
-                            ui.selectable_value(&mut pi, k, p.0);
+                            pick(ui, &mut pi, k, p.0);
                         }
                     });
                     if pi != cur {
@@ -2661,11 +2662,11 @@ impl App {
                     let mut load = false;
                     egui::ComboBox::from_id_salt("proof").width(110.0).selected_text(shown).show_ui(ui, |ui| {
                         for (k, n) in names.iter().enumerate() {
-                            ui.selectable_value(&mut self.proof, k, *n);
+                            pick(ui, &mut self.proof, k, *n);
                         }
                         ui.separator();
                         if let Some(n) = &printer_name {
-                            ui.selectable_value(&mut self.proof, papers + 1, format!("Printer: {n}"));
+                            pick(ui, &mut self.proof, papers + 1, format!("Printer: {n}"));
                             let mut warn = self.proof == papers + 2;
                             if ui.checkbox(&mut warn, "Show what it can't print").changed() {
                                 self.proof = if warn { papers + 2 } else { papers + 1 };
@@ -3676,12 +3677,12 @@ impl App {
         changed |= row(ui, "Film", &mut |ui: &mut Ui| {
             let mut resp = egui::ComboBox::from_id_salt("roll_stock").selected_text(shown.clone()).width(ui.available_width()).height(320.0).show_ui(ui, |ui| {
                 let mut c = false;
-                if ui.selectable_label(r.stock.is_empty(), "Not noted").clicked() {
+                if picked(ui, r.stock.is_empty(), "Not noted").clicked() {
                     r.stock.clear();
                     c = true;
                 }
                 for s in STOCKS {
-                    if ui.selectable_label(r.stock == s.id, format!("{} {}", s.brand, s.name)).clicked() {
+                    if picked(ui, r.stock == s.id, format!("{} {}", s.brand, s.name)).clicked() {
                         r.stock = s.id.to_string();
                         // Fill in the box speed from the name when it has one ("Portra 400").
                         if let Some(iso) = s.name.split_whitespace().filter_map(|w| w.trim_end_matches(['D', 'T']).parse::<f32>().ok()).last() {
@@ -4163,7 +4164,7 @@ impl App {
                         let name = l.name();
                         let low = name.to_lowercase();
                         if words.iter().all(|w| low.contains(w)) {
-                            if ui.selectable_label(p.lens == name, RichText::new(&name).size(12.0)).clicked() {
+                            if ui.selectable_label(p.lens == name, RichText::new(&name).size(12.0).color(if p.lens == name { INK } else { TEXT })).clicked() {
                                 lens_pick = Some(name);
                             }
                             shown += 1;
@@ -4273,7 +4274,7 @@ impl App {
                 slider(ui, "Threshold", &mut p.hal_thr, 0.0, 100.0, d.hal_thr, Some(&grey_ramp(0.15, 1.0)));
                 egui::ComboBox::from_id_salt("match_stock").width(ui.available_width()).selected_text("Match a film stock's grain and halation…").show_ui(ui, |ui| {
                     for st in STOCKS {
-                        if ui.selectable_label(false, format!("{} {}", st.brand, st.name)).clicked() {
+                        if picked(ui, false, format!("{} {}", st.brand, st.name)).clicked() {
                             (p.gr_amt, p.gr_size, p.hal_amt, p.gr_hi) = negative::character(st);
                         }
                     }
@@ -4331,11 +4332,11 @@ impl App {
                         }
                         let shown = p.profile.as_ref().map_or("Standard", |c| c.name.as_str());
                         egui::ComboBox::from_id_salt("cal_profile").width(ui.available_width() - 8.0).selected_text(shown).show_ui(ui, |ui| {
-                            if ui.selectable_label(p.profile.is_none(), "Standard").clicked() {
+                            if picked(ui, p.profile.is_none(), "Standard").clicked() {
                                 pick_profile = Some(None);
                             }
                             for c in profiles {
-                                if ui.selectable_label(p.profile.as_ref().is_some_and(|x| x.name == c.name), &c.name).clicked() {
+                                if picked(ui, p.profile.as_ref().is_some_and(|x| x.name == c.name), &c.name).clicked() {
                                     pick_profile = Some(Some(c.clone()));
                                 }
                             }
@@ -5069,7 +5070,7 @@ impl App {
             };
             egui::ComboBox::from_id_salt("screen").width(ui.available_width()).selected_text(shown).show_ui(ui, |ui| {
                 for (v, n) in [("", "sRGB (as is)"), ("p3", "Display P3"), ("adobe", "Adobe RGB"), ("auto", "System profile")] {
-                    if ui.selectable_label(cur == v, n).clicked() {
+                    if picked(ui, cur == v, n).clicked() {
                         self.colour.screen.profile = v.into();
                         screen_changed = true;
                     }

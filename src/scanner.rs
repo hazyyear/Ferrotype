@@ -11,6 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 
+pub mod direct;
 pub mod merge;
 #[cfg(windows)]
 mod twain;

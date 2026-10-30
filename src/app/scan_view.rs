@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use crate::{scanfile, scanner};
 
 /// Pages of the Scan view, in the order of its switch.
-pub(super) const PAGES: [&str; 3] = ["Light table", "Capture", "Roll sheet"];
+pub(super) const PAGES: [&str; 4] = ["Light table", "Capture", "Roll sheet", "Scanner"];
 const ROLL_LENGTHS: [usize; 4] = [12, 24, 36, 72];
 
 /// One frame found on a strip scan.
@@ -122,8 +122,8 @@ pub(super) struct ScanUi {
     tx: mpsc::Sender<ScanMsg>,
     rx: mpsc::Receiver<ScanMsg>,
     /// The scanner: what it is doing, while a scan runs.
-    scanning: Option<String>,
-    sc_tx: mpsc::Sender<scanner::Event>,
+    pub scanning: Option<String>,
+    pub sc_tx: mpsc::Sender<scanner::Event>,
     sc_rx: mpsc::Receiver<scanner::Event>,
     /// The TWAIN scanner to use ("" = the system's default).
     twain: String,
@@ -137,6 +137,8 @@ pub(super) struct ScanUi {
     file_info: Option<(PathBuf, Option<scanfile::Info>)>,
     /// The last preview scan and the size of the scanner area it shows (mm).
     preview: Option<(PathBuf, [f32; 2])>,
+    /// The Scanner page: Ferrotype driving the scanner over USB.
+    pub direct: super::scanner_view::DirectUi,
 }
 
 impl Default for ScanUi {
@@ -145,7 +147,7 @@ impl Default for ScanUi {
         let (sc_tx, sc_rx) = mpsc::channel();
         ScanUi {
             page: 0, strip: None, preview_busy: false, checks: None, focus_checked: false, converted: usize::MAX, roll_len: 2, sel: vec![], anchor: None, info: HashMap::new(), info_folder: None, busy: None, tx, rx,
-            scanning: None, sc_tx, sc_rx, twain: String::new(), devices: None, options: None, sane: scanner::Settings { depth: 16, resolution: 2400, passes: 1, linear: true, ..Default::default() }, apps: None, file_info: None, preview: None,
+            scanning: None, sc_tx, sc_rx, twain: String::new(), devices: None, options: None, sane: scanner::Settings { depth: 16, resolution: 2400, passes: 1, linear: true, ..Default::default() }, apps: None, file_info: None, preview: None, direct: Default::default(),
         }
     }
 }
@@ -292,6 +294,7 @@ fn check_frame(preview: &Rgb32FImage, full: &Rgb32FImage, p: &Params) -> Checks 
 impl App {
     /// Collect finished background work for the Scan view. Called every frame.
     pub(super) fn scan_poll(&mut self, ctx: &egui::Context) {
+        self.direct_poll(ctx);
         while let Ok(e) = self.scan.sc_rx.try_recv() {
             match e {
                 scanner::Event::Status(t) => {
@@ -455,6 +458,7 @@ impl App {
                 egui::Frame::new().inner_margin(egui::Margin { right: 10, ..Default::default() }).show(ui, |ui| match page {
                     0 => self.light_table_left(ui),
                     1 => self.capture_left(ui),
+                    3 => self.scanner_left(ui),
                     _ => self.roll_left(ui),
                 });
             });
@@ -463,6 +467,7 @@ impl App {
             egui::Panel::bottom("scan_right_footer").frame(pad(PANEL, 16, 10)).show(ui, |ui| match page {
                 0 => self.light_table_footer(ui),
                 1 => self.capture_footer(ui),
+                3 => self.scanner_footer(ui),
                 _ => self.roll_footer(ui),
             });
             egui::CentralPanel::default().frame(egui::Frame::new()).show(ui, |ui| {
@@ -472,6 +477,7 @@ impl App {
                         match page {
                             0 => self.light_table_right(ui),
                             1 => self.capture_right(ui),
+                            3 => self.scanner_right(ui),
                             _ => self.roll_right(ui),
                         }
                     });
@@ -487,7 +493,7 @@ impl App {
         // A scan with an orange film base is a colour negative: show it converted, as Negative does.
         // Once per photo and page: 1 + page, so Light table and Capture each get their turn.
         let seen = self.photo_gen.wrapping_mul(4) + page;
-        if page != 2
+        if page < 2
             && let Some(ph) = &self.photo
             && self.scan.converted != seen
         {
@@ -524,6 +530,9 @@ impl App {
                             self.image_view(ui);
                         }
                     });
+                }
+                3 => {
+                    egui::CentralPanel::default().frame(egui::Frame::new().fill(CANVAS)).show(ui, |ui| self.scanner_center(ui));
                 }
                 _ => {
                     egui::CentralPanel::default().frame(pad(CANVAS, 20, 16)).show(ui, |ui| self.roll_grid(ui));
@@ -564,6 +573,10 @@ impl App {
                         let (text, col) = if self.watch { (format!("Waiting for frame {next}: shoot it and it opens here"), TEXT2) } else { ("Folder watch is off".to_string(), WARN) };
                         ui.label(RichText::new(text).monospace().size(11.5).color(col));
                     });
+                }
+                3 => {
+                    let text = self.scan.scanning.clone().unwrap_or_else(|| "Direct USB: Ferrotype drives the scanner itself".into());
+                    ui.label(RichText::new(text).monospace().size(11.5).color(TEXT2));
                 }
                 _ => {
                     let n = self.scan.sel.len();
@@ -975,7 +988,7 @@ impl App {
             }
             egui::ComboBox::from_id_salt("sane_dev").width(full - 70.0).selected_text(shown).show_ui(ui, |ui| {
                 for d in &devices {
-                    ui.selectable_value(&mut self.scan.sane.device, d.id.clone(), &d.name);
+                    pick(ui, &mut self.scan.sane.device, d.id.clone(), &d.name);
                 }
             });
             if ghost(ui, "Look", false).on_hover_text("Look for scanners again").clicked() {
@@ -1010,7 +1023,7 @@ impl App {
                 ui.label(RichText::new("Source").size(12.0).color(TEXT2));
                 egui::ComboBox::from_id_salt("sane_src").width(150.0).selected_text(s.source.clone()).show_ui(ui, |ui| {
                     for o in &opts.sources {
-                        ui.selectable_value(&mut s.source, o.clone(), o);
+                        pick(ui, &mut s.source, o.clone(), o);
                     }
                 });
                 ui.end_row();
@@ -1019,7 +1032,7 @@ impl App {
                 ui.label(RichText::new("Resolution").size(12.0).color(TEXT2));
                 egui::ComboBox::from_id_salt("sane_res").width(150.0).selected_text(format!("{} ppi", s.resolution)).show_ui(ui, |ui| {
                     for &r in &opts.resolutions {
-                        ui.selectable_value(&mut s.resolution, r, format!("{r} ppi"));
+                        pick(ui, &mut s.resolution, r, format!("{r} ppi"));
                     }
                 });
                 ui.end_row();
@@ -1029,7 +1042,7 @@ impl App {
                 ui.label(RichText::new("Depth").size(12.0).color(TEXT2));
                 egui::ComboBox::from_id_salt("sane_depth").width(150.0).selected_text(format!("{} bits", s.depth)).show_ui(ui, |ui| {
                     for &d in &depths {
-                        ui.selectable_value(&mut s.depth, d, format!("{d} bits"));
+                        pick(ui, &mut s.depth, d, format!("{d} bits"));
                     }
                 });
                 ui.end_row();
@@ -1038,7 +1051,7 @@ impl App {
             let shown = if s.passes <= 1 { "1 (single scan)".to_string() } else { format!("{} (averaged)", s.passes) };
             egui::ComboBox::from_id_salt("sane_passes").width(150.0).selected_text(shown).show_ui(ui, |ui| {
                 for (n, label) in [(1, "1 (single scan)"), (2, "2 (averaged)"), (4, "4: half the noise"), (8, "8 (averaged)")] {
-                    ui.selectable_value(&mut s.passes, n, label);
+                    pick(ui, &mut s.passes, n, label);
                 }
             })
             .response
@@ -1929,7 +1942,7 @@ impl App {
     }
 
     /// The roll's notes (camera, film, development, and the selected frame's), the same panel as Library's.
-    fn roll_notes(&mut self, ui: &mut Ui) {
+    pub(super) fn roll_notes(&mut self, ui: &mut Ui) {
         if self.folder.is_some() {
             self.roll_panel(ui);
         }

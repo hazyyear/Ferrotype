@@ -91,7 +91,7 @@ pub(super) fn masks_panel(ui: &mut Ui, st: &mut MaskUi, p: &mut Params) -> bool 
                 m.hidden = !m.hidden;
             }
             let name = if m.parts.is_empty() { format!("{} (draw on the photo)", m.name) } else { m.name.clone() };
-            if ui.selectable_label(on, name).clicked() {
+            if picked(ui, on, name).clicked() {
                 st.sel = i;
                 want_tool = true;
             }
@@ -125,7 +125,7 @@ pub(super) fn masks_panel(ui: &mut Ui, st: &mut MaskUi, p: &mut Params) -> bool 
                 if k > 0 {
                     egui::ComboBox::from_id_salt(("op", k)).width(84.0).selected_text(OPS.iter().find(|o| o.0 == part.op).map_or("", |o| o.1)).show_ui(ui, |ui| {
                         for (op, name) in OPS {
-                            ui.selectable_value(&mut part.op, op, name);
+                            pick(ui, &mut part.op, op, name);
                         }
                     });
                 }

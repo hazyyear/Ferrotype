@@ -1,3 +1,4 @@
+#![cfg_attr(windows, allow(dead_code))]
 //! Multi-pass scanning: the same frame scanned several times and averaged. Sensor noise falls by the square root
 //! of the number of passes (4 passes halve it), which mostly shows in the dense parts of a negative (the
 //! highlights). A flatbed's carriage never stops in quite the same place twice, so each pass is first shifted
