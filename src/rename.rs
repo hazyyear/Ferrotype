@@ -89,7 +89,59 @@ pub fn apply(plan: &[(PathBuf, PathBuf)]) -> Result<usize, String> {
     for dir in folders(plan.iter().map(|(a, _)| a.as_path())) {
         crate::write_atomic(&dir.join(LOG), text.as_bytes()).map_err(|e| format!("could not save the undo list: {e}"))?;
     }
-    move_all(plan)
+    let n = move_all(plan)?;
+    follow(plan);
+    Ok(n)
+}
+
+/// The new name of `name` when `from` is renamed to `to`: the photo itself, or one of its virtual copies
+/// (`A.NEF.copy2` → `roll-001.NEF.copy2`).
+fn renamed(name: &str, from: &str, to: &str) -> Option<String> {
+    if name == from {
+        return Some(to.to_string());
+    }
+    let n = name.strip_prefix(from)?.strip_prefix(".copy")?;
+    (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).then(|| format!("{to}.copy{n}"))
+}
+
+/// What other files know a photo by its name follows the rename: the roll's frame notes and hand-picked
+/// collections. Best effort: the photos have already moved, and a note that can't be saved is only a note.
+fn follow(plan: &[(PathBuf, PathBuf)]) {
+    let new_path = |f: &Path| -> Option<PathBuf> {
+        let name = f.file_name()?.to_str()?;
+        plan.iter().filter(|(a, _)| a.parent() == f.parent()).find_map(|(a, b)| {
+            let n = renamed(name, a.file_name()?.to_str()?, b.file_name()?.to_str()?)?;
+            Some(f.with_file_name(n))
+        })
+    };
+    let dirs: std::collections::BTreeSet<&Path> = plan.iter().filter_map(|(a, _)| a.parent()).collect();
+    for dir in dirs {
+        let Some(mut r) = crate::roll::read(dir) else { continue };
+        let mut moved = false;
+        r.frames = std::mem::take(&mut r.frames).into_iter().map(|(k, f)| {
+            match new_path(&dir.join(&k)).and_then(|n| Some(n.file_name()?.to_string_lossy().to_string())) {
+                Some(n) => {
+                    moved = true;
+                    (n, f)
+                }
+                None => (k, f),
+            }
+        }).collect();
+        if moved {
+            let _ = crate::roll::write(dir, &r);
+        }
+    }
+    let mut cols = crate::library::load();
+    let mut changed = false;
+    for f in cols.iter_mut().flat_map(|c| c.files.iter_mut()) {
+        if let Some(n) = new_path(f) {
+            *f = n;
+            changed = true;
+        }
+    }
+    if changed {
+        let _ = crate::library::save(&cols);
+    }
 }
 
 /// Err when a move would land on a file that exists and isn't itself moving out of the way.
@@ -140,6 +192,7 @@ pub fn undo(dir: &Path) -> Result<usize, String> {
     // A new photo may have taken an old name since (cameras restart numbering): never rename over it.
     refuse_clash(&back).map_err(|e| format!("{e}, so the rename can't be undone"))?;
     let n = move_all(&back)?;
+    follow(&back);
     for d in folders(back.iter().map(|(_, a)| a.as_path())).into_iter().chain([dir.to_path_buf()]) {
         let _ = std::fs::remove_file(d.join(LOG));
     }
@@ -177,6 +230,27 @@ mod tests {
         undo(&dir).unwrap();
         assert_eq!(std::fs::read_to_string(dir.join("A.xmp")).unwrap(), "A.xmp");
         assert!(!dir.join("roll-001.NEF").exists() && !can_undo(&dir));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn frame_notes_follow_a_rename_and_its_undo() {
+        let dir = std::env::temp_dir().join(format!("ferrotype-rename3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("scan.tif"), "x").unwrap();
+        std::fs::write(dir.join("scan.tif.copy2.ferrotype.json"), "{}").unwrap();
+        let note = |a: f32| crate::roll::Frame { aperture: a, ..Default::default() };
+        let mut r = crate::roll::Roll { roll: "12".into(), ..Default::default() };
+        r.frames.insert("scan.tif".into(), note(2.8));
+        r.frames.insert("scan.tif.copy2".into(), note(8.0));
+        r.frames.insert("other.tif".into(), note(4.0));
+        crate::roll::write(&dir, &r).unwrap();
+        apply(&plan(&[dir.join("scan.tif")], "roll-{n}", "")).unwrap();
+        let keys = |d: &Path| crate::roll::read(d).unwrap().frames.into_iter().map(|(k, f)| (k, f.aperture)).collect::<Vec<_>>();
+        assert_eq!(keys(&dir), vec![("other.tif".into(), 4.0), ("roll-001.tif".into(), 2.8), ("roll-001.tif.copy2".into(), 8.0)]);
+        undo(&dir).unwrap();
+        assert_eq!(keys(&dir), vec![("other.tif".into(), 4.0), ("scan.tif".into(), 2.8), ("scan.tif.copy2".into(), 8.0)]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

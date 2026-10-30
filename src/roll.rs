@@ -137,17 +137,35 @@ pub fn write(dir: &Path, r: &Roll) -> Result<(), String> {
     crate::write_atomic(&path, text.as_bytes()).map_err(|e| e.to_string())
 }
 
-/// The key a frame is stored under: the file name of the photo (a virtual copy shares its original's notes).
+/// The key a frame is stored under: the photo's own file name. A virtual copy (`scan.tif.copy2`) has its own key,
+/// because the frames split from one strip scan are virtual copies of it and each needs its own notes.
 pub fn frame_key(path: &Path) -> String {
-    let real = crate::load::copy_of(path).unwrap_or_else(|| path.to_path_buf());
-    real.file_name().unwrap_or_default().to_string_lossy().to_string()
+    path.file_name().unwrap_or_default().to_string_lossy().to_string()
+}
+
+impl Roll {
+    /// The notes for the frame at `path`; a virtual copy with none of its own shows its original's.
+    pub fn frame(&self, path: &Path) -> Frame {
+        let own = || self.frames.get(&frame_key(path));
+        let orig = || crate::load::copy_of(path).and_then(|o| self.frames.get(&frame_key(&o)));
+        own().or_else(orig).cloned().unwrap_or_default()
+    }
 }
 
 /// The roll the photo belongs to and its own frame notes.
 pub fn for_photo(path: &Path) -> Option<(Roll, Frame)> {
     let r = read(path.parent()?)?;
-    let f = r.frames.get(&frame_key(path)).cloned().unwrap_or_default();
+    let f = r.frame(path);
     Some((r, f))
+}
+
+/// Year, month and day of a date written with any separators ("2026-05-04", "2026–05–04", "2026/5/4",
+/// "2026年5月4日", or an EXIF "2026:05:04 12:00:00"): the first three runs of digits, year first. None otherwise.
+pub fn date_ymd(s: &str) -> Option<(u32, u32, u32)> {
+    let mut n = s.split(|c: char| !c.is_ascii_digit()).filter(|t| !t.is_empty());
+    let y = n.next().filter(|y| y.len() == 4)?.parse().ok()?;
+    let (m, d): (u32, u32) = (n.next()?.parse().ok()?, n.next()?.parse().ok()?);
+    ((1..=12).contains(&m) && (1..=31).contains(&d)).then_some((y, m, d))
 }
 
 /// Contrast added to the negative conversion per stop of push (pushed film comes out contrastier, pulled film
@@ -176,7 +194,13 @@ pub fn apply_stock(r: &Roll, p: &mut Params) {
 
 /// Fill in what a scan's own metadata lacks (a camera's file keeps its own values) from the roll notes.
 pub fn fill_shot(path: &Path, shot: &mut crate::lens::Shot) {
-    let Some((r, f)) = for_photo(path) else { return };
+    if let Some((r, f)) = for_photo(path) {
+        fill_shot_from(&r, &f, shot);
+    }
+}
+
+/// `fill_shot` with the roll and frame notes already read.
+pub fn fill_shot_from(r: &Roll, f: &Frame, shot: &mut crate::lens::Shot) {
     let empty = |s: &String| s.trim().is_empty();
     // A scanner's own make and model describe the scanner, not the camera the film went through.
     if !empty(&r.camera) {
@@ -197,8 +221,11 @@ pub fn fill_shot(path: &Path, shot: &mut crate::lens::Shot) {
     if f.focal > 0.0 {
         shot.focal = f.focal;
     }
-    if r.date.len() >= 10 && (empty(&shot.taken) || !empty(&r.camera)) {
-        shot.taken = format!("{} 12:00:00", r.date[..10].replace('-', ":"));
+    // The date is typed by hand: use it only when it reads as a date (a pasted en dash used to crash here).
+    if let Some((y, m, d)) = date_ymd(&r.date)
+        && (empty(&shot.taken) || !empty(&r.camera))
+    {
+        shot.taken = format!("{y:04}:{m:02}:{d:02} 12:00:00");
     }
 }
 
@@ -244,6 +271,37 @@ mod tests {
         write(&dir, &Roll::default()).unwrap();
         assert!(read(&dir).is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dates_are_read_whatever_the_dashes() {
+        assert_eq!(date_ymd("2026-05-04"), Some((2026, 5, 4)));
+        assert_eq!(date_ymd("2026–05–04"), Some((2026, 5, 4)));
+        assert_eq!(date_ymd("2026年5月4日"), Some((2026, 5, 4)));
+        assert_eq!(date_ymd("2026:05:04 12:00:00"), Some((2026, 5, 4)));
+        for bad in ["May 2026", "4.5.2026", "2026-13-01", "", "été"] {
+            assert_eq!(date_ymd(bad), None, "{bad}");
+        }
+        let dir = std::env::temp_dir().join(format!("ferro-roll-date-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (typed, want) in [("2026–05–04", "2026:05:04 12:00:00"), ("May 2026", "")] {
+            write(&dir, &Roll { camera: "FM2".into(), date: typed.into(), ..Default::default() }).unwrap();
+            let mut shot = crate::lens::Shot::default();
+            fill_shot(&dir.join("a.tif"), &mut shot);
+            assert_eq!(shot.taken, want, "{typed}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strip_frames_have_their_own_notes() {
+        let mut r = Roll::default();
+        let (scan, copy2, copy3) = (Path::new("/r/scan.tif"), Path::new("/r/scan.tif.copy2"), Path::new("/r/scan.tif.copy3"));
+        r.frames.insert(frame_key(scan), Frame { aperture: 2.8, ..Default::default() });
+        r.frames.insert(frame_key(copy2), Frame { aperture: 8.0, ..Default::default() });
+        assert_eq!((r.frame(scan).aperture, r.frame(copy2).aperture), (2.8, 8.0));
+        // A copy with no notes of its own shows its original's.
+        assert_eq!(r.frame(copy3).aperture, 2.8);
     }
 
     #[test]

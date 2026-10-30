@@ -718,7 +718,7 @@ impl App {
             load::copy_of(&v).filter(|o| files.contains(o)).map(|_| v)
         }).collect();
         files.extend(copies);
-        files.sort();
+        load::sort_photos(&mut files);
         self.subdirs = entries.into_iter().filter(|p| p.is_dir() && !p.file_name().unwrap_or_default().to_string_lossy().starts_with('.')).collect();
         self.subdirs.sort();
         self.collection = None;
@@ -761,9 +761,10 @@ impl App {
         self.search_busy = true;
         let (files, tx) = (self.files.clone(), self.tx.clone());
         std::thread::spawn(move || {
+            let rolls = crate::library::Rolls::default();
             let entries: Vec<(PathBuf, crate::library::Entry)> = files.par_iter().map(|f| {
                 let p = read_params(f).unwrap_or_default();
-                (f.clone(), crate::library::entry(f, &p))
+                (f.clone(), rolls.entry(f, &p))
             }).collect();
             let _ = tx.send(Msg::Indexed(generation, entries));
         });
@@ -879,7 +880,7 @@ impl App {
             }
         }
         self.files.extend(ready.iter().cloned());
-        self.files.sort();
+        load::sort_photos(&mut self.files);
         self.spawn_thumbs(ctx, ready.clone(), self.thumb_gen.load(std::sync::atomic::Ordering::Relaxed));
         let newest = ready.last().unwrap().clone();
         self.status = format!("New: {}", newest.file_name().unwrap_or_default().to_string_lossy());
@@ -1379,6 +1380,11 @@ impl App {
 
     /// A new virtual copy of `f` with these settings; returns its path.
     fn virtual_copy(&mut self, f: &Path, p: &Params) -> Option<PathBuf> {
+        self.virtual_copy_as(f, &Params { strip_frame: false, ..p.clone() })
+    }
+
+    /// `virtual_copy` with the settings exactly as given (the Scan tab marks the frames it makes).
+    pub(crate) fn virtual_copy_as(&mut self, f: &Path, p: &Params) -> Option<PathBuf> {
         let orig = load::copy_of(f).unwrap_or(f.to_path_buf());
         let name = orig.file_name()?.to_string_lossy().to_string();
         let copy = (2..1000).map(|i| orig.with_file_name(format!("{name}.copy{i}"))).find(|c| !crate::sidecar(c).exists())?;
@@ -3344,14 +3350,14 @@ impl App {
         if let Some(sel) = hdr {
             let groups = sel.then(|| {
                 let mut files = self.lib_multi.clone();
-                files.sort();
+                load::sort_photos(&mut files);
                 vec![files]
             });
             self.merge_hdr(ui.ctx(), groups);
         }
         if let Some(multi) = rename {
             let mut files = if multi { self.lib_multi.clone() } else { rename_one.into_iter().collect() };
-            files.sort();
+            load::sort_photos(&mut files);
             self.rename_dlg = Some(RenameDlg { files, pattern: "{date}-{n}".into(), roll: self.export.roll.clone(), preview: vec![], previewed: Default::default() });
         }
         if undo_rename && let Some(d) = self.folder.clone() {
@@ -3383,13 +3389,13 @@ impl App {
         }
         if export_sel {
             let mut files = self.lib_multi.clone();
-            files.sort();
+            load::sort_photos(&mut files);
             self.export_sel = files;
             self.export_dialog = Some(true);
         }
         if let Some(pr) = pano {
             let mut files = self.lib_multi.clone();
-            files.sort();
+            load::sort_photos(&mut files);
             self.merge_pano(ui.ctx(), files, pr);
         }
         if let Some(f) = open {
@@ -3733,7 +3739,7 @@ impl App {
         // This frame's settings, when one is selected.
         if let Some(f) = self.lib_sel.clone() {
             let key = crate::roll::frame_key(&f);
-            let mut fr = r.frames.get(&key).cloned().unwrap_or_default();
+            let mut fr = r.frame(&f);
             ui.add_space(10.0);
             ui.label(caps("This frame"));
             let mut fc = false;

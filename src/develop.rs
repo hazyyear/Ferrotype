@@ -126,6 +126,10 @@ pub struct Params {
     /// 1 = made before the camera curve existed (settings tuned on the flat look, so it never gets one);
     /// 2 = starts from the camera's look. `read_params` marks a sidecar without the field as 1.
     pub process: u8,
+    /// A frame that the Scan tab's Split strip made as a virtual copy of the strip scan. Adding the strip again
+    /// replaces these, and only these: copies made by hand are left alone.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub strip_frame: bool,
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -297,6 +301,7 @@ impl Default for Params {
             profile: None,
             cam_curve: vec![],
             process: 2,
+            strip_frame: false,
         }
     }
 }
@@ -318,6 +323,7 @@ impl Params {
         p.profile = self.profile.clone();
         (p.cam_curve, p.process) = (self.cam_curve.clone(), self.process);
         p.keywords = self.keywords.clone();
+        p.strip_frame = self.strip_frame;
         p
     }
 
@@ -394,7 +400,7 @@ impl Params {
 
     /// True when the photo has edits, ignoring its rating, flag, label and snapshots.
     pub fn is_edited(&self) -> bool {
-        Params { rating: 0, flag: 0, label: 0, snapshots: vec![], cam_curve: vec![], process: 2, keywords: vec![], ..self.clone() } != Params::default()
+        Params { rating: 0, flag: 0, label: 0, snapshots: vec![], cam_curve: vec![], process: 2, keywords: vec![], strip_frame: false, ..self.clone() } != Params::default()
     }
 
     /// Turn a quarter clockwise (or back), carrying the crop, spots, filters and brush strokes along.
@@ -1907,6 +1913,18 @@ mod tests {
         let q: Params = serde_json::from_str("{}").unwrap();
         assert!(q.profile.is_none() && !serde_json::to_string(&q).unwrap().contains("profile"));
         assert!(!Params { process: 1, ..q }.is_edited());
+    }
+
+    #[test]
+    fn strip_frame_mark_stays_with_its_photo() {
+        // Old sidecars and ordinary photos don't carry it at all.
+        assert!(!serde_json::to_string(&Params::default()).unwrap().contains("strip_frame"));
+        let frame = Params { strip_frame: true, ..Default::default() };
+        let back: Params = serde_json::from_str(&serde_json::to_string(&frame).unwrap()).unwrap();
+        assert!(back.strip_frame);
+        // Paste and presets neither add nor remove it.
+        assert!(frame.with_look_of(&Params::default()).strip_frame);
+        assert!(!Params::default().with_look_of(&frame).strip_frame);
     }
 
     #[test]
