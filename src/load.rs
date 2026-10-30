@@ -43,6 +43,12 @@ fn load_raw(path: &Path) -> Result<Rgb32FImage, String> {
     let dec = rawler::get_decoder(&src).map_err(|e| e.to_string())?;
     let raw = dec.raw_image(&src, &RawDecodeParams::default(), false).map_err(|e| e.to_string())?;
     let orient = Orientation::from_exif(raw.orientation.to_u16() as u8).unwrap_or(Orientation::NoTransforms);
+    // Our own demosaicing (RCD, X-Trans) and colour where we handle the sensor; rawler's develop otherwise.
+    if let Some(img) = crate::demosaic::develop(&raw) {
+        let mut img = DynamicImage::ImageRgb32F(img);
+        img.apply_orientation(orient);
+        return Ok(img.to_rgb32f());
+    }
     // Default steps minus the sRGB gamma: we want linear data.
     let steps: Vec<_> = RawDevelop::default().steps.into_iter().filter(|s| *s != ProcessingStep::SRgb).collect();
     let img = RawDevelop::new_with(&steps).develop_intermediate(&raw).map_err(|e| e.to_string())?;

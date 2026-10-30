@@ -19,6 +19,7 @@ mod calib;
 mod upright;
 mod roll;
 mod colour;
+mod demosaic;
 
 use develop::Params;
 use image::{DynamicImage, Rgb32FImage, codecs::jpeg::JpegEncoder};
