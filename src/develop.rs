@@ -99,6 +99,8 @@ pub struct Params {
     pub label: u8,
     /// AI denoise strength, 0–100 (needs the optional model).
     pub ai_nr: f32,
+    /// Infrared dust and scratch removal, 0 = off, up to 100 (needs a scan with an infrared channel, see `scan::ir_clean`).
+    pub ir_clean: f32,
     /// Named versions of these settings to come back to.
     pub snapshots: Vec<Snapshot>,
     /// Lens profile from the lensfun database ("" = off), with the shot's focal length, f-number and camera crop factor.
@@ -286,7 +288,7 @@ impl Default for Params {
             grads: vec![],
             brushes: vec![],
             masks: vec![],
-            rot90: 0, label: 0, ai_nr: 0.0, snapshots: vec![],
+            rot90: 0, label: 0, ai_nr: 0.0, ir_clean: 0.0, snapshots: vec![],
             lens: String::new(), lens_focal: 0.0, lens_f: 0.0, lens_crop: 1.0, lens_dist: 100.0, lens_vig: 100.0,
             profile: None,
             cam_curve: vec![],

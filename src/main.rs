@@ -434,6 +434,7 @@ pub fn export_file(path: &Path, out_dir: &Path, o: &ExportOpts, n: usize, overri
     if load::is_raw_photo(path) && wants_cam_curve(&p) {
         p.cam_curve = load::camera_curve(path, &raw);
     }
+    let raw = scan::prepare_ir(raw, path, &p);
     let img = denoise::prepare(raw, path, &p)?;
     if let Some(m) = o.upright {
         p = upright::apply(&img, &p, m);

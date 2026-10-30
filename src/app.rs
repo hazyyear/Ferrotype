@@ -204,6 +204,8 @@ enum Msg {
     /// it sends nothing but `skipped`, so it is tried again when you come back.
     Cull(PathBuf, Option<CullData>, bool),
     Denoised(PathBuf, Result<Vec<f32>, String>),
+    /// Infrared cleaning finished: the photo, the strength, the cleaned source (None: the scan has no infrared).
+    IrCleaned(PathBuf, f32, Option<Arc<Rgb32FImage>>),
     AiInstalled(Result<(), String>),
     /// A 1:1 window finished rendering: the settings and window it shows.
     Zoomed(Params, [u32; 4], f32, ColorImage),
@@ -266,6 +268,12 @@ struct Photo {
     /// AI denoise result as a difference from `orig`, once computed.
     delta: Option<Arc<Vec<f32>>>,
     nr_applied: f32,
+    /// Infrared-cleaned `orig` and the strength it was cleaned at; whether the scan has infrared (None = not
+    /// looked yet), a clean running, and the strength `full` was built with.
+    ir_base: Option<(f32, Arc<Rgb32FImage>)>,
+    has_ir: Option<bool>,
+    ir_busy: bool,
+    ir_applied: f32,
     preview: Arc<Rgb32FImage>,
     draft: Arc<Rgb32FImage>,
     auto_base: [f32; 3],
@@ -583,7 +591,7 @@ fn describe_change(a: &Params, b: &Params) -> (String, String) {
         ("t_rot", "Rotate"), ("t_scale", "Scale"), ("flip_h", "Flip"), ("crop", "Crop"), ("vig", "Vignette"), ("vig_mid", "Vignette midpoint"),
         ("vig_round", "Vignette roundness"), ("vig_fea", "Vignette feather"), ("vig_hi", "Vignette highlights"), ("gr_amt", "Grain"), ("gr_size", "Grain size"),
         ("gr_rough", "Grain roughness"), ("cal_sh", "Shadows tint"), ("cal", "Calibration"), ("neg", "Negative"), ("border", "Border"), ("spots", "Spot removal"), ("masks", "Mask"), ("hal_amt", "Halation"), ("hal_size", "Halation size"), ("hal_thr", "Halation threshold"), ("curves", "Point curve"), ("lut", "LUT"), ("lut_amt", "LUT amount"), ("rating", "Rating"), ("flag", "Flag"),
-        ("rot90", "Rotate 90°"), ("profile", "Profile"), ("label", "Label"), ("ai_nr", "AI denoise"), ("snapshots", "Snapshot"),
+        ("rot90", "Rotate 90°"), ("profile", "Profile"), ("label", "Label"), ("ai_nr", "AI denoise"), ("ir_clean", "Infrared clean"), ("snapshots", "Snapshot"),
     ];
     let changed: Vec<&(&str, &str)> = names.iter().filter(|(k, _)| ja.get(k) != jb.get(k)).collect();
     match changed.as_slice() {
@@ -895,7 +903,7 @@ impl App {
                                 format!("{} × {}", full.width(), full.height())
                             };
                             let full = Arc::new(full);
-                            self.photo = Some(Photo { full: full.clone(), orig: full, delta: delta.map(Arc::new), nr_applied: 0.0, preview: Arc::new(preview), draft: Arc::new(draft), auto_base });
+                            self.photo = Some(Photo { full: full.clone(), orig: full, delta: delta.map(Arc::new), nr_applied: 0.0, ir_base: None, has_ir: None, ir_busy: false, ir_applied: 0.0, preview: Arc::new(preview), draft: Arc::new(draft), auto_base });
                             // The previous photo's picture must not show under this one's name.
                             self.tex = None;
                             self.photo_gen += 1;
@@ -942,6 +950,18 @@ impl App {
                         let tex = ctx.load_texture(format!("cull {name}"), d.img, TextureOptions::LINEAR);
                         let focus = ctx.load_texture(format!("focus {name}"), d.focus, TextureOptions::LINEAR);
                         self.cull.cache.insert(p, CullImg { tex, focus, bins: d.bins, clipped: d.clipped, raw: d.raw });
+                    }
+                }
+                Msg::IrCleaned(p, amt, r) => {
+                    if let Some(ph) = &mut self.photo
+                        && Some(&p) == self.current.as_ref()
+                    {
+                        ph.ir_busy = false;
+                        ph.has_ir = Some(r.is_some());
+                        match r {
+                            Some(img) => ph.ir_base = Some((amt, img)),
+                            None => self.status = "This scan has no infrared channel".into(),
+                        }
                     }
                 }
                 Msg::Denoised(p, r) => {
@@ -1153,12 +1173,30 @@ impl App {
                 ctx2.request_repaint();
             });
         }
+        // Infrared cleaning: off the UI thread, once the slider is let go.
+        let held = ctx.input(|i| i.pointer.any_down());
+        let ir_amt = self.params.ir_clean;
+        if ir_amt > 0.0 && ph.has_ir != Some(false) && !ph.ir_busy && ph.ir_base.as_ref().map(|b| b.0) != Some(ir_amt) && !held {
+            ph.ir_busy = true;
+            let (img, path, tx, ctx2) = (ph.orig.clone(), cur.clone(), self.tx.clone(), ctx.clone());
+            std::thread::spawn(move || {
+                let r = scan::ir_channel(&path).map(|ir| Arc::new(scan::ir_clean(&img, &ir, ir_amt)));
+                let _ = tx.send(Msg::IrCleaned(path, ir_amt, r));
+                ctx2.request_repaint();
+            });
+        }
+        let ir_use = if ir_amt > 0.0 { ph.ir_base.as_ref().map_or(0.0, |b| b.0) } else { 0.0 };
         let want = if ph.delta.is_some() { amt } else { 0.0 };
-        if want != ph.nr_applied && !ctx.input(|i| i.pointer.any_down()) {
-            ph.full = match &ph.delta {
-                Some(d) if want > 0.0 => Arc::new(denoise::apply_delta(&ph.orig, d, want / 100.0)),
+        if (want != ph.nr_applied || ir_use != ph.ir_applied) && !held {
+            let base = match &ph.ir_base {
+                Some((_, img)) if ir_use > 0.0 => img.clone(),
                 _ => ph.orig.clone(),
             };
+            ph.full = match &ph.delta {
+                Some(d) if want > 0.0 => Arc::new(denoise::apply_delta(&base, d, want / 100.0)),
+                _ => base,
+            };
+            ph.ir_applied = ir_use;
             ph.preview = Arc::new(load::fit(&ph.full, PREVIEW));
             ph.draft = Arc::new(load::fit(&ph.preview, DRAFT));
             ph.nr_applied = want;
@@ -1290,10 +1328,11 @@ impl App {
         let (orig, delta, params, tx, o, cur) = (photo.orig.clone(), photo.delta.clone(), self.params.clone(), self.tx.clone(), self.export.clone(), cur.clone());
         self.status = "Printing…".into();
         std::thread::spawn(move || {
+            let base = scan::prepare_ir((*orig).clone(), &cur, &params);
             let src = match (&delta, params.ai_nr > 0.0) {
-                (Some(d), true) => Ok(denoise::apply_delta(&orig, d, params.ai_nr / 100.0)),
-                (None, true) => denoise::prepare((*orig).clone(), &cur, &params),
-                _ => Ok((*orig).clone()),
+                (Some(d), true) => Ok(denoise::apply_delta(&base, d, params.ai_nr / 100.0)),
+                (None, true) => denoise::prepare(base, &cur, &params),
+                _ => Ok(base),
             };
             let r = src.and_then(|src| write_export(&src, &params, &o, &out, &cur));
             let _ = tx.send(Msg::Status(match r { Ok(()) => format!("Printed {}", out.file_name().unwrap_or_default().to_string_lossy()), Err(e) => format!("Print failed: {e}") }));
@@ -4229,6 +4268,8 @@ impl App {
     fn negative_right(&mut self, ui: &mut Ui) {
         let auto_base = self.auto_base();
         let profile = self.params.profile.clone();
+        let has_ir = self.photo.as_ref().map(|p| (p.has_ir, p.ir_busy));
+        let ir_clean = &mut self.params.ir_clean;
         let np = &mut self.params.neg;
         let st = negative::stock(&np.stock);
         let mut add_character = false;
@@ -4373,6 +4414,18 @@ impl App {
                         scan_action = Some(3);
                     }
                 });
+                // Infrared cleaning (Digital ICE style) for scans saved with their infrared channel.
+                slider(ui, "Infrared clean", ir_clean, 0.0, 100.0, 0.0, None);
+                let note = match has_ir {
+                    Some((Some(false), _)) => Some("This scan has no infrared channel. Save scans as 64-bit RGBI TIFF (VueScan, SilverFast) to use it."),
+                    Some((_, true)) => Some("Cleaning with the infrared channel…"),
+                    _ if st.kind == Kind::Bw => Some("Silver black-and-white film blocks infrared, so this works on colour film and C-41 black-and-white only."),
+                    _ if *ir_clean <= 0.0 => Some("Removes dust and scratches found in the scan's infrared channel."),
+                    _ => None,
+                };
+                if let Some(n) = note {
+                    ui.label(RichText::new(n).size(11.5).color(TEXT2));
+                }
             });
         });
         match scan_action {
