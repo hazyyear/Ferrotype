@@ -119,6 +119,8 @@ pub(super) struct ScanUi {
     rx: mpsc::Receiver<ScanMsg>,
     /// The scanner: what it is doing, while a scan runs.
     pub scanning: Option<String>,
+    /// How far the scan is, from 0 to 1, when the scanner says.
+    pub progress: Option<f32>,
     pub sc_tx: mpsc::Sender<scanner::Event>,
     sc_rx: mpsc::Receiver<scanner::Event>,
     /// The TWAIN scanner to use ("" = the system's default).
@@ -138,7 +140,7 @@ impl Default for ScanUi {
         let (sc_tx, sc_rx) = mpsc::channel();
         ScanUi {
             page: 0, strip: None, preview_busy: false, checks: None, focus_checked: false, converted: usize::MAX, roll_len: 2, sel: vec![], anchor: None, info: HashMap::new(), info_folder: None, busy: None, tx, rx,
-            scanning: None, sc_tx, sc_rx, twain: String::new(), apps: None, file_info: None, direct: Default::default(),
+            scanning: None, progress: None, sc_tx, sc_rx, twain: String::new(), apps: None, file_info: None, direct: Default::default(),
         }
     }
 }
@@ -246,7 +248,7 @@ fn check_frame(preview: &Rgb32FImage, full: &Rgb32FImage, p: &Params) -> Checks 
     } else if neg {
         let b = luma(auto_base) / 0.995;
         if b < 0.45 {
-            (false, format!("Film base at {:.0}%: room for more exposure", b * 100.0))
+            (false, format!("Film base at {:.0}%, so there is room for more exposure", b * 100.0))
         } else {
             (true, format!("Film base at {:.0}%, nothing clipped", b * 100.0))
         }
@@ -256,7 +258,7 @@ fn check_frame(preview: &Rgb32FImage, full: &Rgb32FImage, p: &Params) -> Checks 
     let crop = scan::auto_crop(&g, neg);
     let framing = match crop {
         Some(_) => (true, "Frame edges found".to_string()),
-        None => (false, "Couldn't find the frame edges: is the whole frame in view?".to_string()),
+        None => (false, "Couldn't find the frame edges. Is the whole frame in view?".to_string()),
     };
     // Corners against the centre, inside the frame: a tilted or bowed negative goes soft at one end.
     let c = crop.unwrap_or([0.05; 4]);
@@ -273,7 +275,7 @@ fn check_frame(preview: &Rgb32FImage, full: &Rgb32FImage, p: &Params) -> Checks 
     let sharp = if mid < 1e-4 || bw < 4 {
         (true, "Not enough detail to judge".to_string())
     } else if worst / mid < 0.45 {
-        (false, format!("The {} corner is much softer than the centre: check the film is flat and square to the lens", names[wi]))
+        (false, format!("The {} corner is much softer than the centre. Check that the film is flat and square to the lens", names[wi]))
     } else {
         (true, "Corners about as sharp as the centre".into())
     };
@@ -288,14 +290,14 @@ impl App {
         self.direct_poll(ctx);
         while let Ok(e) = self.scan.sc_rx.try_recv() {
             match e {
-                scanner::Event::Status(t) => {
-                    self.status = t.clone();
-                    self.scan.scanning = Some(t);
-                }
+                // Shown next to the page tabs (and in the Light table's scanner panel), not again in the top bar.
+                scanner::Event::Status(t) => self.scan.scanning = Some(t),
+                scanner::Event::Progress(f) => self.scan.progress = Some(f),
                 // The folder watch (on while scanning) brings the file in and opens it.
                 scanner::Event::Saved(f) => self.status = format!("Scanned {}", f.file_name().unwrap_or_default().to_string_lossy()),
                 scanner::Event::Done(r) => {
                     self.scan.scanning = None;
+                    self.scan.progress = None;
                     self.status = match r {
                         Ok(0) => "The scanner was closed without scanning".into(),
                         Ok(1) => "1 scan saved".into(),
@@ -349,7 +351,7 @@ impl App {
                                 self.open_path(ctx, first);
                             }
                         }
-                        Err(e) => self.status = format!("Couldn't split it: {e}"),
+                        Err(e) => self.status = format!("Couldn't split it. {e}"),
                     }
                 }
                 ScanMsg::FileInfo(f, i) => {
@@ -537,12 +539,12 @@ impl App {
                 1 => {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let next = self.roll_frames().len() + 1;
-                        let (text, col) = if self.watch { (format!("Waiting for frame {next}: shoot it and it opens here"), TEXT2) } else { ("Folder watch is off".to_string(), WARN) };
+                        let (text, col) = if self.watch { (format!("Waiting for frame {next}. Shoot it and it opens here"), TEXT2) } else { ("Folder watch is off".to_string(), WARN) };
                         ui.label(RichText::new(text).monospace().size(11.5).color(col));
                     });
                 }
                 3 => {
-                    let text = self.scan.scanning.clone().unwrap_or_else(|| "Direct USB: Ferrotype drives the scanner itself".into());
+                    let text = self.scan.scanning.clone().unwrap_or_else(|| self.scan.direct.subtitle().into());
                     ui.label(RichText::new(text).monospace().size(11.5).color(TEXT2));
                 }
                 _ => {
@@ -552,7 +554,7 @@ impl App {
                     ui.add_space(6.0);
                     let any = n > 0;
                     let mut act = None;
-                    for (k, (name, tip)) in [("Rotate", "Turn a quarter clockwise"), ("Flip", "Mirror left to right (emulsion side scanned the wrong way)"), ("Find frame", "Crop away the holder and film edge"), ("Skip", "Leave out of the roll (marks the frame rejected); again to bring it back")].iter().enumerate() {
+                    for (k, (name, tip)) in [("Rotate", "Turn a quarter clockwise"), ("Flip", "Mirror left to right (emulsion side scanned the wrong way)"), ("Find frame", "Crop away the holder and film edge"), ("Skip", "Leave this frame out of the roll by marking it rejected. Press again to bring it back")].iter().enumerate() {
                         if ui.add_enabled(any, egui::Button::new(*name)).on_hover_text(*tip).clicked() {
                             act = Some(k);
                         }
@@ -869,7 +871,7 @@ impl App {
             #[cfg(windows)]
             {
                 let ctx = ui.ctx().clone();
-                ui.label(RichText::new("Opens your scanner's own window (Epson Scan 2 for a Perfection). Scan there; each picture lands in this folder as a 16-bit TIFF.").size(12.0).color(TEXT2));
+                ui.label(RichText::new("Opens your scanner's own window (Epson Scan 2 for a Perfection). Scan there, and each picture lands in this folder as a 16-bit TIFF.").size(12.0).color(TEXT2));
                 if primary(ui, "Scan", true).on_hover_text("Scan into the open folder").clicked() {
                     self.start_scan(&ctx);
                 }
@@ -884,7 +886,7 @@ impl App {
                     }
                 });
             }
-            let hint = if cfg!(windows) { "Or let Ferrotype drive a V800/V850 itself" } else { "Preview, pick frames and scan them" };
+            let hint = if cfg!(windows) { "Or let ferrotype run the scanner itself" } else { "Preview, pick frames and scan them" };
             if ui.add(egui::Button::new("Scanner page…").min_size(vec2(ui.available_width(), 28.0))).on_hover_text(hint).clicked() {
                 self.scan.page = 3;
             }
@@ -894,11 +896,11 @@ impl App {
             ui.label(RichText::new("Or scan with").size(12.0).color(TEXT3));
             ui.horizontal_wrapped(|ui| {
                 for (name, path) in &apps {
-                    if ui.button(*name).on_hover_text("Open it, and save its scans into this folder: they appear here as they arrive").clicked() {
+                    if ui.button(*name).on_hover_text("Open it and save its scans into this folder. They appear here as they arrive").clicked() {
                         match scanner::launch(path) {
                             Ok(()) => {
                                 self.watch = true;
-                                self.status = format!("Opened {name}: save into {}", self.folder.as_deref().map(|d| d.display().to_string()).unwrap_or_else(|| "the open folder".into()));
+                                self.status = format!("Opened {name}. Save your scans into {}", self.folder.as_deref().map(|d| d.display().to_string()).unwrap_or_else(|| "the open folder".into()));
                             }
                             Err(e) => self.status = format!("Couldn't open {name}: {e}"),
                         }
@@ -958,7 +960,7 @@ impl App {
         }
         ui.label(RichText::new(bits.join(" · ")).size(12.0).color(TEXT2));
         if info.icc {
-            ui.label(RichText::new("Colour profile embedded: read through it").size(12.0).color(TEXT3));
+            ui.label(RichText::new("Has a colour profile, which is used to read it").size(12.0).color(TEXT3));
         } else if info.bits >= 16 {
             // Untagged 16-bit data may be linear (a raw scan) or gamma-encoded: the guess can be overruled per roll.
             let dir = cur.parent().map(Path::to_path_buf);
@@ -971,7 +973,7 @@ impl App {
                 scanfile::Data::Gamma => 2,
             };
             let guess = if info.looks_linear() { "linear" } else { "gamma" };
-            ui.label(RichText::new(format!("Scan data (no profile; looks {guess})")).size(12.0).color(TEXT3));
+            ui.label(RichText::new(format!("Scan data with no profile (looks {guess})")).size(12.0).color(TEXT3));
             segmented(ui, &mut i, &["Auto", "Linear", "Gamma"]);
             let now = [scanfile::Data::Auto, scanfile::Data::Linear, scanfile::Data::Gamma][i];
             if now != was
@@ -990,7 +992,7 @@ impl App {
             }
         }
         if info.pages > 1 {
-            ui.label(RichText::new(format!("This file holds {} scans (multi-page TIFF): only the first shows.", info.pages)).size(12.0).color(WARN));
+            ui.label(RichText::new(format!("This file holds {} scans (a multi-page TIFF), and only the first is shown.", info.pages)).size(12.0).color(WARN));
             let busy = self.scan.busy.is_some();
             if ui.add_enabled(!busy, egui::Button::new(format!("Split into {} files", info.pages)).min_size(vec2(ui.available_width(), 28.0))).clicked() {
                 // A holder of frames at full resolution is gigabytes to read and write: off the window's thread.
@@ -1038,7 +1040,7 @@ impl App {
             if c[1].add(egui::Button::new("Right").min_size(vec2(w, 28.0))).on_hover_text("Turn right").clicked() {
                 fr.turns = (fr.turns + 1) % 4;
             }
-            if c[2].add(egui::Button::new(RichText::new("Flip").color(if fr.flip { INK } else { TEXT })).fill(if fr.flip { BONE } else { Color32::TRANSPARENT }).min_size(vec2(w, 28.0))).on_hover_text("Scanned emulsion side up: mirror it").clicked() {
+            if c[2].add(egui::Button::new(RichText::new("Flip").color(if fr.flip { INK } else { TEXT })).fill(if fr.flip { BONE } else { Color32::TRANSPARENT }).min_size(vec2(w, 28.0))).on_hover_text("Scanned emulsion side up, so mirror it").clicked() {
                 fr.flip = !fr.flip;
             }
             if c[3].add(egui::Button::new(RichText::new("Skip").color(if fr.skip { INK } else { TEXT })).fill(if fr.skip { BONE } else { Color32::TRANSPARENT }).min_size(vec2(w, 28.0))).on_hover_text("Leave this frame out (blank, fogged, leader)").clicked() {
@@ -1180,7 +1182,7 @@ impl App {
                 self.scan.strip = None;
             }
             add = c[1].add_enabled(!kept.is_empty() && !done, egui::Button::new(RichText::new(label).color(INK).family(semi())).fill(BONE).stroke(Stroke::NONE).min_size(vec2(c[1].available_width(), 32.0)))
-                .on_hover_text("The first frame stays on this scan; the others become virtual copies, each its own frame in the roll").clicked();
+                .on_hover_text("The first frame stays on this scan. The others become virtual copies, each its own frame in the roll").clicked();
         });
         if add {
             self.strip_add(kept, key);
@@ -1238,7 +1240,7 @@ impl App {
     fn capture_left(&mut self, ui: &mut Ui) {
         ui.spacing_mut().item_spacing.y = 10.0;
         ui.label(caps("Source"));
-        ui.label(RichText::new("Shoot each frame on a light source with your camera, saving or tethering into one folder. Ferrotype opens each new frame as it lands.").size(12.0).color(TEXT2));
+        ui.label(RichText::new("Shoot each frame on a light source with your camera, saving or tethering into one folder. ferrotype opens each new frame as it lands.").size(12.0).color(TEXT2));
         let name = self.folder.as_ref().map(|d| d.display().to_string()).unwrap_or_else(|| "No folder".into());
         ui.label(RichText::new(name).monospace().size(11.0).color(TEXT3));
         if ui.add(egui::Button::new("Choose capture folder…").min_size(vec2(ui.available_width(), 30.0))).clicked()
@@ -1345,7 +1347,7 @@ impl App {
         }
         ui.add_space(6.0);
         let rejected = self.params.flag < 0;
-        if ui.add(egui::Button::new(if rejected { "Keep this frame" } else { "Retake: skip this frame" }).min_size(vec2(ui.available_width(), 30.0))).on_hover_text("Marks it rejected so it leaves the count; shoot the frame again").clicked() {
+        if ui.add(egui::Button::new(if rejected { "Keep this frame" } else { "Retake (skip this frame)" }).min_size(vec2(ui.available_width(), 30.0))).on_hover_text("Marks it rejected so it leaves the count. Then shoot the frame again").clicked() {
             self.params.flag = if rejected { 0 } else { -1 };
         }
     }
@@ -1618,11 +1620,11 @@ impl App {
         let mut ir_all = was;
         switch_row(ui, "Infrared clean, all frames", &mut ir_all).on_hover_text("For scans saved with their infrared channel (64-bit RGBI TIFF). Others are left as they are.");
         let dust_all = ui.add_enabled(idle, egui::Button::new("Find dust on every frame").min_size(vec2(ui.available_width(), 28.0)))
-            .on_hover_text("Marks specks for healing, for scans without infrared. Frames that already have heal spots are left alone").clicked();
+            .on_hover_text("Marks specks for healing on scans without infrared. Frames that already have heal spots are left alone").clicked();
         ui.add_space(4.0);
 
         ui.label(caps("4 · File names"));
-        let rename = ui.add_enabled(!self.files.is_empty(), egui::Button::new("Rename roll…").min_size(vec2(ui.available_width(), 28.0))).on_hover_text("Name every frame from a pattern, e.g. roll name and frame number").clicked();
+        let rename = ui.add_enabled(!self.files.is_empty(), egui::Button::new("Rename roll…").min_size(vec2(ui.available_width(), 28.0))).on_hover_text("Name every frame from a pattern, such as roll name and frame number").clicked();
 
         if ir_all != was {
             let v = if ir_all { 60.0 } else { 0.0 };
@@ -1675,7 +1677,7 @@ impl App {
                 let img = load::load_quick(f, 3000).ok()?;
                 let found = scan::find_dust(&scan::frame(&img, p), develop::crop_of(p), 150);
                 (!found.is_empty()).then_some(Edit::Spots(found))
-            }, |n| format!("Marked dust on {n} frames: check them with Develop's Heal tool"));
+            }, |n| format!("Marked dust on {n} frames. Check them with Develop's Heal tool"));
         }
         if rename {
             let roll = self.roll_name();

@@ -248,7 +248,7 @@ impl Session {
     fn new() -> Result<Session, String> {
         // SAFETY: TWAINDSM.dll is the TWAIN Working Group's manager; DSM_Entry has the signature above.
         let lib = unsafe { libloading::Library::new("TWAINDSM.dll") }
-            .map_err(|_| "No TWAIN driver found. Install your scanner's software (Epson Scan 2 includes the TWAIN driver), or scan with it and let Ferrotype pick up the files.".to_string())?;
+            .map_err(|_| "No TWAIN driver found. Install your scanner's software (Epson Scan 2 includes the TWAIN driver), or scan with it and let ferrotype pick up the files.".to_string())?;
         let entry: DsmEntry = unsafe { *lib.get::<DsmEntry>(b"DSM_Entry\0").map_err(|e| e.to_string())? };
         let class = wide("STATIC");
         let title = wide("Ferrotype scanner");

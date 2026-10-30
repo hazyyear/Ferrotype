@@ -321,6 +321,8 @@ pub fn write_tiff(dest: &Path, w: u32, h: u32, samples: usize, bits: u16, px: &[
                 d.write_tag(Tag::IccProfile, icc).map_err(|e| e.to_string())?;
             }
             for (tag, s) in [(Tag::Software, &info.software), (Tag::Make, &info.make), (Tag::Model, &info.model)] {
+                // TIFF text tags are ASCII only: a name like "V800 · test:1" would make the whole file fail.
+                let s: String = s.chars().map(|c| if c.is_ascii() && !c.is_ascii_control() { c } else { '-' }).collect();
                 if !s.is_empty() {
                     d.write_tag(tag, s.as_str()).map_err(|e| e.to_string())?;
                 }
@@ -371,6 +373,14 @@ mod tests {
         let px: Vec<u16> = (0..w * h).flat_map(|i| [6554, 13107, 19661, if i % w == 5 { 3277 } else { 52428 }]).collect();
         let info = Info { software: "VueScan 9.8.30".into(), dpi: 3200.0, ..Default::default() };
         write_tiff(path, w, h, 4, 16, &px, None, &info).unwrap();
+    }
+
+    #[test]
+    fn names_outside_ascii_dont_break_the_file() {
+        let p = tmp("named.tif");
+        let info = Info { make: "Noname".into(), model: "frontend-tester · test:1".into(), ..Default::default() };
+        write_tiff(&p, 4, 2, 3, 16, &[1000u16; 24], None, &info).unwrap();
+        assert_eq!(super::info(&p).unwrap().model, "frontend-tester - test:1");
     }
 
     #[test]

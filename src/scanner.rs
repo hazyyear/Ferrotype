@@ -21,6 +21,8 @@ mod twain;
 pub enum Event {
     /// What the scanner is doing, for the status line.
     Status(String),
+    /// How far the whole job is, from 0 to 1.
+    Progress(f32),
     /// A scan was saved.
     Saved(PathBuf),
     /// The scanner was closed: how many pictures came in, or what went wrong.
@@ -228,10 +230,13 @@ fn num(s: &str) -> u32 {
     s.trim().trim_end_matches("dpi").split('.').next().unwrap_or("").trim().parse().unwrap_or(0)
 }
 
-/// One pass of `scanimage` into `out`: the whole area, or `area`, at `resolution`.
-fn sane_pass(s: &Settings, opts: &Options, area: Option<Area>, resolution: u32, depth: u32, out: &Path) -> Result<(), String> {
+/// One pass of `scanimage` into `out`: the whole area, or `area`, at `resolution`. Reports how far it is, and
+/// `cancel` stops it.
+#[allow(clippy::too_many_arguments)]
+fn sane_pass(s: &Settings, opts: &Options, area: Option<Area>, resolution: u32, depth: u32, out: &Path, cancel: &AtomicBool, progress: &dyn Fn(f32)) -> Result<(), String> {
+    use std::io::Read;
     let mut cmd = std::process::Command::new("scanimage");
-    cmd.args(["-d", &s.device, "--format=tiff"]);
+    cmd.args(["-d", &s.device, "--format=tiff", "--progress"]);
     if let Some(m) = &opts.color_mode {
         cmd.args(["--mode", m]);
     }
@@ -253,13 +258,56 @@ fn sane_pass(s: &Settings, opts: &Options, area: Option<Area>, resolution: u32, 
         cmd.args(["-l", &format!("{l:.1}"), "-t", &format!("{t:.1}"), "-x", &format!("{w:.1}"), "-y", &format!("{h:.1}")]);
     }
     cmd.arg(format!("--output-file={}", out.display()));
-    let r = cmd.output().map_err(|e| format!("scanimage: {e}"))?;
-    if !r.status.success() || !out.exists() {
+    cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| format!("scanimage: {e}"))?;
+    // scanimage writes "Progress: 12.3%" lines (ended by \r) to stderr while it scans; anything else is an error.
+    let mut stderr = child.stderr.take().ok_or("scanimage: no output")?;
+    let mut errors = String::new();
+    let (mut line, mut buf) = (Vec::new(), [0u8; 256]);
+    let mut stopped = false;
+    loop {
+        if cancel.load(Ordering::Relaxed) && !stopped {
+            let _ = child.kill();
+            stopped = true;
+        }
+        let n = stderr.read(&mut buf).unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        for &b in &buf[..n] {
+            if b == b'\r' || b == b'\n' {
+                let text = String::from_utf8_lossy(&line).trim().to_string();
+                match progress_of(&text) {
+                    Some(f) => progress(f),
+                    None if !text.is_empty() => {
+                        errors.push_str(&text);
+                        errors.push('\n');
+                    }
+                    None => {}
+                }
+                line.clear();
+            } else {
+                line.push(b);
+            }
+        }
+    }
+    let ok = child.wait().map(|st| st.success()).unwrap_or(false);
+    if stopped {
         let _ = std::fs::remove_file(out);
-        let err = String::from_utf8_lossy(&r.stderr).trim().to_string();
+        return Err("stopped".into());
+    }
+    if !ok || !out.exists() {
+        let _ = std::fs::remove_file(out);
+        let err = errors.trim().to_string();
         return Err(if err.is_empty() { "the scanner stopped".into() } else { err });
     }
     Ok(())
+}
+
+/// The fraction in one of scanimage's "Progress: 12.3%" lines.
+fn progress_of(line: &str) -> Option<f32> {
+    let v: f32 = line.strip_prefix("Progress:")?.trim().strip_suffix('%')?.trim().parse().ok()?;
+    Some((v / 100.0).clamp(0.0, 1.0))
 }
 
 /// Scan each area into `dir` as `scan-0001.tif` and on, with `s.passes` passes each, averaged. `cancel` stops
@@ -283,7 +331,9 @@ fn sane_frames(dir: &Path, s: &Settings, areas: &[Area], cancel: &AtomicBool, sa
                     return Err("stopped".to_string());
                 }
                 say(Event::Status(if passes > 1 { format!("Scanning {what}, pass {} of {passes}, at {} ppi…", p + 1, s.resolution) } else { format!("Scanning {what} at {} ppi…", s.resolution) }));
-                sane_pass(s, &opts, Some(*area), s.resolution, s.depth, &tmp)?;
+                let done = (i as u32 * passes + p) as f32;
+                let all = (areas.len() as u32 * passes) as f32;
+                sane_pass(s, &opts, Some(*area), s.resolution, s.depth, &tmp, cancel, &|f| say(Event::Progress((done + f) / all)))?;
                 // One pass in memory at a time: added to the running sum, then dropped.
                 let (w, h, samples, px) = crate::scanfile::read_u16(&tmp, 0).ok_or("couldn't read what the scanner sent")?;
                 match &mut sum {
@@ -294,6 +344,7 @@ fn sane_frames(dir: &Path, s: &Settings, areas: &[Area], cancel: &AtomicBool, sa
                 }
             }
             let sum = sum.ok_or("no pass came in")?;
+            say(Event::Status(format!("Saving {what}…")));
             let (w, h, samples) = (sum.w, sum.h, sum.samples);
             write_scan(&part, w, h, samples, &sum.average(), s.resolution as f32, passes, s.linear && opts.linear.is_some(), &s.device_name)
         })();
@@ -325,7 +376,7 @@ fn write_scan(out: &Path, w: u32, h: u32, samples: usize, px: &[u16], dpi: f32, 
 }
 
 /// A quick low-resolution scan of the whole area, for picking frames: saved at `out`, with the area's size.
-pub fn preview(s: &Settings, out: &Path) -> Result<[f32; 2], String> {
+pub fn preview(s: &Settings, out: &Path, cancel: &AtomicBool, progress: &dyn Fn(f32)) -> Result<[f32; 2], String> {
     if s.device.is_empty() {
         return Err("choose a scanner first".into());
     }
@@ -334,7 +385,7 @@ pub fn preview(s: &Settings, out: &Path) -> Result<[f32; 2], String> {
     let res = opts.resolutions.iter().copied().filter(|r| *r >= 75).min().unwrap_or(150).clamp(75, 300);
     let res = if opts.resolutions.is_empty() || opts.resolutions.contains(&res) { res } else { opts.resolutions[0] };
     let part = out.with_extension("part");
-    sane_pass(s, &opts, None, res, 16, &part)?;
+    sane_pass(s, &opts, None, res, 16, &part, cancel, progress)?;
     std::fs::rename(&part, out).map_err(|e| e.to_string())?;
     Ok(bed)
 }
@@ -463,6 +514,13 @@ mod tests {
         assert_eq!(a, [49.0, 24.0, 102.0, 52.0]);
         // Never outside the area.
         assert_eq!(area_of([0.0, 0.0, 0.0, 0.0], [200.0, 100.0], 2.0), [0.0, 0.0, 200.0, 100.0]);
+    }
+
+    #[test]
+    fn scanimage_progress_lines_are_read() {
+        assert_eq!(progress_of("Progress: 42.5%"), Some(0.425));
+        assert_eq!(progress_of("Progress: 100.0%"), Some(1.0));
+        assert_eq!(progress_of("scanimage: open of device failed"), None);
     }
 
     #[test]

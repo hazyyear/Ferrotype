@@ -118,7 +118,7 @@ impl Job {
 
 /// Scan one job on an open session into `out` (a 16-bit TIFF, RGBI with infrared). Work files go in `tmp`.
 #[allow(clippy::too_many_arguments)]
-pub fn capture(session: &mut Session, job: &Job, preview: bool, out: &Path, tmp: &Path, settle: Duration, cancel: &AtomicBool, say: &dyn Fn(String)) -> Result<(), String> {
+pub fn capture(session: &mut Session, job: &Job, preview: bool, out: &Path, tmp: &Path, settle: Duration, cancel: &AtomicBool, say: &dyn Fn(String), progress: &dyn Fn(f32)) -> Result<(), String> {
     let model = session.capabilities.scanner_model().map_err(|e| e.to_string())?;
     let (depth, dpi) = if preview { (model.preview_depth, model.preview_dpi) } else { (16, job.dpi) };
     let settings = job.settings(preview, depth, dpi);
@@ -132,16 +132,18 @@ pub fn capture(session: &mut Session, job: &Job, preview: bool, out: &Path, tmp:
     };
     std::fs::create_dir_all(tmp).map_err(|e| e.to_string())?;
     let mut last = String::new();
-    let mut progress = |p: epscan::Progress<'_>| {
-        let pct = (p.done * 100).checked_div(p.total).unwrap_or(0);
-        let line = format!("{} {pct}%", phase(p.phase));
+    let mut report = |p: epscan::Progress<'_>| {
+        if p.total > 0 {
+            progress(p.done as f32 / p.total as f32);
+        }
+        let line = phase(p.phase);
         if line != last {
             say(line.clone());
             last = line;
         }
         true
     };
-    let result = session.scan(&settings, &options, &tmp.join("pass"), cancel, &mut progress).map_err(|e| e.to_string())?;
+    let result = session.scan(&settings, &options, &tmp.join("pass"), cancel, &mut report).map_err(|e| e.to_string())?;
     let rgb = result.rgb.as_ref().and_then(|r| r.tiff.clone()).ok_or("the scanner sent no picture")?;
     // 16-bit throughout, and the infrared put in place: a medium-format frame at 6400 ppi is 290 million pixels.
     let (w, h, samples, mut px) = crate::scanfile::read_u16(&rgb, 0).ok_or("couldn't read the scan")?;
@@ -189,7 +191,7 @@ fn phase(p: &str) -> String {
 }
 
 /// A quick scan of a whole source, for placing frames: saved at `out`.
-pub fn preview(location: &str, source: Source, linear: bool, out: &Path, cancel: &AtomicBool, say: &dyn Fn(String)) -> Result<Scanner, String> {
+pub fn preview(location: &str, source: Source, linear: bool, out: &Path, cancel: &AtomicBool, say: &dyn Fn(String), progress: &dyn Fn(f32)) -> Result<Scanner, String> {
     if location == "demo" {
         return Err("the demo scanner can't scan".into());
     }
@@ -198,7 +200,7 @@ pub fn preview(location: &str, source: Source, linear: bool, out: &Path, cancel:
     let [w, h] = scanner.area(source);
     let job = Job { source, rect_mm: [0.0, 0.0, w, h], dpi: 0, oversample: 1, linear, infrared: false };
     let tmp = out.with_extension("work");
-    let r = capture(&mut s, &job, true, out, &tmp, Duration::ZERO, cancel, say);
+    let r = capture(&mut s, &job, true, out, &tmp, Duration::ZERO, cancel, say, progress);
     s.close();
     let _ = std::fs::remove_dir_all(&tmp);
     r.map(|()| scanner)
@@ -223,7 +225,8 @@ fn frames_on(s: &mut Session, jobs: &[Job], dir: &Path, settle: Duration, cancel
         let part = dir.join(format!(".{name}.part"));
         let tmp = dir.join(format!(".{name}.work"));
         let what = if jobs.len() > 1 { format!("Frame {} of {}", i + 1, jobs.len()) } else { "Scan".into() };
-        let r = capture(s, job, false, &part, &tmp, settle, cancel, &|t| say(Event::Status(format!("{what}: {t}"))));
+        let all = jobs.len() as f32;
+        let r = capture(s, job, false, &part, &tmp, settle, cancel, &|t| say(Event::Status(format!("{what}: {t}"))), &|f| say(Event::Progress((i as f32 + f) / all)));
         let _ = std::fs::remove_dir_all(&tmp);
         if let Err(e) = r {
             let _ = std::fs::remove_file(&part);
