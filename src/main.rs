@@ -20,6 +20,7 @@ mod upright;
 mod roll;
 mod colour;
 mod demosaic;
+mod library;
 
 use develop::Params;
 use image::{DynamicImage, Rgb32FImage, codecs::jpeg::JpegEncoder};
@@ -46,6 +47,10 @@ pub fn read_params(path: &Path) -> Option<Params> {
             if let Some(x) = &x {
                 let (r, l) = xmp::rating_label(x);
                 xmp::apply_rating_label(&mut p, r, l);
+                // So do keywords set there.
+                if let Some(k) = xmp::keywords(x) {
+                    p.keywords = k;
+                }
             }
             p.migrate();
             Some(p)
@@ -350,7 +355,7 @@ pub fn export_embed(p: &Params, o: &ExportOpts, src: &Path) -> output::Embed {
         let shot = export_shot(src);
         let desc = export_description(p, o, src);
         e.exif = output::exif_tiff(&shot, &desc);
-        e.xmp = output::xmp_packet(&shot, &desc, &[]);
+        e.xmp = output::xmp_packet(&shot, &desc, &p.keywords);
     }
     e
 }

@@ -204,6 +204,10 @@ enum Msg {
     /// it sends nothing but `skipped`, so it is tried again when you come back.
     Cull(PathBuf, Option<CullData>, bool),
     Denoised(PathBuf, Result<Vec<f32>, String>),
+    /// Search details for a folder generation.
+    Indexed(usize, Vec<(PathBuf, crate::library::Entry)>),
+    /// A collection's photos, found (by name).
+    Collection(String, Vec<PathBuf>),
     /// Infrared cleaning finished: the photo, the strength, the cleaned source (None: the scan has no infrared).
     IrCleaned(PathBuf, f32, Option<Arc<Rgb32FImage>>),
     AiInstalled(Result<(), String>),
@@ -283,6 +287,17 @@ struct Photo {
 
 pub struct App {
     module: Module,
+    /// Search details per photo (built in the background the first time a search is typed in a folder), the
+    /// folder generation they belong to, and whether a build is running.
+    search: std::collections::HashMap<PathBuf, crate::library::Entry>,
+    search_gen: usize,
+    search_busy: bool,
+    /// Collections, the one open (shown instead of a folder), a new one being named (with its files), and the
+    /// keyword being typed.
+    collections: Vec<crate::library::Collection>,
+    collection: Option<String>,
+    new_coll: Option<(String, Vec<PathBuf>)>,
+    kw_text: String,
     /// Roll notes of the open folder (see `roll`), and which folder they were read from.
     roll: crate::roll::Roll,
     roll_dir: Option<PathBuf>,
@@ -670,6 +685,7 @@ impl App {
             thumb_due: false, lens_query: String::new(), lib_multi: vec![], pano_busy: false,
             watch: false, watch_open: true, watch_apply: false, watch_at: 0.0, watch_sizes: Default::default(), wipe: 0.5, wipe_tex: None,
             cull: Default::default(), ai_busy: false, tx, rx, roll: Default::default(), roll_dir: None,
+            search: Default::default(), search_gen: 0, search_busy: false, collections: crate::library::load(), collection: None, new_coll: None, kw_text: String::new(),
         }
     }
 
@@ -689,21 +705,76 @@ impl App {
         files.sort();
         self.subdirs = entries.into_iter().filter(|p| p.is_dir() && !p.file_name().unwrap_or_default().to_string_lossy().starts_with('.')).collect();
         self.subdirs.sort();
+        self.collection = None;
         // Ratings and edit marks arrive with each thumbnail: reading every sidecar here froze the window on cloud folders.
         self.meta.clear();
         self.cull.failed.clear();
-        self.folder = Some(dir);
+        self.show_files(ctx, files, Some(dir));
+        if let Some(f) = file {
+            self.select(ctx, f);
+        }
+    }
+
+    /// Show these photos in the Library: a folder's (with `dir`), or a collection's (from anywhere).
+    fn show_files(&mut self, ctx: &egui::Context, files: Vec<PathBuf>, dir: Option<PathBuf>) {
+        if dir.is_none() {
+            self.subdirs.clear();
+            self.meta.clear();
+        }
+        self.folder = dir;
         self.files = files.clone();
         self.thumbs.clear();
         self.thumb_used.borrow_mut().clear();
         self.thumb_pending.clear();
         self.thumb_ready.clear();
         self.lib_sel = files.first().cloned();
+        self.lib_multi.clear();
+        self.search.clear();
         use std::sync::atomic::Ordering::Relaxed;
         let gen_now = self.thumb_gen.fetch_add(1, Relaxed) + 1;
         self.spawn_thumbs(ctx, files, gen_now);
-        if let Some(f) = file {
-            self.select(ctx, f);
+    }
+
+    /// Build the search details for the photos shown, in the background, the first time they're searched.
+    fn ensure_search(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let generation = self.thumb_gen.load(Relaxed);
+        if self.lib_query.trim().is_empty() || self.search_busy || self.search_gen == generation {
+            return;
+        }
+        self.search_busy = true;
+        let (files, tx) = (self.files.clone(), self.tx.clone());
+        std::thread::spawn(move || {
+            let entries: Vec<(PathBuf, crate::library::Entry)> = files.par_iter().map(|f| {
+                let p = read_params(f).unwrap_or_default();
+                (f.clone(), crate::library::entry(f, &p))
+            }).collect();
+            let _ = tx.send(Msg::Indexed(generation, entries));
+        });
+    }
+
+    /// Refresh one photo's search details after its keywords or rating changed.
+    fn reindex(&mut self, f: &Path) {
+        if self.search.contains_key(f) {
+            let p = read_params(f).unwrap_or_default();
+            self.search.insert(f.to_path_buf(), crate::library::entry(f, &p));
+        }
+    }
+
+    /// Open a collection: its photos are found off the UI thread (a smart one searches its folder tree).
+    fn open_collection(&mut self, i: usize) {
+        let Some(c) = self.collections.get(i).cloned() else { return };
+        self.status = format!("Opening {}…", c.name);
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let files = crate::library::members(&c);
+            let _ = tx.send(Msg::Collection(c.name, files));
+        });
+    }
+
+    fn save_collections(&mut self) {
+        if let Err(e) = crate::library::save(&self.collections) {
+            self.status = format!("Could not save collections: {e}");
         }
     }
 
@@ -982,6 +1053,18 @@ impl App {
                         let focus = ctx.load_texture(format!("focus {name}"), d.focus, TextureOptions::LINEAR);
                         self.cull.cache.insert(p, CullImg { tex, focus, bins: d.bins, clipped: d.clipped, raw: d.raw });
                     }
+                }
+                Msg::Indexed(generation, entries) => {
+                    self.search_busy = false;
+                    if generation == self.thumb_gen.load(std::sync::atomic::Ordering::Relaxed) {
+                        self.search = entries.into_iter().collect();
+                        self.search_gen = generation;
+                    }
+                }
+                Msg::Collection(name, files) => {
+                    self.show_files(ctx, files, None);
+                    self.status = format!("{name}: {} photo{}", self.files.len(), if self.files.len() == 1 { "" } else { "s" });
+                    self.collection = Some(name);
                 }
                 Msg::IrCleaned(p, amt, r) => {
                     if let Some(ph) = &mut self.photo
@@ -2206,6 +2289,9 @@ impl App {
             };
             self.cull.flash = Some((text, std::time::Instant::now()));
         }
+        if let (Some(r), Some(e)) = (rating, self.search.get_mut(f)) {
+            e.rating = r;
+        }
         let apply = |p: &mut Params| {
             if let Some(r) = rating {
                 p.rating = r;
@@ -2507,7 +2593,9 @@ impl App {
                     self.open_path(ui.ctx(), &d);
                 }
                 if !develop {
-                    ui.add(egui::TextEdit::singleline(&mut self.lib_query).hint_text("Search frames").desired_width(240.0).margin(vec2(10.0, 6.0)));
+                    ui.add(egui::TextEdit::singleline(&mut self.lib_query).hint_text("Search: keyword, camera, lens, iso>1600…").desired_width(260.0).margin(vec2(10.0, 6.0)))
+                        .on_hover_text("Words match the name, keywords, camera, lens, date, roll and film notes; -word leaves out. Also iso>1600, focal<35, f<2.8, stars>=3, date:2026-05, \"two words\".");
+                    self.ensure_search();
                 } else {
                     let name = self.current.as_ref().and_then(|c| c.file_name()).map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
                     let line = [name, self.status.clone()].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ");
@@ -2937,34 +3025,43 @@ impl App {
             let kind = if load::is_raw(&real) { 0 } else if e == "jpg" || e == "jpeg" { 1 } else if e == "tif" || e == "tiff" { 2 } else { 3 };
             let m = self.meta.get(*f).copied().unwrap_or_default();
             let rating_ok = match self.lib_rating { 1 => m.rating >= 1 && m.flag >= 0, 2 => m.rating >= 3 && m.flag >= 0, 3 => m.flag > 0, _ => true };
-            self.lib_filter[kind]
-                && (!self.lib_filter[4] || m.edited)
-                && rating_ok
-                && (q.is_empty() || f.file_name().unwrap_or_default().to_string_lossy().to_lowercase().contains(&q))
+            // The full search once its details are in; the file name meanwhile.
+            let found = q.trim().is_empty() || match self.search.get(*f) {
+                Some(e) => crate::library::matches(e, &q),
+                None => f.file_name().unwrap_or_default().to_string_lossy().to_lowercase().contains(q.trim()),
+            };
+            self.lib_filter[kind] && (!self.lib_filter[4] || m.edited) && rating_ok && found
         }).cloned().collect()
     }
 
     fn library_left(&mut self, ui: &mut Ui) {
         ui.label(caps("Roll"));
         ui.add_space(2.0);
-        let Some(dir) = self.folder.clone() else {
-            ui.label(RichText::new("No roll open").color(TEXT3));
-            return;
-        };
-        if let Some(parent) = dir.parent()
-            && ui.add(egui::Button::new(RichText::new("‹  Up one level").color(TEXT2)).fill(Color32::TRANSPARENT).stroke(Stroke::NONE)).clicked()
-        {
-            self.open_path(ui.ctx(), &parent.to_path_buf());
-            return;
-        }
-        let name = dir.file_name().unwrap_or_default().to_string_lossy().to_string();
-        list_row(ui, &name, &self.files.len().to_string(), true);
-        for s in self.subdirs.clone().iter().take(40) {
-            if list_row(ui, &format!("   {}", s.file_name().unwrap_or_default().to_string_lossy()), "", false).clicked() {
-                self.open_path(ui.ctx(), s);
-                return;
+        match self.folder.clone() {
+            None if self.collection.is_none() => {
+                ui.label(RichText::new("No roll open").color(TEXT3));
+            }
+            None => {
+                ui.label(RichText::new("Showing a collection").size(12.0).color(TEXT2));
+            }
+            Some(dir) => {
+                if let Some(parent) = dir.parent()
+                    && ui.add(egui::Button::new(RichText::new("‹  Up one level").color(TEXT2)).fill(Color32::TRANSPARENT).stroke(Stroke::NONE)).clicked()
+                {
+                    self.open_path(ui.ctx(), &parent.to_path_buf());
+                    return;
+                }
+                let name = dir.file_name().unwrap_or_default().to_string_lossy().to_string();
+                list_row(ui, &name, &self.files.len().to_string(), true);
+                for s in self.subdirs.clone().iter().take(40) {
+                    if list_row(ui, &format!("   {}", s.file_name().unwrap_or_default().to_string_lossy()), "", false).clicked() {
+                        self.open_path(ui.ctx(), s);
+                        return;
+                    }
+                }
             }
         }
+        self.collections_panel(ui);
         ui.add_space(18.0);
         ui.label(caps("Show rated"));
         segmented(ui, &mut self.lib_rating, &["All", "1+ stars", "3+", "Picks"]);
@@ -3058,6 +3155,8 @@ impl App {
         let mut export_sel = false;
         let (mut rename, mut rename_one, mut undo_rename) = (None::<bool>, None::<PathBuf>, false);
         let mut hdr = None::<bool>;
+        let (mut add_to, mut add_files) = (None::<Option<usize>>, Vec::<PathBuf>::new());
+        let lib_multi = self.lib_multi.clone();
         let can_undo_rename = self.folder.as_deref().is_some_and(crate::rename::can_undo);
         let (cmd, shift) = ui.input(|i| (i.modifiers.command, i.modifiers.shift));
         let gap = 12.0;
@@ -3108,6 +3207,7 @@ impl App {
                                 ui.painter().rect_filled(Rect::from_min_max(pos2(r.right() - 26.0, r.bottom() - 6.0), pos2(r.right() - 6.0, r.bottom() - 2.0)), 2.0, LABEL_COLORS[(m.label - 1).min(4) as usize]);
                             }
                             let is_copy = load::copy_of(f).is_some();
+                            let colls: Vec<String> = self.collections.iter().filter(|c| !c.is_smart()).map(|c| c.name.clone()).collect();
                             let multi = self.lib_multi.len();
                             let in_multi = self.lib_multi.contains(f);
                             let pano_busy = self.pano_busy;
@@ -3150,6 +3250,20 @@ impl App {
                                     undo_rename = true;
                                     ui.close();
                                 }
+                                ui.menu_button(if multi >= 2 && in_multi { format!("Add {multi} to collection") } else { "Add to collection".into() }, |ui| {
+                                    for (k, n) in colls.iter().enumerate() {
+                                        if ui.button(n).clicked() {
+                                            add_to = Some(Some(k));
+                                            add_files = if multi >= 2 && in_multi { lib_multi.clone() } else { vec![f.clone()] };
+                                            ui.close();
+                                        }
+                                    }
+                                    if ui.button("New collection…").clicked() {
+                                        add_to = Some(None);
+                                        add_files = if multi >= 2 && in_multi { lib_multi.clone() } else { vec![f.clone()] };
+                                        ui.close();
+                                    }
+                                });
                                 if ui.button("Make a virtual copy").clicked() {
                                     copy = Some(f.clone());
                                     ui.close();
@@ -3234,6 +3348,23 @@ impl App {
                 self.open_path(ui.ctx(), &d);
             }
         }
+        match add_to {
+            Some(Some(k)) => {
+                // Index among the plain collections (smart ones can't hold a hand-picked file).
+                if let Some(c) = self.collections.iter_mut().filter(|c| !c.is_smart()).nth(k) {
+                    let n = add_files.iter().filter(|f| !c.files.contains(f)).count();
+                    for f in add_files {
+                        if !c.files.contains(&f) {
+                            c.files.push(f);
+                        }
+                    }
+                    self.status = format!("Added {n} to {}", c.name);
+                }
+                self.save_collections();
+            }
+            Some(None) => self.new_coll = Some((String::new(), add_files)),
+            None => {}
+        }
         if export_sel {
             let mut files = self.lib_multi.clone();
             files.sort();
@@ -3256,6 +3387,133 @@ impl App {
         }
         if let Some(f) = remove {
             self.remove_copy(&f);
+        }
+    }
+
+    /// Collections: open one, save the search as a smart one, name a new one, delete one (right-click).
+    fn collections_panel(&mut self, ui: &mut Ui) {
+        ui.add_space(18.0);
+        ui.horizontal(|ui| {
+            ui.label(caps("Collections"));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let q = self.lib_query.trim().to_string();
+                if !q.is_empty()
+                    && let Some(dir) = self.folder.clone()
+                    && small_action(ui, "Save search", false).on_hover_text("A smart collection: this search over this folder and its subfolders, kept up to date").clicked()
+                {
+                    let name = format!("{q} · {}", dir.file_name().unwrap_or_default().to_string_lossy());
+                    self.collections.push(crate::library::Collection { name, query: q, folder: dir, ..Default::default() });
+                    self.save_collections();
+                }
+                if self.new_coll.is_none() && small_action(ui, "+ New", false).on_hover_text("A collection of the selected photos (or an empty one)").clicked() {
+                    let files = if self.lib_multi.is_empty() { self.lib_sel.clone().into_iter().collect() } else { self.lib_multi.clone() };
+                    self.new_coll = Some((String::new(), files));
+                }
+            });
+        });
+        if let Some((name, files)) = &mut self.new_coll {
+            let n = files.len();
+            let resp = ui.add(egui::TextEdit::singleline(name).hint_text(format!("Name for {n} photo{}", if n == 1 { "" } else { "s" })).desired_width(f32::INFINITY));
+            resp.request_focus();
+            let done = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let cancel = ui.input(|i| i.key_pressed(egui::Key::Escape));
+            if done && !name.trim().is_empty() {
+                let c = crate::library::Collection { name: name.trim().to_string(), files: files.clone(), ..Default::default() };
+                self.status = format!("Collection {} made", c.name);
+                self.collections.push(c);
+                self.new_coll = None;
+                self.save_collections();
+            } else if cancel || (done && name.trim().is_empty()) {
+                self.new_coll = None;
+            }
+        }
+        if self.collections.is_empty() && self.new_coll.is_none() {
+            ui.label(RichText::new("Right-click photos to add them to one, or save a search.").size(11.5).color(TEXT3));
+        }
+        let mut open = None;
+        let mut delete = None;
+        for (i, c) in self.collections.iter().enumerate() {
+            let on = self.collection.as_ref() == Some(&c.name);
+            let count = if c.is_smart() { "smart".to_string() } else { c.files.len().to_string() };
+            let resp = list_row(ui, &c.name, &count, on).on_hover_text(if c.is_smart() { format!("Search \"{}\" in {}", c.query, c.folder.display()) } else { "Right-click to delete".into() });
+            if resp.clicked() {
+                open = Some(i);
+            }
+            resp.context_menu(|ui| {
+                if ui.button("Delete collection").on_hover_text("Only the collection: the photos stay where they are").clicked() {
+                    delete = Some(i);
+                    ui.close();
+                }
+            });
+        }
+        if let Some(i) = open {
+            self.open_collection(i);
+        }
+        if let Some(i) = delete {
+            let c = self.collections.remove(i);
+            if self.collection.as_ref() == Some(&c.name) {
+                self.collection = None;
+            }
+            self.save_collections();
+        }
+    }
+
+    /// Keywords of the selected photo (or of every selected photo, when several are): chips with ×, and a field.
+    fn keywords_panel(&mut self, ui: &mut Ui, f: &Path) {
+        let targets: Vec<PathBuf> = if self.lib_multi.len() >= 2 && self.lib_multi.iter().any(|m| m == f) { self.lib_multi.clone() } else { vec![f.to_path_buf()] };
+        let kws = read_params(f).unwrap_or_default().keywords;
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            ui.label(caps("Keywords"));
+            if targets.len() > 1 {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.label(RichText::new(format!("{} photos", targets.len())).size(11.0).color(TEXT3)));
+            }
+        });
+        let mut remove = None;
+        ui.horizontal_wrapped(|ui| {
+            for k in &kws {
+                if chip(ui, &format!("{k}  ×"), false).on_hover_text("Remove").clicked() {
+                    remove = Some(k.clone());
+                }
+            }
+        });
+        let resp = ui.add(egui::TextEdit::singleline(&mut self.kw_text).hint_text("Add: street, Lisbon, night").desired_width(f32::INFINITY));
+        let add = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let mut change: Option<(Vec<String>, Option<String>)> = None;
+        if add {
+            let new = crate::library::split_keywords(&self.kw_text);
+            self.kw_text.clear();
+            if !new.is_empty() {
+                change = Some((new, None));
+            }
+            resp.request_focus();
+        }
+        if let Some(r) = remove {
+            change = Some((vec![], Some(r)));
+        }
+        if let Some((add, rm)) = change {
+            for t in &targets {
+                let mut q = read_params(t).unwrap_or_default();
+                for k in &add {
+                    if !q.keywords.iter().any(|o| o.eq_ignore_ascii_case(k)) {
+                        q.keywords.push(k.clone());
+                    }
+                }
+                if let Some(r) = &rm {
+                    q.keywords.retain(|o| !o.eq_ignore_ascii_case(r));
+                }
+                if write_params(t, &q).is_ok() {
+                    self.meta.insert(t.clone(), Meta::of(&q));
+                    // The open photo's settings in memory must not write the old keywords back.
+                    if self.current.as_deref() == Some(t.as_path()) {
+                        self.params.keywords = q.keywords.clone();
+                        for h in &mut self.history {
+                            h.keywords = q.keywords.clone();
+                        }
+                    }
+                }
+                self.reindex(t);
+            }
         }
     }
 
@@ -3335,6 +3593,7 @@ impl App {
                 }
             });
         });
+        self.keywords_panel(ui, &f);
         ui.add_space(12.0);
         ui.columns(2, |c| {
             if c[0].add(egui::Button::new("Open as negative").min_size(vec2(c[0].available_width(), 32.0))).clicked() {
