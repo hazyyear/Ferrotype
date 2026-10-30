@@ -21,6 +21,8 @@ pub const TEXT3: Color32 = hex(0x8A877F); // "dim": secondary labels and metadat
 pub const LABEL: Color32 = TEXT2;
 /// Kept as a name for "emphasis"; in this brand it is bone, never a hue.
 pub const ACCENT: Color32 = BONE;
+/// Warnings and errors only: the one hue in the interface, so a problem never reads as ordinary help text.
+pub const WARN: Color32 = hex(0xE0A458);
 /// Secondary text on a bone (selected) surface.
 pub const ON_BONE: Color32 = hex(0x5A5752);
 const TRACK: Color32 = hex(0x3A3A40); // unfilled part of a slider track; the bone thumb carries the 3:1
@@ -182,10 +184,11 @@ pub fn tab(ui: &mut Ui, text: &str, on: bool) -> egui::Response {
 /// Multi-select filter chip (several can be on): bone outline and bone text when on, dim text only when off.
 /// Calmer than the inverted `chip`, so a row of them doesn't outshine the photos.
 pub fn filter_chip(ui: &mut Ui, text: &str, on: bool) -> egui::Response {
-    // Off is plain dim text with no box, so on and off differ in shape, not only in a shade of border.
-    ui.add(egui::Button::new(RichText::new(text).size(11.5).color(if on { BONE } else { TEXT3 }))
-        .fill(if on { CARD } else { Color32::TRANSPARENT })
-        .stroke(if on { Stroke::new(1.0, BONE) } else { Stroke::NONE })
+    // On is inverted (ink on bone), as every selection is; off is dim text with a thin outline, so the two differ
+    // in fill and shape, not only in a shade of border.
+    ui.add(egui::Button::new(RichText::new(text).size(11.5).color(if on { INK } else { TEXT2 }))
+        .fill(if on { BONE } else { Color32::TRANSPARENT })
+        .stroke(Stroke::new(1.0, if on { BONE } else { BTN_BORDER }))
         .corner_radius(3)
         .min_size(vec2(0.0, 24.0)))
 }
@@ -266,7 +269,9 @@ pub fn switch(ui: &mut Ui, on: &mut bool) -> egui::Response {
 }
 
 /// Collapsible panel section: 40 px header, "+"/"−" on the right, hairline below.
-pub fn section(ui: &mut Ui, title: &str, open: &mut bool, body: impl FnOnce(&mut Ui)) {
+/// A bone dot after the title marks settings that differ from the defaults, so a collapsed panel still shows
+/// where the edits are.
+pub fn section(ui: &mut Ui, title: &str, open: &mut bool, changed: bool, body: impl FnOnce(&mut Ui)) {
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::click());
     if resp.clicked() {
         *open = !*open;
@@ -276,7 +281,10 @@ pub fn section(ui: &mut Ui, title: &str, open: &mut bool, body: impl FnOnce(&mut
         p.rect_filled(rect, 0.0, hex(0x202024));
     }
     // Panel titles in Plex Sans 500; the mono caps are kept for the groups inside.
-    p.text(pos2(rect.left() + 16.0, rect.center().y), Align2::LEFT_CENTER, title, FontId::new(13.0, semi()), if *open || resp.hovered() { TEXT } else { TEXT2 });
+    let t = p.text(pos2(rect.left() + 16.0, rect.center().y), Align2::LEFT_CENTER, title, FontId::new(13.0, semi()), if *open || resp.hovered() { TEXT } else { TEXT2 });
+    if changed {
+        p.circle_filled(pos2(t.right() + 8.0, rect.center().y), 3.0, BONE);
+    }
     p.text(pos2(rect.right() - 16.0, rect.center().y), Align2::RIGHT_CENTER, if *open { "−" } else { "+" }, FontId::proportional(14.0), TEXT3);
     if *open {
         egui::Frame::new().inner_margin(egui::Margin { left: 16, right: 16, top: 0, bottom: 14 }).show(ui, |ui| {

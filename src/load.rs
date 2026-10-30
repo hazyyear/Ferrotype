@@ -15,6 +15,11 @@ pub fn is_raw(path: &Path) -> bool {
     e != "tif" && e != "tiff" && rawler::decoders::supported_extensions().iter().any(|s| s.eq_ignore_ascii_case(&e))
 }
 
+/// `is_raw` for a photo or a virtual copy of one (`IMG_0001.NEF.copy2`).
+pub fn is_raw_photo(path: &Path) -> bool {
+    is_raw(copy_of(path).as_deref().unwrap_or(path))
+}
+
 pub fn is_supported(path: &Path) -> bool {
     is_raw(path) || OTHER_EXT.contains(&ext(path).as_str())
 }
@@ -85,23 +90,74 @@ pub fn exif_block(path: &Path) -> Option<Vec<u8>> {
     dec.exif_metadata().ok()?
 }
 
+/// The JPEG a camera stores inside a RAW file (its own rendering), or a smaller thumbnail.
+fn embedded_preview(path: &Path) -> Option<DynamicImage> {
+    let src = RawSource::new(path).ok()?;
+    let dec = rawler::get_decoder(&src).ok()?;
+    let p = RawDecodeParams::default();
+    dec.preview_image(&src, &p).ok().flatten().or_else(|| dec.thumbnail_image(&src, &p).ok().flatten())
+}
+
 /// Fast small decode for thumbnails: the embedded JPEG preview for RAW files when there is one.
 pub fn load_quick(path: &Path, size: u32) -> Result<Rgb32FImage, String> {
+    load_quick_toned(path, size).map(|r| r.0)
+}
+
+/// `load_quick`, and whether the picture is the camera's own JPEG (already tone-mapped, so a RAW's camera curve
+/// must not be applied to it again).
+pub fn load_quick_toned(path: &Path, size: u32) -> Result<(Rgb32FImage, bool), String> {
     let real = copy_of(path);
     let path = real.as_deref().unwrap_or(path);
-    if is_raw(path) {
-        let embedded = RawSource::new(path).ok().and_then(|src| {
-            let dec = rawler::get_decoder(&src).ok()?;
-            let p = RawDecodeParams::default();
-            dec.preview_image(&src, &p).ok().flatten().or_else(|| dec.thumbnail_image(&src, &p).ok().flatten())
-        });
-        if let Some(img) = embedded.filter(|i| i.width() >= size.min(160)) {
-            let mut out = img.thumbnail(size, size).to_rgb32f();
-            linearize_srgb(&mut out, false);
-            return Ok(out);
+    if is_raw(path)
+        && let Some(img) = embedded_preview(path).filter(|i| i.width() >= size.min(160))
+    {
+        let mut out = img.thumbnail(size, size).to_rgb32f();
+        linearize_srgb(&mut out, false);
+        return Ok((out, true));
+    }
+    Ok((fit(&load(path)?, size), false))
+}
+
+/// The camera's own tone curve for a RAW, matched from the JPEG it embedded: pairs of (linear RAW brightness,
+/// linear JPEG brightness) at the same quantiles, as RawTherapee's auto-matched curve does. With it an unedited
+/// RAW looks like the camera's picture instead of flat linear data. Empty without a preview of 640 px or more.
+pub fn camera_curve(path: &Path, linear: &Rgb32FImage) -> Vec<[f32; 2]> {
+    let real = copy_of(path);
+    let path = real.as_deref().unwrap_or(path);
+    let Some(prev) = embedded_preview(path).filter(|i| i.width().max(i.height()) >= 640) else { return vec![] };
+    let mut pv = prev.thumbnail(1024, 1024).to_rgb32f();
+    linearize_srgb(&mut pv, false);
+    match_curve(lumas(linear), lumas(&pv))
+}
+
+fn lumas(img: &Rgb32FImage) -> Vec<f32> {
+    let step = (img.len() / 3 / 300_000).max(1);
+    img.chunks(3).step_by(step).map(|c| crate::develop::luma([c[0], c[1], c[2]])).collect()
+}
+
+/// Quantile matching: x rises strictly, y never falls, and the curve stops where the JPEG clips (brighter RAW
+/// values keep the last gain, so the Highlights slider can still bring them back).
+pub(crate) fn match_curve(mut raw: Vec<f32>, mut jpg: Vec<f32>) -> Vec<[f32; 2]> {
+    if raw.len() < 1000 || jpg.len() < 1000 {
+        return vec![];
+    }
+    raw.sort_unstable_by(f32::total_cmp);
+    jpg.sort_unstable_by(f32::total_cmp);
+    let q = |v: &[f32], t: f32| v[((v.len() - 1) as f32 * t) as usize];
+    let mut out: Vec<[f32; 2]> = vec![];
+    for i in 0..=64 {
+        let t = 0.002 + 0.996 * i as f32 / 64.0;
+        let (x, y) = (q(&raw, t), q(&jpg, t));
+        // Gains outside 1/16–16 mean the preview isn't this picture (a placeholder, another crop): skip the point.
+        if x <= 1e-6 || y <= 0.0 || !(1.0 / 16.0..=16.0).contains(&(y / x)) || out.last().is_some_and(|l| x <= l[0] * 1.001 || y < l[1]) {
+            continue;
+        }
+        out.push([x, y]);
+        if y >= 0.98 {
+            break;
         }
     }
-    Ok(fit(&load(path)?, size))
+    if out.len() < 8 { vec![] } else { out }
 }
 
 /// Downscale so the long side is at most `size`.
@@ -192,4 +248,23 @@ pub fn raw_stats(path: &Path) -> Option<RawStats> {
         b.iter_mut().for_each(|v| *v /= m);
     }
     Some(RawStats { bins, clipped: [0, 1, 2].map(|c| clip[c] as f32 / count[c].max(1) as f32 * 100.0) })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn matched_curve_follows_the_jpeg() {
+        // The "JPEG" is the RAW through a gamma-like curve: the match recovers it and stops where the JPEG clips.
+        let raw: Vec<f32> = (0..20_000).map(|i| i as f32 / 20_000.0 * 0.5).collect();
+        let jpg: Vec<f32> = raw.iter().map(|x| (x * 2.0).powf(0.7).min(1.0)).collect();
+        let c = super::match_curve(raw, jpg);
+        assert!(c.len() > 30, "{}", c.len());
+        assert!(c.windows(2).all(|w| w[1][0] > w[0][0] && w[1][1] >= w[0][1]));
+        for q in &c {
+            assert!((q[1] - (q[0] * 2.0).powf(0.7).min(1.0)).abs() < 0.01, "{q:?}");
+        }
+        assert!(super::match_curve(vec![0.1; 10], vec![0.2; 10]).is_empty());
+        // A virtual copy of a RAW is a RAW too (it gets the same camera curve).
+        assert!(super::is_raw_photo(std::path::Path::new("IMG_1.NEF.copy2")) && !super::is_raw(std::path::Path::new("IMG_1.NEF.copy2")));
+    }
 }

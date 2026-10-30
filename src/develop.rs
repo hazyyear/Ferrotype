@@ -112,6 +112,14 @@ pub struct Params {
     /// Camera or scanner colour profile built from a chart (see `calib`), applied to the source first.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile: Option<crate::calib::ColorProfile>,
+    /// The camera's tone curve for a RAW (`load::camera_curve`): (linear RAW, linear camera JPEG) brightness pairs,
+    /// measured when the photo is first opened so an unedited RAW looks like the camera's picture. Belongs to the
+    /// photo, not to a look. Not used on negatives, whose inversion needs linear data.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub cam_curve: Vec<[f32; 2]>,
+    /// 1 = made before the camera curve existed (settings tuned on the flat look, so it never gets one);
+    /// 2 = starts from the camera's look. `read_params` marks a sidecar without the field as 1.
+    pub process: u8,
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -281,6 +289,8 @@ impl Default for Params {
             rot90: 0, label: 0, ai_nr: 0.0, snapshots: vec![],
             lens: String::new(), lens_focal: 0.0, lens_f: 0.0, lens_crop: 1.0, lens_dist: 100.0, lens_vig: 100.0,
             profile: None,
+            cam_curve: vec![],
+            process: 2,
         }
     }
 }
@@ -298,6 +308,9 @@ impl Params {
         // The lens profile belongs to the photo, like its geometry.
         (p.lens, p.lens_focal, p.lens_f, p.lens_crop, p.lens_dist, p.lens_vig) =
             (self.lens.clone(), self.lens_focal, self.lens_f, self.lens_crop, self.lens_dist, self.lens_vig);
+        // So does the camera or scanner profile: the negative conversion was measured with it.
+        p.profile = self.profile.clone();
+        (p.cam_curve, p.process) = (self.cam_curve.clone(), self.process);
         p
     }
 
@@ -328,6 +341,7 @@ impl Params {
         let mut p: Params = serde_json::from_value(mix(&a, &b, t as f64)).unwrap_or_else(|_| to.clone());
         // Ratings and the like are never part of a look.
         (p.rating, p.flag, p.label) = (from.rating, from.flag, from.label);
+        (p.cam_curve, p.process) = (from.cam_curve.clone(), from.process);
         p
     }
 
@@ -373,7 +387,7 @@ impl Params {
 
     /// True when the photo has edits, ignoring its rating, flag, label and snapshots.
     pub fn is_edited(&self) -> bool {
-        Params { rating: 0, flag: 0, label: 0, snapshots: vec![], ..self.clone() } != Params::default()
+        Params { rating: 0, flag: 0, label: 0, snapshots: vec![], cam_curve: vec![], process: 2, ..self.clone() } != Params::default()
     }
 
     /// Turn a quarter clockwise (or back), carrying the crop, spots, filters and brush strokes along.
@@ -1363,6 +1377,31 @@ pub fn mask_weights(m: &Mask, p: &Params, shown: &Rgb32FImage, full: (u32, u32),
     acc
 }
 
+/// The camera curve alone, in place (for the unedited "Before" picture).
+pub fn apply_cam_curve(img: &mut Rgb32FImage, cc: &[[f32; 2]]) {
+    if cc.len() >= 2 {
+        px3_mut(img).par_iter_mut().for_each(|c| {
+            let k = cam_gain(cc, luma(*c));
+            *c = c.map(|v| v * k);
+        });
+    }
+}
+
+/// How much the camera curve brightens a pixel of linear brightness `y` (a gain, so colours keep their ratios).
+/// Linear between the curve's points; above the last one the last gain holds.
+fn cam_gain(cc: &[[f32; 2]], y: f32) -> f32 {
+    if y <= cc[0][0] {
+        return cc[0][1] / cc[0][0];
+    }
+    let i = cc.partition_point(|q| q[0] < y);
+    if i >= cc.len() {
+        let l = cc[cc.len() - 1];
+        return l[1] / l[0];
+    }
+    let (a, b) = (cc[i - 1], cc[i]);
+    (a[1] + (b[1] - a[1]) * (y - a[0]) / (b[0] - a[0])) / y
+}
+
 /// Everything after geometry and negative conversion, for one set of settings: tone, colour, effects, detail.
 fn finish(mut img: Rgb32FImage, p: &Params, scale: f32, full: (u32, u32), off: (usize, usize)) -> Rgb32FImage {
     let (full_w, full_h) = full;
@@ -1378,10 +1417,13 @@ fn finish(mut img: Rgb32FImage, p: &Params, scale: f32, full: (u32, u32), off: (
     let (cx, cy) = (big_w / 2.0, big_h / 2.0);
     let r2max = cx * cx + cy * cy;
     let cal_on = p.cal.iter().flatten().any(|v| *v != 0.0);
+    let cam = (!p.neg.enabled && p.cam_curve.len() >= 2).then_some(p.cam_curve.as_slice());
     img.par_chunks_mut(w * 3).enumerate().for_each(|(y, row)| {
         for (x, px) in px3_mut(row).iter_mut().enumerate() {
             let (gx, gy) = ((x + x0) as f32, (y + y0) as f32);
-            let mut c = [px[0] * gains[0], px[1] * gains[1], px[2] * gains[2]];
+            // The camera's curve first: it was measured on the RAW as shot, before any of these settings.
+            let k = cam.map_or(1.0, |cc| cam_gain(cc, luma(*px)));
+            let mut c = [px[0] * gains[0] * k, px[1] * gains[1] * k, px[2] * gains[2] * k];
             if cal_on {
                 c = mul(&cal, c);
             }
@@ -1819,6 +1861,21 @@ mod tests {
     }
 
     #[test]
+    fn camera_curve_shapes_an_unedited_raw_but_not_a_negative() {
+        let img = Rgb32FImage::from_fn(8, 8, |_, _| image::Rgb([0.1, 0.1, 0.1]));
+        // A curve that doubles brightness at 0.1.
+        let p = Params { cam_curve: vec![[0.01, 0.01], [0.1, 0.2], [0.4, 0.9]], ..Default::default() };
+        let flat = render(&img, &Params::default(), 1.0).get_pixel(4, 4).0[1];
+        let toned = render(&img, &p, 1.0).get_pixel(4, 4).0[1];
+        assert!((toned - linear_to_srgb(0.2)).abs() < 0.02 && toned > flat + 0.1, "{flat} {toned}");
+        // It's the photo's, not part of a look: unedited, kept by paste and presets.
+        assert!(!p.is_edited());
+        assert_eq!(p.with_look_of(&Params { exposure: 1.0, ..Default::default() }).cam_curve, p.cam_curve);
+        assert_eq!(Params::blend(&p, &Params::default(), 1.0).cam_curve, p.cam_curve);
+        assert!((cam_gain(&p.cam_curve, 0.8) - 0.9 / 0.4).abs() < 1e-6);
+    }
+
+    #[test]
     fn colour_profile_applies_to_the_source_before_the_negative() {
         let img = Rgb32FImage::from_fn(8, 8, |_, _| image::Rgb([0.6, 0.3, 0.1]));
         let swap = crate::calib::ColorProfile { name: "swap".into(), m: [[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]] };
@@ -1827,6 +1884,7 @@ mod tests {
         // Old sidecars without a profile still load, and saving leaves the field out.
         let q: Params = serde_json::from_str("{}").unwrap();
         assert!(q.profile.is_none() && !serde_json::to_string(&q).unwrap().contains("profile"));
+        assert!(!Params { process: 1, ..q }.is_edited());
     }
 
     #[test]
@@ -1836,6 +1894,9 @@ mod tests {
         let digital = Params { exposure: 0.5, ..Default::default() };
         let pasted = scan.with_look_of(&digital);
         assert!(pasted.neg.enabled && pasted.exposure == 0.5);
+        // A preset or paste never drops the scanner profile the conversion was measured with.
+        let profiled = Params { profile: Some(Default::default()), ..scan.clone() };
+        assert!(profiled.with_look_of(&digital).profile.is_some());
     }
 
     #[test]

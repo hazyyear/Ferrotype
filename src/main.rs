@@ -34,6 +34,10 @@ pub fn read_params(path: &Path) -> Option<Params> {
     match std::fs::read_to_string(sidecar(path)) {
         Ok(t) => {
             let mut p: Params = serde_json::from_str(&t).ok()?;
+            // Saved before the camera curve: its settings were made on the flat look (see `wants_cam_curve`).
+            if !t.contains("\"process\"") {
+                p.process = 1;
+            }
             // Ratings and labels set in Lightroom, darktable or Bridge since win over ours.
             if let Some(x) = &x {
                 let (r, l) = xmp::rating_label(x);
@@ -44,6 +48,13 @@ pub fn read_params(path: &Path) -> Option<Params> {
         }
         Err(_) => Some(xmp::parse(&x?).1),
     }
+}
+
+/// Whether a photo should get the camera's tone curve now: it has none yet, and its settings weren't made on the
+/// flat look of older versions (`Params::process`; those would change under it). Lightroom settings imported from
+/// an XMP assume Lightroom's own base curve, so they get it.
+pub fn wants_cam_curve(p: &Params) -> bool {
+    p.cam_curve.is_empty() && p.process >= 2
 }
 
 /// A sidecar that exists but can't be read (damaged, or written by a much newer version).
@@ -102,8 +113,11 @@ fn contact_sheet(files: &[PathBuf], cols: u32, first: usize) -> Rgb32FImage {
     let rows = (files.len() as u32).div_ceil(cols).max(1);
     let (w, h) = (cols * (fw + gap) + gap, rows * (fh + label + gap) + gap);
     let frames: Vec<Option<Rgb32FImage>> = files.par_iter().map(|f| {
-        let img = load::load_quick(f, cell).ok()?;
-        let p = Params { border: Default::default(), ..read_params(f).unwrap_or_default() };
+        let (img, toned) = load::load_quick_toned(f, cell).ok()?;
+        let mut p = Params { border: Default::default(), ..read_params(f).unwrap_or_default() };
+        if toned {
+            p.cam_curve.clear(); // the camera's JPEG already has it
+        }
         Some(load::fit(&develop::render(&img, &p, 0.15), cell))
     }).collect();
     let mut sheet = Rgb32FImage::from_pixel(w, h, image::Rgb([0.04; 3]));
@@ -381,7 +395,12 @@ pub fn export_file(path: &Path, out_dir: &Path, o: &ExportOpts, n: usize, overri
     }
     let mut p = read_params(path).unwrap_or_default();
     overrides(&mut p);
-    let img = denoise::prepare(load::load(path)?, path, &p)?;
+    let raw = load::load(path)?;
+    // A RAW never opened in the app has no camera curve yet: measure it, as opening it would.
+    if load::is_raw_photo(path) && wants_cam_curve(&p) {
+        p.cam_curve = load::camera_curve(path, &raw);
+    }
+    let img = denoise::prepare(raw, path, &p)?;
     let shot = if !o.name.trim().is_empty() && o.name != "{name}" { lens::shot(path).unwrap_or_default() } else { Default::default() };
     let out = claim_output(out_dir, &output::file_name(&o.name, path, n, &o.roll, &p, &shot), o.ext)?;
     write_export(&img, &p, o, &out, path).inspect_err(|_| {
@@ -628,6 +647,11 @@ mod tests {
         let p = Params { exposure: 1.25, ..Default::default() };
         write_params(&photo, &p).unwrap();
         assert!(read_params(&photo) == Some(p));
+        // Edits saved before the camera curve keep the flat look they were made on; new ones get the curve.
+        std::fs::write(sidecar(&photo), r#"{"exposure":1.25}"#).unwrap();
+        let old = read_params(&photo).unwrap();
+        assert!(old.process == 1 && !wants_cam_curve(&old));
+        assert!(wants_cam_curve(&Params::default()));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
