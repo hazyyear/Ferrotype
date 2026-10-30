@@ -251,7 +251,9 @@ struct Opened {
     cam: Vec<[f32; 2]>,
 }
 
-type RenderKey = (Params, bool, bool, usize, Option<usize>);
+/// Settings, clipping view, draft, proof, mask overlay, and which source image (the cleaned or denoised one
+/// replaces it in place, so a render of the old one must not count).
+type RenderKey = (Params, bool, bool, usize, Option<usize>, usize);
 
 /// What the render thread hands back for the preview.
 struct RenderOut {
@@ -527,7 +529,7 @@ fn render_preview(src: &Rgb32FImage, full_w: u32, shown: &Params, overlay: Optio
     }
     RenderOut {
         generation: 0,
-        key: (Params::default(), false, false, 0, None),
+        key: (Params::default(), false, false, 0, None, 0),
         image: to_color_image(&out),
         srgb: srgb_color_image(&out),
         bins,
@@ -645,6 +647,8 @@ fn describe_change(a: &Params, b: &Params) -> (String, String) {
             let val = jb.get(k).and_then(|v| v.as_f64()).map(|v| if v.abs() < 10.0 && v.fract() != 0.0 { format!("{v:+.2}") } else if *k == "temp" { format!("{v:.0}") } else { format!("{v:+.0}") }).unwrap_or_default();
             (n.to_string(), val)
         }
+        // Upright (or its Off button) moves several transform sliders at once.
+        many if many.iter().all(|(k, _)| k.starts_with("t_")) => ("Straighten".into(), String::new()),
         many => (format!("{} +{}", many[0].1, many.len() - 1), String::new()),
     }
 }
@@ -1230,7 +1234,7 @@ impl App {
         // Cropping and placing a chart show the whole frame, without the border, with the crop drawn on top.
         let shown = if matches!(self.tool, Tool::Crop | Tool::Chart) { Params { crop: [0.0; 4], border: Default::default(), ..self.params.clone() } } else { self.params.clone() };
         let overlay = (self.tool == Tool::Mask && self.mask_ui.overlay && self.mask_ui.sel < shown.masks.len()).then_some(self.mask_ui.sel);
-        let key = (shown.clone(), self.clip_view, draft, self.proof, overlay);
+        let key = (shown.clone(), self.clip_view, draft, self.proof, overlay, Arc::as_ptr(&photo.preview) as usize);
         if self.rendered.as_ref() == Some(&key) {
             return;
         }
@@ -3413,10 +3417,19 @@ impl App {
         });
         if let Some((name, files)) = &mut self.new_coll {
             let n = files.len();
-            let resp = ui.add(egui::TextEdit::singleline(name).hint_text(format!("Name for {n} photo{}", if n == 1 { "" } else { "s" })).desired_width(f32::INFINITY));
-            resp.request_focus();
-            let done = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            let cancel = ui.input(|i| i.key_pressed(egui::Key::Escape));
+            let resp = ui.add(egui::TextEdit::singleline(name).id_salt("new_coll").hint_text(format!("Name for {n} photo{}, then Enter", if n == 1 { "" } else { "s" })).desired_width(f32::INFINITY));
+            // Focus it once when it appears, not every frame (that would trap the keyboard).
+            let id = resp.id;
+            if ui.memory(|m| m.data.get_temp::<bool>(id)).is_none() {
+                resp.request_focus();
+                ui.memory_mut(|m| m.data.insert_temp(id, true));
+            }
+            let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let done = (resp.has_focus() || resp.lost_focus()) && enter;
+            let cancel = resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape));
+            if done || cancel {
+                ui.memory_mut(|m| m.data.remove::<bool>(id));
+            }
             if done && !name.trim().is_empty() {
                 let c = crate::library::Collection { name: name.trim().to_string(), files: files.clone(), ..Default::default() };
                 self.status = format!("Collection {} made", c.name);
@@ -3634,7 +3647,10 @@ impl App {
         let r = &mut self.roll;
         let row = |ui: &mut Ui, label: &str, add: &mut dyn FnMut(&mut Ui) -> egui::Response| -> bool {
             ui.horizontal(|ui| {
-                ui.add_sized(vec2(78.0, 22.0), egui::Label::new(RichText::new(label).size(12.0).color(TEXT3)));
+                ui.allocate_ui_with_layout(vec2(78.0, 22.0), Layout::left_to_right(Align::Center), |ui| {
+                    ui.set_min_width(78.0);
+                    ui.label(RichText::new(label).size(12.0).color(TEXT3));
+                });
                 add(ui).changed()
             }).inner
         };
@@ -4161,8 +4177,8 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.label(caps("Upright"));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if small_action(ui, "Off", false).on_hover_text("Rotate, Vertical and Horizontal back to 0").clicked() {
-                            (p.t_rot, p.t_vert, p.t_hor) = (0.0, 0.0, 0.0);
+                        if small_action(ui, "Off", false).on_hover_text("Rotate, Vertical and Horizontal back to 0, Scale to 100").clicked() {
+                            (p.t_rot, p.t_vert, p.t_hor, p.t_scale) = (0.0, 0.0, 0.0, 100.0);
                         }
                         for (m, name) in crate::upright::Mode::ALL.iter().rev() {
                             let tip = match m {

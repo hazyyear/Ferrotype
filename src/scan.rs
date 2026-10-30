@@ -286,57 +286,95 @@ pub fn ir_clean(img: &Rgb32FImage, ir: &Ir, strength: f32) -> Rgb32FImage {
 }
 
 /// Replace `img` where `mask` is 1 (blending where it's in between) with colour from the unmasked surroundings.
+///
+/// Fills from the edge of each defect inward, one ring at a time, from the nearest clean pixels only, so a
+/// window or line a few pixels away doesn't bleed in. Averages are taken in log space: on a negative, a plain
+/// average leans towards the brighter (thinner) film and the repair would print darker than its surroundings.
 pub fn fill(img: &Rgb32FImage, mask: &[f32]) -> Rgb32FImage {
     let (w, h) = (img.width() as usize, img.height() as usize);
     if mask.iter().all(|&m| m <= 0.0) {
         return img.clone();
     }
-    let keep: Vec<f32> = mask.iter().map(|m| 1.0 - m).collect();
-    let mut out = img.clone();
-    let mut done = vec![0f32; w * h]; // how much of each masked pixel is already filled
-    for sigma in [1.5f32, 3.0, 6.0, 12.0, 24.0, 48.0] {
-        let wsum = develop::blur(&keep, w, h, sigma);
-        let chans: Vec<Vec<f32>> = (0..3).map(|c| {
-            let v: Vec<f32> = img.chunks(3).zip(&keep).map(|(p, k)| p[c] * k).collect();
-            develop::blur(&v, w, h, sigma)
-        }).collect();
-        let mut left = false;
-        for i in 0..w * h {
-            if mask[i] <= 0.0 || done[i] >= 1.0 {
-                continue;
-            }
-            // Enough clean film within this radius: take it, for the share not yet filled.
-            let take = ((wsum[i] - 0.15) / 0.35).clamp(0.0, 1.0) * (1.0 - done[i]);
-            if take > 0.0 {
-                let o = &mut out.as_mut()[i * 3..i * 3 + 3];
-                for c in 0..3 {
-                    let fillv = chans[c][i] / wsum[i].max(1e-6);
-                    // Blend between what has been filled so far and this scale's fill.
-                    let so_far = if done[i] > 0.0 { o[c] } else { 0.0 };
-                    o[c] = so_far + fillv * take;
+    let mut val: Vec<[f32; 3]> = img.chunks(3).map(|p| [p[0], p[1], p[2]].map(|v| v.max(1e-5).ln())).collect();
+    let mut known: Vec<bool> = mask.iter().map(|&m| m < 0.5).collect();
+    let mut todo: Vec<usize> = (0..w * h).filter(|&i| !known[i]).collect();
+    const NB: [(i32, i32, f32); 8] = [(-1, 0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0), (-1, -1, 0.7), (1, -1, 0.7), (-1, 1, 0.7), (1, 1, 0.7)];
+    let mut need = 2.0f32; // known neighbour weight a pixel needs to be filled this round
+    while !todo.is_empty() {
+        let ring: Vec<(usize, [f32; 3])> = todo.iter().filter_map(|&i| {
+            let (x, y) = ((i % w) as i32, (i / w) as i32);
+            let (mut acc, mut ws) = ([0f32; 3], 0f32);
+            for (dx, dy, wt) in NB {
+                let (xx, yy) = (x + dx, y + dy);
+                if xx >= 0 && yy >= 0 && (xx as usize) < w && (yy as usize) < h {
+                    let j = yy as usize * w + xx as usize;
+                    if known[j] {
+                        for c in 0..3 {
+                            acc[c] += val[j][c] * wt;
+                        }
+                        ws += wt;
+                    }
                 }
-                done[i] += take;
             }
-            if done[i] < 0.999 {
-                left = true;
+            (ws >= need).then(|| (i, acc.map(|a| a / ws)))
+        }).collect();
+        if ring.is_empty() {
+            if need <= 0.7 {
+                break; // nothing clean anywhere near (all masked): leave as is
             }
-        }
-        if !left {
-            break;
-        }
-    }
-    // Mix: masked share from the fill, the rest from the original.
-    for i in 0..w * h {
-        if mask[i] <= 0.0 {
+            need = 0.7; // corners and thin tips: one neighbour will do
             continue;
         }
-        let m = mask[i];
-        let d = done[i].max(1e-6);
-        let p = img.as_raw();
+        need = 2.0;
+        for &(i, v) in &ring {
+            val[i] = v;
+            known[i] = true;
+        }
+        todo.retain(|&i| !known[i]);
+    }
+    // A light smoothing of the filled pixels hides the ring-by-ring pattern.
+    let filled: Vec<bool> = mask.iter().map(|&m| m >= 0.5).collect();
+    let mut smooth = val.clone();
+    for _ in 0..2 {
+        for i in (0..w * h).filter(|&i| filled[i]) {
+            let (x, y) = ((i % w) as i32, (i / w) as i32);
+            let (mut acc, mut ws) = (val[i].map(|v| v * 2.0), 2.0f32);
+            for (dx, dy, wt) in NB {
+                let (xx, yy) = (x + dx, y + dy);
+                if xx >= 0 && yy >= 0 && (xx as usize) < w && (yy as usize) < h {
+                    let j = yy as usize * w + xx as usize;
+                    for c in 0..3 {
+                        acc[c] += val[j][c] * wt;
+                    }
+                    ws += wt;
+                }
+            }
+            smooth[i] = acc.map(|a| a / ws);
+        }
+        val.clone_from(&smooth);
+    }
+    let mut out = img.clone();
+    let p = img.as_raw();
+    for (i, &m) in mask.iter().enumerate() {
+        if m <= 0.0 {
+            continue;
+        }
+        // Pixels at the defect's soft edge (mask below ½) take their fill from the nearest filled colour.
+        let f = if filled[i] { val[i] } else {
+            let (x, y) = ((i % w) as i32, (i / w) as i32);
+            let mut best = val[i];
+            for (dx, dy, _) in NB {
+                let (xx, yy) = (x + dx, y + dy);
+                if xx >= 0 && yy >= 0 && (xx as usize) < w && (yy as usize) < h && filled[yy as usize * w + xx as usize] {
+                    best = val[yy as usize * w + xx as usize];
+                    break;
+                }
+            }
+            best
+        };
         let o = &mut out.as_mut()[i * 3..i * 3 + 3];
         for c in 0..3 {
-            let f = o[c] / d;
-            o[c] = p[i * 3 + c] * (1.0 - m) + f * m;
+            o[c] = p[i * 3 + c] * (1.0 - m) + f[c].exp() * m;
         }
     }
     out
@@ -455,3 +493,4 @@ mod tests {
         assert!(d.iter().any(|s| (s.x * 300.0 - 50.0).abs() < 1.5 && (s.y * 200.0 - 50.0).abs() < 1.5));
     }
 }
+

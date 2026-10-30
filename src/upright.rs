@@ -379,12 +379,42 @@ pub fn solve_edges(edges: &[Edgelet], w: u32, h: u32, p: &Params, mode: Mode) ->
     (round(rot, 0.05), round(v, 0.5), round(hz, 0.5))
 }
 
-/// `p` with Upright applied (Rotate, Vertical and Horizontal set; everything else kept).
+/// `p` with Upright applied: Rotate, Vertical and Horizontal set, and Scale raised just enough that the
+/// straightened photo still fills the frame (no empty corners); everything else kept.
 pub fn apply(img: &Rgb32FImage, p: &Params, mode: Mode) -> Params {
     let (r, v, h) = solve(img, p, mode);
     let mut q = p.clone();
     (q.t_rot, q.t_vert, q.t_hor) = (r, v, h);
+    let (w, hh) = crate::develop::oriented(img.width(), img.height(), p);
+    q.t_scale = fill_scale(&q, w, hh).max(if p.t_scale > 100.0 && (p.t_vert, p.t_hor) == (0.0, 0.0) { p.t_scale } else { 100.0 });
     q
+}
+
+/// The smallest Scale (100 or more) at which every point on the frame's edge shows part of the photo.
+pub fn fill_scale(p: &Params, w: u32, h: u32) -> f32 {
+    let (wf, hf) = (w as f32, h as f32);
+    let fits = |s: f32| {
+        let m = Mapper::new(&Params { t_scale: s, ..p.clone() }, w, h);
+        (0..=16).all(|i| {
+            let t = i as f32 / 16.0;
+            [(t * wf, 0.0), (t * wf, hf - 1.0), (0.0, t * hf), (wf - 1.0, t * hf)].iter().all(|&(x, y)| {
+                let (sx, sy, ..) = m.map(x, y);
+                sx >= -1.0 && sy >= -1.0 && sx <= wf && sy <= hf
+            })
+        })
+    };
+    if fits(100.0) {
+        return 100.0;
+    }
+    let (mut lo, mut hi) = (100.0f32, 150.0f32);
+    if !fits(hi) {
+        return hi;
+    }
+    for _ in 0..20 {
+        let mid = (lo + hi) / 2.0;
+        if fits(mid) { hi = mid } else { lo = mid }
+    }
+    (hi * 2.0).ceil() / 2.0
 }
 
 #[cfg(test)]
@@ -460,6 +490,15 @@ mod tests {
             *px = image::Rgb([v, v, v]);
         }
         assert_eq!(solve(&img, &Params::default(), Mode::Auto), (0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn upright_fills_the_frame() {
+        let truth = Params { t_vert: 30.0, ..Params::default() };
+        let img = scene(600, 800, &truth);
+        let q = apply(&img, &Params::default(), Mode::Vertical);
+        assert!(q.t_scale > 100.0, "keystoning needs a zoom: {}", q.t_scale);
+        assert_eq!(fill_scale(&Params::default(), 600, 800), 100.0);
     }
 
     #[test]
