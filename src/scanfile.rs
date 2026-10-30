@@ -47,6 +47,10 @@ impl Info {
             return false;
         }
         let sw = self.software.to_ascii_lowercase();
+        // Ferrotype's own scans say so in their Software tag.
+        if sw.starts_with("ferrotype") {
+            return sw.contains(", linear");
+        }
         let raw_software = sw.contains("vuescan") || sw.contains("silverfast");
         // Infrared alongside the colours only comes in raw files, whoever wrote them.
         raw_software || (self.extra > 0 && !sw.contains("epson"))

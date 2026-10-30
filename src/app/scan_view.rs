@@ -99,6 +99,8 @@ enum ScanMsg {
     Options(String, Result<scanner::Options, String>),
     /// What the open file says about the scanner that made it.
     FileInfo(PathBuf, Option<scanfile::Info>),
+    /// A preview scan: the file and the size of the area it covers, in millimetres.
+    Previewed(Result<(PathBuf, [f32; 2]), String>),
 }
 
 pub(super) struct ScanUi {
@@ -133,6 +135,8 @@ pub(super) struct ScanUi {
     apps: Option<Vec<(&'static str, PathBuf)>>,
     /// The open file's scanner tags.
     file_info: Option<(PathBuf, Option<scanfile::Info>)>,
+    /// The last preview scan and the size of the scanner area it shows (mm).
+    preview: Option<(PathBuf, [f32; 2])>,
 }
 
 impl Default for ScanUi {
@@ -141,7 +145,7 @@ impl Default for ScanUi {
         let (sc_tx, sc_rx) = mpsc::channel();
         ScanUi {
             page: 0, strip: None, preview_busy: false, checks: None, focus_checked: false, converted: usize::MAX, roll_len: 2, sel: vec![], anchor: None, info: HashMap::new(), info_folder: None, busy: None, tx, rx,
-            scanning: None, sc_tx, sc_rx, twain: String::new(), devices: None, options: None, sane: scanner::Settings { depth: 16, resolution: 2400, ..Default::default() }, apps: None, file_info: None,
+            scanning: None, sc_tx, sc_rx, twain: String::new(), devices: None, options: None, sane: scanner::Settings { depth: 16, resolution: 2400, passes: 1, linear: true, ..Default::default() }, apps: None, file_info: None, preview: None,
         }
     }
 }
@@ -364,6 +368,19 @@ impl App {
                         }
                     }
                     self.scan.options = Some((dev, o));
+                }
+                ScanMsg::Previewed(r) => {
+                    self.scan.scanning = None;
+                    match r {
+                        Ok((f, bed)) => {
+                            self.status = format!("Preview of {:.0} × {:.0} mm: check the frame boxes, then scan them", bed[0], bed[1]);
+                            self.scan.preview = Some((f.clone(), bed));
+                            self.scan.strip = None;
+                            self.scan.page = 0;
+                            self.select(ctx, f);
+                        }
+                        Err(e) => self.status = format!("Preview failed: {e}"),
+                    }
                 }
                 ScanMsg::FileInfo(f, i) => {
                     if self.current.as_ref() == Some(&f) {
@@ -876,8 +893,26 @@ impl App {
                 self.sane_settings(ui);
             }
             let ready = cfg!(windows) || !self.scan.sane.device.is_empty();
-            if primary(ui, "Scan", ready).on_hover_text("Scan into the open folder").clicked() {
-                self.start_scan(&ctx);
+            if cfg!(windows) {
+                if primary(ui, "Scan", ready).on_hover_text("Scan into the open folder").clicked() {
+                    self.start_scan(&ctx);
+                }
+            } else {
+                // Preview, adjust the frames the light table finds on it, then scan just those at full resolution.
+                let frames = self.preview_frames();
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(ready, egui::Button::new("Preview")).on_hover_text("A quick scan of the whole area: the light table finds the frames on it").clicked() {
+                        self.start_preview(&ctx);
+                    }
+                    if let Some(n) = frames.as_ref().map(Vec::len).filter(|n| *n > 0) {
+                        let label = format!("Scan {n} frame{} at {} ppi", if n == 1 { "" } else { "s" }, self.scan.sane.resolution);
+                        if primary(ui, &label, ready).on_hover_text("Scan each frame boxed on the preview, at full resolution, into the open folder").clicked() {
+                            self.start_frames(&ctx, frames.clone().unwrap_or_default());
+                        }
+                    } else if primary(ui, "Scan", ready).on_hover_text("Scan the whole area into the open folder").clicked() {
+                        self.start_scan(&ctx);
+                    }
+                });
             }
             #[cfg(windows)]
             ui.horizontal(|ui| {
@@ -935,6 +970,9 @@ impl App {
         let full = ui.available_width();
         ui.horizontal(|ui| {
             let shown = devices.iter().find(|d| d.id == self.scan.sane.device).map_or("No scanner found".to_string(), |d| d.name.clone());
+            if !devices.is_empty() {
+                self.scan.sane.device_name = shown.clone();
+            }
             egui::ComboBox::from_id_salt("sane_dev").width(full - 70.0).selected_text(shown).show_ui(ui, |ui| {
                 for d in &devices {
                     ui.selectable_value(&mut self.scan.sane.device, d.id.clone(), &d.name);
@@ -996,18 +1034,75 @@ impl App {
                 });
                 ui.end_row();
             }
+            ui.label(RichText::new("Passes").size(12.0).color(TEXT2));
+            let shown = if s.passes <= 1 { "1 (single scan)".to_string() } else { format!("{} (averaged)", s.passes) };
+            egui::ComboBox::from_id_salt("sane_passes").width(150.0).selected_text(shown).show_ui(ui, |ui| {
+                for (n, label) in [(1, "1 (single scan)"), (2, "2 (averaged)"), (4, "4: half the noise"), (8, "8 (averaged)")] {
+                    ui.selectable_value(&mut s.passes, n, label);
+                }
+            })
+            .response
+            .on_hover_text("Scan each frame several times and average the passes: less noise in the dense parts of a negative, at the cost of time");
+            ui.end_row();
+        });
+        if opts.linear.is_some() {
+            switch_row(ui, "Linear data", &mut s.linear).on_hover_text("Ask the scanner for gamma 1.0, the raw light it measured: what negative conversion wants");
+        }
+    }
+
+    /// The roll folder scans go into, asking for one when none is open (or only a preview is).
+    fn scan_folder(&mut self, ctx: &egui::Context) -> Option<PathBuf> {
+        if let Some(d) = self.folder.clone() {
+            return Some(d);
+        }
+        let d = rfd::FileDialog::new().set_title("Folder for the roll's scans").pick_folder()?;
+        self.open_path(ctx, &d);
+        Some(d)
+    }
+
+    /// A quick scan of the whole area, opened on the light table so its frames can be found and adjusted.
+    fn start_preview(&mut self, ctx: &egui::Context) {
+        let Some(cache) = crate::keys::dirs_cache() else {
+            self.status = "No cache folder for the preview".into();
+            return;
+        };
+        let dir = cache.join("scan-preview");
+        let _ = std::fs::remove_dir_all(&dir);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            self.status = format!("Couldn't make the preview folder: {e}");
+            return;
+        }
+        // A new name each time, so nothing cached for the last preview is shown for this one.
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+        let out = dir.join(format!("preview-{stamp}.tif"));
+        self.scan.scanning = Some("Previewing…".into());
+        let (tx, ctx2, settings) = (self.scan.tx.clone(), ctx.clone(), self.scan.sane.clone());
+        std::thread::spawn(move || {
+            let r = scanner::preview(&settings, &out).map(|bed| (out, bed));
+            let _ = tx.send(ScanMsg::Previewed(r));
+            ctx2.request_repaint();
         });
     }
 
+    /// The frames boxed on the open preview, as areas on the scanner (skipped ones left out). None when the
+    /// light table isn't showing a preview.
+    fn preview_frames(&self) -> Option<Vec<scanner::Area>> {
+        let (file, bed) = self.scan.preview.as_ref()?;
+        let s = self.scan.strip.as_ref().filter(|s| s.file == *file)?;
+        Some(s.frames.iter().filter(|f| !f.skip).map(|f| scanner::area_of(f.crop, *bed, 1.0)).collect())
+    }
+
+    fn start_frames(&mut self, ctx: &egui::Context, areas: Vec<scanner::Area>) {
+        let Some(dir) = self.scan_folder(ctx) else { return };
+        self.watch = true;
+        self.watch_open = true;
+        self.scan.scanning = Some("Scanning…".into());
+        let ctx2 = ctx.clone();
+        scanner::scan_frames(dir, self.scan.sane.clone(), areas, self.scan.sc_tx.clone(), move || ctx2.request_repaint());
+    }
+
     fn start_scan(&mut self, ctx: &egui::Context) {
-        let dir = match self.folder.clone() {
-            Some(d) => d,
-            None => {
-                let Some(d) = rfd::FileDialog::new().set_title("Folder for the roll's scans").pick_folder() else { return };
-                self.open_path(ctx, &d);
-                d
-            }
-        };
+        let Some(dir) = self.scan_folder(ctx) else { return };
         // New scans come in through the folder watch, and the newest opens on the light table.
         self.watch = true;
         self.watch_open = true;
