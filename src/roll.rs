@@ -29,6 +29,8 @@ pub struct Roll {
     /// When it was shot, YYYY-MM-DD.
     pub date: String,
     pub notes: String,
+    /// How to read untagged scans in this folder: "" = from the file's tags, "linear" (a raw scan), "gamma".
+    pub scan_data: String,
     /// Per frame, by file name.
     pub frames: BTreeMap<String, Frame>,
 }

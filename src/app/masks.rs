@@ -70,7 +70,7 @@ pub(super) fn masks_panel(ui: &mut Ui, st: &mut MaskUi, p: &mut Params) -> bool 
         }
     });
     if p.masks.is_empty() {
-        ui.label(RichText::new("A mask limits settings to part of the photo: a gradient, a circle, painted areas, a range of brightness or colour, or any mix of these.").size(11.5).color(TEXT2));
+        ui.label(RichText::new("A mask limits settings to part of the photo. It can be a gradient, a circle, painted areas, a range of brightness or colour, or any mix of these.").size(11.5).color(TEXT2));
         return want_tool;
     }
     st.sel = st.sel.min(p.masks.len() - 1);
@@ -91,7 +91,7 @@ pub(super) fn masks_panel(ui: &mut Ui, st: &mut MaskUi, p: &mut Params) -> bool 
                 m.hidden = !m.hidden;
             }
             let name = if m.parts.is_empty() { format!("{} (draw on the photo)", m.name) } else { m.name.clone() };
-            if ui.selectable_label(on, name).clicked() {
+            if picked(ui, on, name).clicked() {
                 st.sel = i;
                 want_tool = true;
             }
@@ -125,7 +125,7 @@ pub(super) fn masks_panel(ui: &mut Ui, st: &mut MaskUi, p: &mut Params) -> bool 
                 if k > 0 {
                     egui::ComboBox::from_id_salt(("op", k)).width(84.0).selected_text(OPS.iter().find(|o| o.0 == part.op).map_or("", |o| o.1)).show_ui(ui, |ui| {
                         for (op, name) in OPS {
-                            ui.selectable_value(&mut part.op, op, name);
+                            pick(ui, &mut part.op, op, name);
                         }
                     });
                 }
@@ -184,7 +184,7 @@ pub(super) fn masks_panel(ui: &mut Ui, st: &mut MaskUi, p: &mut Params) -> bool 
         }
     });
     let draw_name = match st.draw { Draw::Linear => "linear gradient", Draw::Radial => "radial gradient", Draw::Brush => "brush" };
-    ui.label(RichText::new(format!("With the Mask tool, dragging on the photo draws a {draw_name}. Drag a handle to adjust; right-click a handle to remove that shape.")).size(11.5).color(TEXT2));
+    ui.label(RichText::new(format!("With the Mask tool, dragging on the photo draws a {draw_name}. Drag a handle to adjust it, or right-click a handle to remove that shape.")).size(11.5).color(TEXT2));
     if st.draw == Draw::Brush {
         slider(ui, "Brush size", &mut st.size, 0.5, 20.0, 4.0, None);
         switch_row(ui, "Erase", &mut st.erase);

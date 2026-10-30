@@ -1,6 +1,6 @@
 //! Look and feel: palette, fonts, and the custom controls (slider, section, chips, segmented, switch, histogram).
 use eframe::egui;
-use egui::{Align2, Color32, CornerRadius, FontFamily, FontId, Rect, RichText, Sense, Stroke, Ui, pos2, vec2};
+use egui::{Align2, Color32, CornerRadius, FontFamily, FontId, Rect, Response, RichText, Sense, Stroke, Ui, pos2, vec2};
 
 // Brand palette (ferrotype brand kit, direction F). There is no accent colour: emphasis is bone,
 // selection is shown by inverting (ink on bone). Colour belongs to the photograph.
@@ -677,4 +677,21 @@ pub fn token_chips(ui: &mut Ui, pattern: &mut String) {
             }
         }
     });
+}
+
+/// A choice in a list or combo box. Like `selectable_value`, but the chosen one's text is ink on its bone fill
+/// (the app-wide text colour would otherwise paint it bone on bone).
+pub fn pick<V: PartialEq>(ui: &mut Ui, current: &mut V, value: V, text: impl Into<String>) -> Response {
+    let mut r = picked(ui, *current == value, text);
+    if r.clicked() && *current != value {
+        *current = value;
+        r.mark_changed();
+    }
+    r
+}
+
+/// A choice that is `on` or not, readable when on (see `pick`).
+pub fn picked(ui: &mut Ui, on: bool, text: impl Into<String>) -> Response {
+    let t = RichText::new(text);
+    ui.selectable_label(on, if on { t.color(INK) } else { t })
 }

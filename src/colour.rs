@@ -99,6 +99,65 @@ pub fn to_space(img: &mut Rgb32FImage, space: Space) {
     });
 }
 
+// ---------- input profiles ----------
+
+/// Read an image's values through its embedded ICC profile into linear sRGB primaries, in place. Values outside
+/// sRGB (from Adobe RGB or ProPhoto) stay as negative or >1 channels. Returns false, leaving the image untouched,
+/// for a profile that can't be used or that is plain sRGB (the caller's own sRGB path is the same and faster).
+pub fn input_to_linear(img: &mut Rgb32FImage, icc: &[u8], grey: bool) -> bool {
+    use moxcms::{Layout, ToneReprCurve, TransformOptions};
+    let Ok(src) = ColorProfile::new_from_slice(icc) else { return false };
+    let linear = ToneReprCurve::Parametric(vec![1.0]);
+    let opts = TransformOptions { prefer_fixed_point: false, allow_use_cicp_transfer: false, ..Default::default() };
+    if grey || src.color_space == moxcms::DataColorSpace::Gray {
+        if src.color_space != moxcms::DataColorSpace::Gray {
+            return false;
+        }
+        let mut dst = ColorProfile::new_gray_with_gamma(1.0);
+        dst.white_point = src.white_point;
+        let Ok(t) = src.create_transform_f32(Layout::Gray, &dst, Layout::Gray, opts) else { return false };
+        let g: Vec<f32> = img.chunks_exact(3).map(|p| p[0]).collect();
+        let mut o = vec![0f32; g.len()];
+        let rows = (img.width() as usize).max(1) * 64;
+        if g.par_chunks(rows).zip(o.par_chunks_mut(rows)).any(|(a, b)| t.transform(a, b).is_err()) {
+            return false;
+        }
+        img.par_chunks_mut(3).zip(o.par_iter()).for_each(|(p, &v)| p.fill(v));
+        return true;
+    }
+    if src.color_space != moxcms::DataColorSpace::Rgb || is_srgb(&src) {
+        return false;
+    }
+    let mut dst = ColorProfile::new_srgb();
+    dst.cicp = None; // or its sRGB transfer wins over the linear curves below
+    dst.red_trc = Some(linear.clone());
+    dst.green_trc = Some(linear.clone());
+    dst.blue_trc = Some(linear);
+    let Ok(t) = src.create_transform_f32(Layout::Rgb, &dst, Layout::Rgb, opts) else { return false };
+    let mut out = vec![0f32; img.len()];
+    let rows = (img.width() as usize).max(1) * 3 * 64;
+    if img.par_chunks(rows).zip(out.par_chunks_mut(rows)).any(|(a, b)| t.transform(a, b).is_err()) {
+        return false;
+    }
+    img.copy_from_slice(&out);
+    true
+}
+
+/// A matrix/TRC profile with sRGB's colorants and curve, as most cameras and phones embed.
+fn is_srgb(p: &ColorProfile) -> bool {
+    let s = ColorProfile::new_srgb();
+    let close = |a: moxcms::Xyzd, b: moxcms::Xyzd| (a.x - b.x).abs() < 0.002 && (a.y - b.y).abs() < 0.002 && (a.z - b.z).abs() < 0.002;
+    if !p.is_matrix_shaper() || !close(p.red_colorant, s.red_colorant) || !close(p.green_colorant, s.green_colorant) || !close(p.blue_colorant, s.blue_colorant) {
+        return false;
+    }
+    let curve_ok = |c: &Option<moxcms::ToneReprCurve>| {
+        let Some(c) = c else { return false };
+        let Ok(e) = c.make_linear_evaluator() else { return false };
+        [0.02f32, 0.2, 0.5, 0.8].iter().all(|&v| (e.evaluate_value(v) - crate::load::srgb_to_linear(v)).abs() < 0.003)
+    };
+    curve_ok(&p.red_trc) && curve_ok(&p.green_trc) && curve_ok(&p.blue_trc)
+}
+
 // ---------- the screen ----------
 
 /// How the screen shows colour: sRGB (no change), a standard wide-gamut space, or a monitor ICC profile.
@@ -428,5 +487,27 @@ mod tests {
         assert!(pr.out_of_gamut(&img).iter().all(|o| !o));
         assert!(load_proof(dir.join("nope.icc").to_str().unwrap(), true, false).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn embedded_profiles_read_back_to_linear_srgb() {
+        // A mid grey and a saturated red, linear sRGB, encoded as Adobe RGB with its profile embedded.
+        let truth = [[0.478f32, 0.478, 0.478], [0.6, 0.1, 0.05]];
+        let mut img = Rgb32FImage::from_fn(2, 1, |x, _| image::Rgb(truth[x as usize]));
+        let m = Space::AdobeRgb.matrix();
+        for px in img.chunks_mut(3) {
+            let l = [px[0], px[1], px[2]];
+            for k in 0..3 {
+                px[k] = Space::AdobeRgb.encode(m[k][0] * l[0] + m[k][1] * l[1] + m[k][2] * l[2]);
+            }
+        }
+        assert!(input_to_linear(&mut img, &Space::AdobeRgb.icc(), false));
+        for (px, t) in img.pixels().zip(truth) {
+            for k in 0..3 {
+                assert!((px.0[k] - t[k]).abs() < 0.004, "{:?} vs {t:?}", px.0);
+            }
+        }
+        // sRGB itself is left to the caller's faster path.
+        assert!(!input_to_linear(&mut img, &ColorProfile::new_srgb().encode().unwrap(), false));
     }
 }
