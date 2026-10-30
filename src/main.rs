@@ -16,6 +16,11 @@ mod rename;
 mod hdrmerge;
 mod gpu;
 mod calib;
+mod upright;
+mod roll;
+mod colour;
+mod demosaic;
+mod library;
 
 use develop::Params;
 use image::{DynamicImage, Rgb32FImage, codecs::jpeg::JpegEncoder};
@@ -42,6 +47,10 @@ pub fn read_params(path: &Path) -> Option<Params> {
             if let Some(x) = &x {
                 let (r, l) = xmp::rating_label(x);
                 xmp::apply_rating_label(&mut p, r, l);
+                // So do keywords set there.
+                if let Some(k) = xmp::keywords(x) {
+                    p.keywords = k;
+                }
             }
             p.migrate();
             Some(p)
@@ -238,6 +247,11 @@ pub struct ExportOpts {
     pub meta: bool,
     /// Exporting a folder: include its subfolders and recreate the folder tree in the destination.
     pub tree: bool,
+    /// Colour space of the file (sRGB, Display P3, Adobe RGB, ProPhoto), with its ICC profile embedded.
+    pub space: colour::Space,
+    /// Command line: straighten each photo with Upright before exporting.
+    #[serde(skip)]
+    pub upright: Option<upright::Mode>,
 }
 
 impl Default for ExportOpts {
@@ -245,7 +259,7 @@ impl Default for ExportOpts {
         Self {
             ext: "jpg", long_edge: 0, quality: 92, hdr: false, canvas: [0, 0], print: [0.0, 0.0, 300.0], print_fill: false,
             wm_text: String::new(), wm_logo: String::new(), wm_pos: 0, wm_size: 4.0, wm_opacity: 70.0,
-            name: String::new(), roll: String::new(), meta: false, tree: false,
+            name: String::new(), roll: String::new(), meta: false, tree: false, upright: None, space: colour::Space::Srgb,
         }
     }
 }
@@ -275,7 +289,13 @@ impl ExportOpts {
 /// Render at the requested size. A smaller export renders from a downscaled source (much faster),
 /// and radii scale with it so it looks like the full-size render.
 pub fn render_export(full: &Rgb32FImage, p: &Params, o: &ExportOpts) -> Rgb32FImage {
-    render_export_with(full, p, o, develop::render)
+    if o.space == colour::Space::Srgb {
+        return render_export_with(full, p, o, develop::render);
+    }
+    // Wide gamut: render keeping the colours sRGB can't hold, then convert into the export's space.
+    let mut out = render_export_with(full, p, o, develop::render_wide);
+    colour::to_space(&mut out, o.space);
+    out
 }
 
 fn render_export_with(full: &Rgb32FImage, p: &Params, o: &ExportOpts, render: impl Fn(&Rgb32FImage, &Params, f32) -> Rgb32FImage) -> Rgb32FImage {
@@ -304,54 +324,86 @@ fn render_export_with(full: &Rgb32FImage, p: &Params, o: &ExportOpts, render: im
     out
 }
 
+/// Camera and lens details of `src` for an export, with the folder's roll notes filling in what a film scan
+/// lacks (camera, lens, speed, date, and the frame's aperture, shutter and focal length).
+pub fn export_shot(src: &Path) -> lens::Shot {
+    let mut s = lens::shot(src).unwrap_or_default();
+    roll::fill_shot(src, &mut s);
+    s
+}
+
+/// The one-line description written with the camera details: roll, film stock (and push), developer, frame note.
+pub fn export_description(p: &Params, o: &ExportOpts, src: &Path) -> String {
+    match roll::for_photo(src) {
+        Some((mut r, f)) => {
+            if !o.roll.trim().is_empty() {
+                r.roll = o.roll.trim().to_string();
+            }
+            if p.neg.enabled {
+                r.stock = p.neg.stock.clone();
+            }
+            [r.summary(), f.note.trim().to_string()].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ")
+        }
+        None => [(!o.roll.trim().is_empty()).then(|| format!("Roll {}", o.roll.trim())), output::stock_name(p)].into_iter().flatten().collect::<Vec<_>>().join(" · "),
+    }
+}
+
+/// What the export of `src` carries besides pixels: camera details when `o.meta` asks for them, print DPI.
+pub fn export_embed(p: &Params, o: &ExportOpts, src: &Path) -> output::Embed {
+    let mut e = output::Embed { dpi: (o.print[0] > 0.0 && o.canvas[0] == 0).then(|| o.print[2].round() as u16), icc: o.space.icc(), ..Default::default() };
+    if o.meta {
+        let shot = export_shot(src);
+        let desc = export_description(p, o, src);
+        e.exif = output::exif_tiff(&shot, &desc);
+        e.xmp = output::xmp_packet(&shot, &desc, &p.keywords);
+    }
+    e
+}
+
 /// Export one rendered photo to `out`, as an HDR gain-map JPEG when asked. `src` is the original file (for the
 /// camera and lens details written with `o.meta`).
 pub fn write_export(full: &Rgb32FImage, p: &Params, o: &ExportOpts, out: &Path, src: &Path) -> Result<(), String> {
-    // Camera details and print DPI go in every JPEG that asks for them, HDR or not.
-    let dpi = (o.print[0] > 0.0 && o.canvas[0] == 0).then(|| o.print[2].round() as u16);
-    let exif = if o.meta {
-        let shot = lens::shot(src).unwrap_or_default();
-        let desc = [(!o.roll.trim().is_empty()).then(|| format!("Roll {}", o.roll.trim())), output::stock_name(p)].into_iter().flatten().collect::<Vec<_>>().join(" · ");
-        output::exif_segment(&shot, &desc)
-    } else {
-        vec![]
-    };
+    let e = export_embed(p, o, src);
     if o.hdr && o.ext == "jpg" {
+        // The gain map is defined on sRGB here: HDR exports stay sRGB.
+        let o = &ExportOpts { space: colour::Space::Srgb, ..o.clone() };
+        let e = output::Embed { icc: vec![], ..e };
         let sdr = render_export(full, p, o);
         jpeg_fits(&sdr)?;
         let low = render_export(full, &Params { exposure: p.exposure - hdr::HEADROOM, ..p.clone() }, o);
-        let bytes = hdr::encode_ultrahdr(&sdr, &hdr::gain_map(&sdr, &low), o.quality.clamp(1, 100), &exif, dpi)?;
+        let segs = output::jpeg_segments(&output::Embed { xmp: String::new(), ..e.clone() });
+        let bytes = hdr::encode_ultrahdr(&sdr, &hdr::gain_map(&sdr, &low), o.quality.clamp(1, 100), &segs, e.dpi)?;
         return std::fs::write(out, bytes).map_err(|e| e.to_string());
     }
-    if o.ext == "jpg" && (!exif.is_empty() || dpi.is_some()) {
-        let img = render_export(full, p, o);
-        jpeg_fits(&img)?;
-        let mut bytes = vec![];
-        let mut enc = JpegEncoder::new_with_quality(&mut bytes, o.quality.clamp(1, 100));
-        if let Some(d) = dpi {
-            enc.set_pixel_density(image::codecs::jpeg::PixelDensity::dpi(d));
-        }
-        DynamicImage::ImageRgb32F(img).to_rgb8().write_with_encoder(enc).map_err(|e| e.to_string())?;
-        if !exif.is_empty() {
-            bytes = output::insert_segment(&bytes, &exif);
-        }
-        return std::fs::write(out, bytes).map_err(|e| e.to_string());
-    }
-    save_output(render_export(full, p, o), out, o.quality)
+    save_output_with(render_export(full, p, o), out, o.quality, &e)
 }
 
 /// Save a rendered (sRGB-encoded) image. `.tif` → 16-bit TIFF, `.png` → 8-bit PNG, anything else → JPEG.
 /// Nothing but pixels is written, so exports never carry the camera's GPS location or other metadata.
 pub fn save_output(img: Rgb32FImage, out: &Path, quality: u8) -> Result<(), String> {
+    save_output_with(img, out, quality, &output::Embed::default())
+}
+
+/// `save_output`, plus what `e` holds (camera details, colour profile, DPI) in whichever format it is.
+pub fn save_output_with(img: Rgb32FImage, out: &Path, quality: u8, e: &output::Embed) -> Result<(), String> {
     let ext = out.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     let dynimg = DynamicImage::ImageRgb32F(img);
     match ext.as_str() {
-        "tif" | "tiff" => dynimg.to_rgb16().save(out).map_err(|e| e.to_string()),
-        "png" => dynimg.to_rgb8().save(out).map_err(|e| e.to_string()),
+        "tif" | "tiff" => output::write_tiff(&dynimg.to_rgb16(), out, e),
+        "png" => output::write_png(&dynimg.to_rgb8(), out, e),
         _ => {
             jpeg_fits(dynimg.as_rgb32f().unwrap())?;
-            let f = std::fs::File::create(out).map_err(|e| e.to_string())?;
-            dynimg.to_rgb8().write_with_encoder(JpegEncoder::new_with_quality(std::io::BufWriter::new(f), quality.clamp(1, 100))).map_err(|e| e.to_string())
+            let mut bytes = vec![];
+            let mut enc = JpegEncoder::new_with_quality(&mut bytes, quality.clamp(1, 100));
+            if let Some(d) = e.dpi {
+                enc.set_pixel_density(image::codecs::jpeg::PixelDensity::dpi(d));
+            }
+            dynimg.to_rgb8().write_with_encoder(enc).map_err(|e| e.to_string())?;
+            let segs = output::jpeg_segments(e);
+            if !segs.is_empty() {
+                bytes = output::insert_segment(&bytes, &segs);
+            }
+            std::fs::write(out, bytes).map_err(|e| e.to_string())
         }
     }
 }
@@ -400,9 +452,15 @@ pub fn export_file(path: &Path, out_dir: &Path, o: &ExportOpts, n: usize, overri
     if load::is_raw_photo(path) && wants_cam_curve(&p) {
         p.cam_curve = load::camera_curve(path, &raw);
     }
+    let raw = scan::prepare_ir(raw, path, &p);
     let img = denoise::prepare(raw, path, &p)?;
-    let shot = if !o.name.trim().is_empty() && o.name != "{name}" { lens::shot(path).unwrap_or_default() } else { Default::default() };
-    let out = claim_output(out_dir, &output::file_name(&o.name, path, n, &o.roll, &p, &shot), o.ext)?;
+    if let Some(m) = o.upright {
+        p = upright::apply(&img, &p, m);
+    }
+    let shot = if !o.name.trim().is_empty() && o.name != "{name}" { export_shot(path) } else { Default::default() };
+    // {roll}: the one given for this export, else the folder's roll notes.
+    let roll = if o.roll.trim().is_empty() { roll::for_photo(path).map(|r| r.0.roll).unwrap_or_default() } else { o.roll.clone() };
+    let out = claim_output(out_dir, &output::file_name(&o.name, path, n, &roll, &p, &shot), o.ext)?;
     write_export(&img, &p, o, &out, path).inspect_err(|_| {
         let _ = std::fs::remove_file(&out);
     })?;
@@ -477,7 +535,7 @@ pub fn make_pano(files: &[PathBuf], proj: pano::Projection, progress: &dyn Fn(&s
 
 const USAGE: &str = "ferrotype                      open the editor
 ferrotype <folder|file>         open the editor on a folder or photo
-ferrotype export [--out DIR] [--tif|--png|--hdr] [--size PX] [--quality Q] [--neg STOCK] [--lens] FILES...
+ferrotype export [--out DIR] [--tif|--png|--hdr] [--size PX] [--quality Q] [--neg STOCK] [--lens] [--upright MODE] [--space SPACE] FILES...
                 [--set instagram|story|portfolio] [--print 8x10|20x30cm] [--dpi N] [--watermark TEXT] [--logo PNG]
                 [--name PATTERN] [--roll N] [--meta]
                                 render files with their saved edits (headless); --lens adds the lens profile;
@@ -511,6 +569,14 @@ fn cli_export(args: &[String]) -> Result<(), String> {
             "--quality" => o.quality = it.next().and_then(|v| v.parse().ok()).ok_or("--quality needs 1-100")?,
             "--neg" => neg = Some(it.next().ok_or("--neg needs a stock id")?.clone()),
             "--lens" => lens_auto = true,
+            "--space" => {
+                let v = it.next().ok_or("--space needs srgb, p3, adobe or prophoto")?;
+                o.space = colour::Space::parse(v).ok_or("--space is srgb, p3, adobe or prophoto")?;
+            }
+            "--upright" => {
+                let v = it.next().ok_or("--upright needs auto, level, vertical or full")?;
+                o.upright = Some(upright::Mode::parse(v).ok_or("--upright is auto, level, vertical or full")?);
+            }
             "--name" => o.name = it.next().ok_or("--name needs a pattern like \"{roll}-{n}\"")?.clone(),
             "--roll" => o.roll = it.next().ok_or("--roll needs a roll number")?.clone(),
             "--meta" => o.meta = true,

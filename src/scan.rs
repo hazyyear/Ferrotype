@@ -2,6 +2,8 @@
 //! All work on the uncropped frame (after quarter turns and straightening) and answer in frame fractions.
 use crate::develop::{self, Params, Spot, luma};
 use image::Rgb32FImage;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// The photo's frame without its crop: what crops and spots are measured against.
 pub fn frame(src: &Rgb32FImage, p: &Params) -> Rgb32FImage {
@@ -150,6 +152,245 @@ pub fn find_dust(frame: &Rgb32FImage, crop: [f32; 4], max: usize) -> Vec<Spot> {
     }).collect()
 }
 
+// ---------- infrared dust and scratch removal ----------
+
+/// The infrared channel of a scan: film dyes let infrared through, dust, hair and scratches don't, so it shows
+/// the defects alone. Values 0..1, `w`×`h`, in the scan's own orientation.
+pub struct Ir {
+    pub w: u32,
+    pub h: u32,
+    pub data: Vec<f32>,
+}
+
+/// The infrared channel of an RGBI TIFF (VueScan, SilverFast: four samples per pixel, 8 or 16 bits), if the scan
+/// has one. Cached per file (and its modification time), so moving the slider doesn't decode the scan again.
+pub fn ir_channel(path: &Path) -> Option<Arc<Ir>> {
+    let real = crate::load::copy_of(path).unwrap_or_else(|| path.to_path_buf());
+    let ext = real.extension()?.to_str()?.to_ascii_lowercase();
+    if ext != "tif" && ext != "tiff" {
+        return None;
+    }
+    let mtime = std::fs::metadata(&real).and_then(|m| m.modified()).ok();
+    type Cache = Mutex<Option<(PathBuf, Option<std::time::SystemTime>, Option<Arc<Ir>>)>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some((p, t, ir)) = &*cache.lock().ok()?
+        && *p == real
+        && *t == mtime
+    {
+        return ir.clone();
+    }
+    let ir = read_ir(&real).map(Arc::new);
+    if let Ok(mut c) = cache.lock() {
+        *c = Some((real, mtime, ir.clone()));
+    }
+    ir
+}
+
+fn read_ir(path: &Path) -> Option<Ir> {
+    use tiff::decoder::{Decoder, DecodingResult};
+    let f = std::fs::File::open(path).ok()?;
+    let mut dec = Decoder::new(std::io::BufReader::new(f)).ok()?;
+    let (w, h) = dec.dimensions().ok()?;
+    let samples = match dec.colortype().ok()? {
+        tiff::ColorType::RGBA(_) => 4,
+        tiff::ColorType::Multiband { num_samples, .. } if num_samples >= 4 => num_samples as usize,
+        _ => return None,
+    };
+    let data: Vec<f32> = match dec.read_image().ok()? {
+        DecodingResult::U8(v) => v.chunks_exact(samples).map(|c| c[3] as f32 / 255.0).collect(),
+        DecodingResult::U16(v) => v.chunks_exact(samples).map(|c| c[3] as f32 / 65535.0).collect(),
+        DecodingResult::F32(v) => v.chunks_exact(samples).map(|c| c[3]).collect(),
+        _ => return None,
+    };
+    if data.len() != (w * h) as usize {
+        return None;
+    }
+    // A real alpha channel (a PNG-style cut-out saved as TIFF) is mostly fully opaque: not infrared.
+    let opaque = data.iter().step_by(97).filter(|&&v| v >= 0.999).count() as f32 / (data.len() / 97).max(1) as f32;
+    if opaque > 0.9 {
+        return None;
+    }
+    Some(Ir { w, h, data })
+}
+
+/// How sure we are that each pixel is a defect, 0..1, from the infrared channel. `strength` 0..100 sets how
+/// faint a defect still counts. The cyan dye leaks a little into infrared on some scanners, so the part of the
+/// infrared that follows the red channel is taken out first.
+pub fn ir_defects(ir: &Ir, red: Option<&[f32]>, strength: f32) -> Vec<f32> {
+    let (w, h) = (ir.w as usize, ir.h as usize);
+    let mut v = ir.data.clone();
+    if let Some(red) = red.filter(|r| r.len() == v.len()) {
+        // Least-squares slope of infrared on red over the clear film, removed around the mean.
+        let n = v.len() as f64;
+        let (mr, mi) = (red.iter().map(|&x| x as f64).sum::<f64>() / n, v.iter().map(|&x| x as f64).sum::<f64>() / n);
+        let (mut sxy, mut sxx) = (0f64, 0f64);
+        for (r, i) in red.iter().zip(&v).step_by(7) {
+            sxy += (*r as f64 - mr) * (*i as f64 - mi);
+            sxx += (*r as f64 - mr).powi(2);
+        }
+        let k = if sxx > 0.0 { (sxy / sxx).clamp(0.0, 1.0) as f32 } else { 0.0 };
+        for (i, r) in v.iter_mut().zip(red) {
+            *i -= k * (r - mr as f32);
+        }
+    }
+    // Clear film around a defect: a wide blur of the infrared, with the defect itself mostly left out by
+    // taking the brighter of the local level and a level a little wider.
+    let near = develop::blur(&v, w, h, 6.0);
+    let far = develop::blur(&v, w, h, 18.0);
+    let t = 0.35 + (0.05 - 0.35) * (strength / 100.0).clamp(0.0, 1.0); // how deep a dip counts as a defect
+    let raw: Vec<f32> = v.iter().zip(near.iter().zip(&far)).map(|(&x, (&a, &b))| {
+        let r = a.max(b).max(1e-4);
+        let dip = 1.0 - x / r;
+        develop::smooth(t * 0.5, t, dip)
+    }).collect();
+    // Grow by two pixels: the soft edge of a speck is darker in the picture before it shows in infrared.
+    let mut grown = raw.clone();
+    for y in 0..h {
+        for x in 0..w {
+            let mut m = raw[y * w + x];
+            if m >= 1.0 {
+                continue;
+            }
+            for dy in -2i32..=2 {
+                for dx in -2i32..=2 {
+                    let (xx, yy) = (x as i32 + dx, y as i32 + dy);
+                    if xx >= 0 && yy >= 0 && (xx as usize) < w && (yy as usize) < h && dx * dx + dy * dy <= 5 {
+                        m = m.max(raw[yy as usize * w + xx as usize] * (1.0 - 0.15 * (dx * dx + dy * dy) as f32 / 5.0));
+                    }
+                }
+            }
+            grown[y * w + x] = m;
+        }
+    }
+    grown
+}
+
+/// Fill the defects in `img` from the clean film around them: normalised blurs of the clean pixels at growing
+/// sizes, each pixel taking the finest one that has enough clean film nearby.
+pub fn ir_clean(img: &Rgb32FImage, ir: &Ir, strength: f32) -> Rgb32FImage {
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    // A resized source: sample the infrared at this size.
+    let resized;
+    let ir = if (ir.w as usize, ir.h as usize) == (w, h) {
+        ir
+    } else {
+        resized = Ir { w: w as u32, h: h as u32, data: (0..w * h).map(|i| {
+            let (x, y) = ((i % w) as f32 * ir.w as f32 / w as f32, (i / w) as f32 * ir.h as f32 / h as f32);
+            ir.data[(y as usize).min(ir.h as usize - 1) * ir.w as usize + (x as usize).min(ir.w as usize - 1)]
+        }).collect() };
+        &resized
+    };
+    let red: Vec<f32> = img.chunks(3).map(|c| c[0]).collect();
+    fill(img, &ir_defects(ir, Some(&red), strength))
+}
+
+/// Replace `img` where `mask` is 1 (blending where it's in between) with colour from the unmasked surroundings.
+///
+/// Fills from the edge of each defect inward, one ring at a time, from the nearest clean pixels only, so a
+/// window or line a few pixels away doesn't bleed in. Averages are taken in log space: on a negative, a plain
+/// average leans towards the brighter (thinner) film and the repair would print darker than its surroundings.
+pub fn fill(img: &Rgb32FImage, mask: &[f32]) -> Rgb32FImage {
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    if mask.iter().all(|&m| m <= 0.0) {
+        return img.clone();
+    }
+    let mut val: Vec<[f32; 3]> = img.chunks(3).map(|p| [p[0], p[1], p[2]].map(|v| v.max(1e-5).ln())).collect();
+    let mut known: Vec<bool> = mask.iter().map(|&m| m < 0.5).collect();
+    let mut todo: Vec<usize> = (0..w * h).filter(|&i| !known[i]).collect();
+    const NB: [(i32, i32, f32); 8] = [(-1, 0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0), (-1, -1, 0.7), (1, -1, 0.7), (-1, 1, 0.7), (1, 1, 0.7)];
+    let mut need = 2.0f32; // known neighbour weight a pixel needs to be filled this round
+    while !todo.is_empty() {
+        let ring: Vec<(usize, [f32; 3])> = todo.iter().filter_map(|&i| {
+            let (x, y) = ((i % w) as i32, (i / w) as i32);
+            let (mut acc, mut ws) = ([0f32; 3], 0f32);
+            for (dx, dy, wt) in NB {
+                let (xx, yy) = (x + dx, y + dy);
+                if xx >= 0 && yy >= 0 && (xx as usize) < w && (yy as usize) < h {
+                    let j = yy as usize * w + xx as usize;
+                    if known[j] {
+                        for c in 0..3 {
+                            acc[c] += val[j][c] * wt;
+                        }
+                        ws += wt;
+                    }
+                }
+            }
+            (ws >= need).then(|| (i, acc.map(|a| a / ws)))
+        }).collect();
+        if ring.is_empty() {
+            if need <= 0.7 {
+                break; // nothing clean anywhere near (all masked): leave as is
+            }
+            need = 0.7; // corners and thin tips: one neighbour will do
+            continue;
+        }
+        need = 2.0;
+        for &(i, v) in &ring {
+            val[i] = v;
+            known[i] = true;
+        }
+        todo.retain(|&i| !known[i]);
+    }
+    // A light smoothing of the filled pixels hides the ring-by-ring pattern.
+    let filled: Vec<bool> = mask.iter().map(|&m| m >= 0.5).collect();
+    let mut smooth = val.clone();
+    for _ in 0..2 {
+        for i in (0..w * h).filter(|&i| filled[i]) {
+            let (x, y) = ((i % w) as i32, (i / w) as i32);
+            let (mut acc, mut ws) = (val[i].map(|v| v * 2.0), 2.0f32);
+            for (dx, dy, wt) in NB {
+                let (xx, yy) = (x + dx, y + dy);
+                if xx >= 0 && yy >= 0 && (xx as usize) < w && (yy as usize) < h {
+                    let j = yy as usize * w + xx as usize;
+                    for c in 0..3 {
+                        acc[c] += val[j][c] * wt;
+                    }
+                    ws += wt;
+                }
+            }
+            smooth[i] = acc.map(|a| a / ws);
+        }
+        val.clone_from(&smooth);
+    }
+    let mut out = img.clone();
+    let p = img.as_raw();
+    for (i, &m) in mask.iter().enumerate() {
+        if m <= 0.0 {
+            continue;
+        }
+        // Pixels at the defect's soft edge (mask below ½) take their fill from the nearest filled colour.
+        let f = if filled[i] { val[i] } else {
+            let (x, y) = ((i % w) as i32, (i / w) as i32);
+            let mut best = val[i];
+            for (dx, dy, _) in NB {
+                let (xx, yy) = (x + dx, y + dy);
+                if xx >= 0 && yy >= 0 && (xx as usize) < w && (yy as usize) < h && filled[yy as usize * w + xx as usize] {
+                    best = val[yy as usize * w + xx as usize];
+                    break;
+                }
+            }
+            best
+        };
+        let o = &mut out.as_mut()[i * 3..i * 3 + 3];
+        for c in 0..3 {
+            o[c] = p[i * 3 + c] * (1.0 - m) + f[c].exp() * m;
+        }
+    }
+    out
+}
+
+/// The source for rendering `path` with `p`: infrared cleaning applied when asked for and the scan has infrared.
+pub fn prepare_ir(img: Rgb32FImage, path: &Path, p: &Params) -> Rgb32FImage {
+    if p.ir_clean <= 0.0 {
+        return img;
+    }
+    match ir_channel(path) {
+        Some(ir) => ir_clean(&img, &ir, p.ir_clean),
+        None => img,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,6 +433,49 @@ mod tests {
     }
 
     #[test]
+    fn infrared_finds_and_fills_dust() {
+        // A smooth gradient picture with two dark specks; the infrared is clear film with the same specks.
+        let (w, h) = (160u32, 120u32);
+        let speck = |x: u32, y: u32| [(40u32, 40u32), (110, 80)].iter().any(|&(cx, cy)| (x as i32 - cx as i32).pow(2) + (y as i32 - cy as i32).pow(2) <= 9);
+        let img = Rgb32FImage::from_fn(w, h, |x, y| {
+            let v = 0.3 + 0.3 * x as f32 / w as f32;
+            if speck(x, y) { image::Rgb([0.02, 0.02, 0.02]) } else { image::Rgb([v, v * 0.9, v * 0.8]) }
+        });
+        let ir = Ir { w, h, data: (0..w * h).map(|i| if speck(i % w, i / w) { 0.1 } else { 0.85 + 0.02 * ((i % 13) as f32 / 13.0) }).collect() };
+        let mask = ir_defects(&ir, None, 50.0);
+        assert!(mask[(40 * w + 40) as usize] > 0.9 && mask[(80 * w + 110) as usize] > 0.9);
+        let n = mask.iter().filter(|&&m| m > 0.5).count();
+        assert!(n < 250 && mask[(20 * w + 80) as usize] == 0.0, "only the specks: {n}");
+        let out = ir_clean(&img, &ir, 50.0);
+        let want = 0.3 + 0.3 * 40.0 / w as f32;
+        assert!((out.get_pixel(40, 40).0[0] - want).abs() < 0.03, "{:?}", out.get_pixel(40, 40));
+        assert_eq!(out.get_pixel(10, 10), img.get_pixel(10, 10), "clean film untouched");
+        // Off: nothing changes.
+        assert_eq!(prepare_ir(img.clone(), Path::new("/nope.tif"), &Params::default()), img);
+    }
+
+    #[test]
+    fn rgbi_tiff_gives_its_infrared() {
+        let dir = std::env::temp_dir().join(format!("ferro-ir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("scan.tif");
+        let (w, h) = (16u32, 8u32);
+        let px: Vec<u16> = (0..w * h).flat_map(|i| [30000u16, 20000, 10000, if i == 5 { 5000 } else { 60000 }]).collect();
+        {
+            let f = std::fs::File::create(&path).unwrap();
+            let mut enc = tiff::encoder::TiffEncoder::new(f).unwrap();
+            enc.write_image::<tiff::encoder::colortype::RGBA16>(w, h, &px).unwrap();
+        }
+        let ir = ir_channel(&path).unwrap();
+        assert_eq!((ir.w, ir.h), (w, h));
+        assert!((ir.data[5] - 5000.0 / 65535.0).abs() < 1e-4 && ir.data[6] > 0.9);
+        // A plain RGB scan has none.
+        image::RgbImage::new(4, 4).save(dir.join("plain.tif")).unwrap();
+        assert!(ir_channel(&dir.join("plain.tif")).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn dust_specks_are_found_but_not_texture() {
         let mut img = Rgb32FImage::from_fn(300, 200, |x, _| {
             let v = 0.4 + 0.1 * (x as f32 / 30.0).sin();
@@ -209,3 +493,4 @@ mod tests {
         assert!(d.iter().any(|s| (s.x * 300.0 - 50.0).abs() < 1.5 && (s.y * 200.0 - 50.0).abs() < 1.5));
     }
 }
+

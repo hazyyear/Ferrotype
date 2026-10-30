@@ -1,5 +1,5 @@
 //! Finishing an export: exact canvas sizes (print, social), watermark, file names from a pattern,
-//! and the small set of camera and film details written into JPEGs when asked.
+//! and the small set of camera and film details written into exports when asked.
 use crate::develop::Params;
 use crate::lens::Shot;
 use image::Rgb32FImage;
@@ -194,61 +194,260 @@ fn file_date(path: &Path) -> String {
         }).unwrap_or_default()
 }
 
-/// An EXIF APP1 segment with camera, lens and a description (roll and film stock). Nothing else: no GPS,
-/// no serial numbers, no capture settings.
-pub fn exif_segment(shot: &Shot, description: &str) -> Vec<u8> {
-    // IFD0: ImageDescription, Make, Model, Software, ExifIFD pointer; Exif IFD: LensModel.
-    let mut ifd0: Vec<(u16, String)> = vec![];
+/// What an export carries besides pixels. Camera details only when asked for (`ExportOpts::meta`); never GPS
+/// or serial numbers. The colour profile always, when the export isn't plain sRGB.
+#[derive(Clone, Default)]
+pub struct Embed {
+    /// A TIFF-structured EXIF block (see `exif_tiff`), empty = none.
+    pub exif: Vec<u8>,
+    /// An XMP packet (see `xmp_packet`), empty = none.
+    pub xmp: String,
+    /// An ICC profile, empty = sRGB, untagged.
+    pub icc: Vec<u8>,
+    pub dpi: Option<u16>,
+}
+
+enum Val {
+    Ascii(String),
+    Short(u16),
+    Long(u32),
+    Rational(u32, u32),
+}
+
+/// n/d with small integers, as cameras write them: 1/125 s, 28/10 for f/2.8.
+fn rational(v: f32) -> (u32, u32) {
+    if v <= 0.0 {
+        return (0, 1);
+    }
+    if v < 1.0 {
+        let inv = 1.0 / v;
+        if (inv - inv.round()).abs() < 0.02 * inv {
+            return (1, inv.round() as u32);
+        }
+    }
+    ((v * 1000.0).round() as u32, 1000)
+}
+
+/// The camera details as a TIFF-structured EXIF block (little-endian): description, make, model and software in
+/// IFD0; exposure time, f-number, ISO, date taken, focal length and lens in the Exif IFD. For a JPEG APP1 segment
+/// (after "Exif\0\0") or a PNG eXIf chunk.
+pub fn exif_tiff(shot: &Shot, description: &str) -> Vec<u8> {
+    let mut ifd0: Vec<(u16, Val)> = vec![];
     for (tag, v) in [(0x010Eu16, description), (0x010F, shot.make.as_str()), (0x0110, shot.model.as_str()), (0x0131, "Ferrotype")] {
         if !v.trim().is_empty() {
-            ifd0.push((tag, v.trim().to_string()));
+            ifd0.push((tag, Val::Ascii(v.trim().to_string())));
         }
     }
-    let lens = shot.lens.trim().to_string();
-    let n0 = ifd0.len() + usize::from(!lens.is_empty());
-    let ifd0_size = 2 + 12 * n0 + 4;
-    let exif_at = 8 + ifd0_size;
-    let exif_size = if lens.is_empty() { 0 } else { 2 + 12 + 4 };
-    let mut data_at = exif_at + exif_size;
-    let (mut head, mut data) = (vec![], vec![]);
-    let entry = |out: &mut Vec<u8>, tag: u16, typ: u16, count: u32, value: [u8; 4]| {
-        out.extend_from_slice(&tag.to_le_bytes());
-        out.extend_from_slice(&typ.to_le_bytes());
-        out.extend_from_slice(&count.to_le_bytes());
-        out.extend_from_slice(&value);
-    };
-    let text = |out: &mut Vec<u8>, data: &mut Vec<u8>, data_at: &mut usize, tag: u16, v: &str| {
-        let mut b = v.as_bytes().to_vec();
-        b.push(0);
-        if b.len() <= 4 {
-            let mut val = [0u8; 4];
-            val[..b.len()].copy_from_slice(&b);
-            entry(out, tag, 2, b.len() as u32, val);
-        } else {
-            entry(out, tag, 2, b.len() as u32, (*data_at as u32).to_le_bytes());
-            *data_at += b.len();
-            data.extend_from_slice(&b);
-        }
-    };
-    head.extend_from_slice(b"II*\0");
+    let mut exif: Vec<(u16, Val)> = vec![];
+    if shot.shutter > 0.0 {
+        let (n, d) = rational(shot.shutter);
+        exif.push((0x829A, Val::Rational(n, d)));
+    }
+    if shot.fnum > 0.0 {
+        exif.push((0x829D, Val::Rational((shot.fnum * 10.0).round() as u32, 10)));
+    }
+    if shot.iso > 0.0 {
+        exif.push((0x8827, Val::Short(shot.iso.round().min(65535.0) as u16)));
+    }
+    if shot.taken.trim().len() >= 10 {
+        exif.push((0x9003, Val::Ascii(shot.taken.trim().to_string())));
+    }
+    if shot.focal > 0.0 {
+        exif.push((0x920A, Val::Rational((shot.focal * 10.0).round() as u32, 10)));
+    }
+    if !shot.lens.trim().is_empty() {
+        exif.push((0xA434, Val::Ascii(shot.lens.trim().to_string())));
+    }
+    let has_exif = !exif.is_empty();
+    if has_exif {
+        ifd0.push((0x8769, Val::Long(0))); // offset filled in below
+    }
+    let ifd_size = |n: usize| 2 + 12 * n + 4;
+    let exif_at = 8 + ifd_size(ifd0.len());
+    let mut data_at = exif_at + if has_exif { ifd_size(exif.len()) } else { 0 };
+    let (mut head, mut data) = (b"II*\0".to_vec(), vec![]);
     head.extend_from_slice(&8u32.to_le_bytes());
-    head.extend_from_slice(&(n0 as u16).to_le_bytes());
-    for (tag, v) in &ifd0 {
-        text(&mut head, &mut data, &mut data_at, *tag, v);
-    }
-    if !lens.is_empty() {
-        entry(&mut head, 0x8769, 4, 1, (exif_at as u32).to_le_bytes());
-    }
-    head.extend_from_slice(&0u32.to_le_bytes());
-    if !lens.is_empty() {
-        head.extend_from_slice(&1u16.to_le_bytes());
-        text(&mut head, &mut data, &mut data_at, 0xA434, &lens);
+    let mut write_ifd = |head: &mut Vec<u8>, entries: &[(u16, Val)]| {
+        head.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for (tag, v) in entries {
+            head.extend_from_slice(&tag.to_le_bytes());
+            let (typ, count, bytes): (u16, u32, Vec<u8>) = match v {
+                Val::Ascii(t) => {
+                    let mut b = t.as_bytes().to_vec();
+                    b.push(0);
+                    (2, b.len() as u32, b)
+                }
+                Val::Short(x) => (3, 1, x.to_le_bytes().to_vec()),
+                Val::Long(x) => (4, 1, if *tag == 0x8769 { (exif_at as u32).to_le_bytes().to_vec() } else { x.to_le_bytes().to_vec() }),
+                Val::Rational(n, d) => (5, 1, [n.to_le_bytes(), d.to_le_bytes()].concat()),
+            };
+            head.extend_from_slice(&typ.to_le_bytes());
+            head.extend_from_slice(&count.to_le_bytes());
+            if bytes.len() <= 4 {
+                let mut val = [0u8; 4];
+                val[..bytes.len()].copy_from_slice(&bytes);
+                head.extend_from_slice(&val);
+            } else {
+                head.extend_from_slice(&(data_at as u32).to_le_bytes());
+                data_at += bytes.len() + bytes.len() % 2;
+                data.extend_from_slice(&bytes);
+                if bytes.len() % 2 == 1 {
+                    data.push(0); // offsets stay even, as TIFF asks
+                }
+            }
+        }
         head.extend_from_slice(&0u32.to_le_bytes());
+    };
+    // Tags in ascending order within each IFD.
+    ifd0.sort_by_key(|e| e.0);
+    write_ifd(&mut head, &ifd0);
+    if has_exif {
+        write_ifd(&mut head, &exif);
     }
+    head.extend(data);
+    head
+}
+
+/// An EXIF APP1 segment for a JPEG: see `exif_tiff`.
+#[cfg(test)]
+pub fn exif_segment(shot: &Shot, description: &str) -> Vec<u8> {
     let mut body = b"Exif\0\0".to_vec();
-    body.extend(head);
-    body.extend(data);
+    body.extend(exif_tiff(shot, description));
     segment(0xE1, &body)
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+/// The same details as an XMP packet, plus keywords: what TIFF and PNG exports carry (and what Lightroom, Bridge
+/// and exiftool read from them).
+pub fn xmp_packet(shot: &Shot, description: &str, keywords: &[String]) -> String {
+    let mut attrs = vec![("xmp:CreatorTool", "Ferrotype".to_string())];
+    let mut add = |k: &'static str, v: String| {
+        if !v.trim().is_empty() {
+            attrs.push((k, v));
+        }
+    };
+    add("tiff:Make", shot.make.trim().to_string());
+    add("tiff:Model", shot.model.trim().to_string());
+    add("exifEX:LensModel", shot.lens.trim().to_string());
+    add("aux:Lens", shot.lens.trim().to_string());
+    let rat = |v: f32| { let (n, d) = rational(v); format!("{n}/{d}") };
+    if shot.shutter > 0.0 {
+        add("exif:ExposureTime", rat(shot.shutter));
+    }
+    if shot.fnum > 0.0 {
+        add("exif:FNumber", format!("{}/10", (shot.fnum * 10.0).round()));
+    }
+    if shot.focal > 0.0 {
+        add("exif:FocalLength", format!("{}/10", (shot.focal * 10.0).round()));
+    }
+    // "2026:05:04 12:00:00" → "2026-05-04T12:00:00"
+    let t = shot.taken.trim();
+    if t.len() >= 19 {
+        add("exif:DateTimeOriginal", format!("{}T{}", t[..10].replace(':', "-"), &t[11..19]));
+    }
+    let mut x = String::from("<?xpacket begin=\"\u{feff}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n");
+    x += "<rdf:Description rdf:about=\"\" xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:tiff=\"http://ns.adobe.com/tiff/1.0/\" xmlns:exif=\"http://ns.adobe.com/exif/1.0/\" xmlns:exifEX=\"http://cipa.jp/exif/1.0/\" xmlns:aux=\"http://ns.adobe.com/exif/1.0/aux/\"";
+    for (k, v) in &attrs {
+        x += &format!("\n  {k}=\"{}\"", xml_escape(v));
+    }
+    x += ">\n";
+    if shot.iso > 0.0 {
+        x += &format!("<exif:ISOSpeedRatings><rdf:Seq><rdf:li>{}</rdf:li></rdf:Seq></exif:ISOSpeedRatings>\n", shot.iso.round());
+    }
+    if !description.trim().is_empty() {
+        x += &format!("<dc:description><rdf:Alt><rdf:li xml:lang=\"x-default\">{}</rdf:li></rdf:Alt></dc:description>\n", xml_escape(description.trim()));
+    }
+    let kws: Vec<&String> = keywords.iter().filter(|k| !k.trim().is_empty()).collect();
+    if !kws.is_empty() {
+        x += "<dc:subject><rdf:Bag>";
+        for k in kws {
+            x += &format!("<rdf:li>{}</rdf:li>", xml_escape(k.trim()));
+        }
+        x += "</rdf:Bag></dc:subject>\n";
+    }
+    x += "</rdf:Description>\n</rdf:RDF>\n</x:xmpmeta>\n<?xpacket end=\"w\"?>";
+    x
+}
+
+/// JPEG APP segments for everything in `e` except the DPI (the encoder writes that): EXIF, XMP and the ICC
+/// profile (split over several APP2 segments when it is larger than one can hold).
+pub fn jpeg_segments(e: &Embed) -> Vec<u8> {
+    let mut out = vec![];
+    if !e.exif.is_empty() {
+        let mut body = b"Exif\0\0".to_vec();
+        body.extend_from_slice(&e.exif);
+        out.extend(segment(0xE1, &body));
+    }
+    if !e.xmp.is_empty() && e.xmp.len() < 65_000 {
+        let mut body = b"http://ns.adobe.com/xap/1.0/\0".to_vec();
+        body.extend_from_slice(e.xmp.as_bytes());
+        out.extend(segment(0xE1, &body));
+    }
+    if !e.icc.is_empty() {
+        let chunks: Vec<&[u8]> = e.icc.chunks(65_519).collect();
+        for (i, c) in chunks.iter().enumerate() {
+            let mut body = b"ICC_PROFILE\0".to_vec();
+            body.push(i as u8 + 1);
+            body.push(chunks.len() as u8);
+            body.extend_from_slice(c);
+            out.extend(segment(0xE2, &body));
+        }
+    }
+    out
+}
+
+/// A 16-bit TIFF with the XMP packet (camera details and keywords) and ICC profile from `e`.
+pub fn write_tiff(img: &image::ImageBuffer<image::Rgb<u16>, Vec<u16>>, path: &Path, e: &Embed) -> Result<(), String> {
+    use tiff::encoder::{Rational, TiffEncoder, colortype::RGB16};
+    use tiff::tags::{ResolutionUnit, Tag};
+    let f = std::fs::File::create(path).map_err(|e| e.to_string())?;
+    let mut enc = TiffEncoder::new(std::io::BufWriter::new(f)).map_err(|e| e.to_string())?;
+    let mut im = enc.new_image::<RGB16>(img.width(), img.height()).map_err(|e| e.to_string())?;
+    let err = |e: tiff::TiffError| e.to_string();
+    {
+        let d = im.encoder();
+        d.write_tag(Tag::Software, "Ferrotype").map_err(err)?;
+        if !e.xmp.is_empty() {
+            d.write_tag(Tag::Unknown(700), e.xmp.as_bytes()).map_err(err)?;
+        }
+        if !e.icc.is_empty() {
+            d.write_tag(Tag::Unknown(34675), &e.icc[..]).map_err(err)?;
+        }
+    }
+    if let Some(dpi) = e.dpi {
+        im.resolution(ResolutionUnit::Inch, Rational { n: dpi as u32, d: 1 });
+    }
+    im.write_data(img.as_raw()).map_err(err)
+}
+
+/// An 8-bit PNG with an eXIf chunk, the XMP packet (iTXt) and the ICC profile from `e` (an sRGB chunk when none).
+pub fn write_png(img: &image::RgbImage, path: &Path, e: &Embed) -> Result<(), String> {
+    let f = std::fs::File::create(path).map_err(|e| e.to_string())?;
+    let mut info = png::Info::with_size(img.width(), img.height());
+    info.color_type = png::ColorType::Rgb;
+    info.bit_depth = png::BitDepth::Eight;
+    if e.icc.is_empty() {
+        info.srgb = Some(png::SrgbRenderingIntent::Perceptual);
+    } else {
+        info.icc_profile = Some(std::borrow::Cow::Owned(e.icc.clone()));
+    }
+    if !e.exif.is_empty() {
+        info.exif_metadata = Some(std::borrow::Cow::Owned(e.exif.clone()));
+    }
+    if let Some(dpi) = e.dpi {
+        let ppm = (dpi as f32 / 0.0254).round() as u32;
+        info.pixel_dims = Some(png::PixelDimensions { xppu: ppm, yppu: ppm, unit: png::Unit::Meter });
+    }
+    let mut enc = png::Encoder::with_info(std::io::BufWriter::new(f), info).map_err(|e| e.to_string())?;
+    if !e.xmp.is_empty() {
+        enc.add_itxt_chunk("XML:com.adobe.xmp".into(), e.xmp.clone()).map_err(|e| e.to_string())?;
+    }
+    let mut w = enc.write_header().map_err(|e| e.to_string())?;
+    w.write_image_data(img.as_raw()).map_err(|e| e.to_string())?;
+    w.finish().map_err(|e| e.to_string())
 }
 
 /// A JPEG marker segment: FF, marker, big-endian length (which counts itself), body.
@@ -294,6 +493,38 @@ mod tests {
         let back = crate::lens::parse_exif(&seg[10..]).unwrap();
         assert_eq!((back.make.as_str(), back.model.as_str(), back.lens.as_str()), ("Sony", "ILCE-7M3", "FE 35mm F1.8"));
         assert!(String::from_utf8_lossy(&seg).contains("Kodak Gold 200"));
+    }
+
+    #[test]
+    fn exif_carries_capture_settings() {
+        let shot = Shot { make: String::new(), model: "Nikon FM2".into(), lens: "50mm f/1.8".into(), fnum: 2.8, shutter: 1.0 / 125.0, iso: 1600.0, focal: 50.0, taken: "2026:05:04 12:00:00".into(), ..Default::default() };
+        let back = crate::lens::parse_exif(&exif_tiff(&shot, "Roll 12 · Kodak Tri-X 400 at 1600 (+2 push)")).unwrap();
+        assert_eq!((back.model.as_str(), back.lens.as_str(), back.taken.as_str()), ("Nikon FM2", "50mm f/1.8", "2026:05:04 12:00:00"));
+        assert_eq!((back.fnum, back.iso, back.focal), (2.8, 1600.0, 50.0));
+        assert!((back.shutter - 0.008).abs() < 1e-6);
+        let x = xmp_packet(&shot, "Roll <12>", &["street".into(), "Lisbon".into()]);
+        assert!(x.contains("exif:FNumber=\"28/10\"") && x.contains("<rdf:li>1600</rdf:li>") && x.contains("Roll &lt;12&gt;"));
+        assert!(x.contains("<rdf:li>Lisbon</rdf:li>") && x.contains("2026-05-04T12:00:00"));
+    }
+
+    #[test]
+    fn tiff_and_png_keep_their_metadata() {
+        let dir = std::env::temp_dir().join(format!("ferro-meta-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let shot = Shot { model: "Leica M6".into(), iso: 400.0, ..Default::default() };
+        let e = Embed { exif: exif_tiff(&shot, "Roll 3"), xmp: xmp_packet(&shot, "Roll 3", &["film".into()]), icc: vec![], dpi: Some(300) };
+        let img = image::ImageBuffer::from_pixel(8, 6, image::Rgb([30000u16, 20000, 10000]));
+        write_tiff(&img, &dir.join("a.tif"), &e).unwrap();
+        let t = std::fs::read(dir.join("a.tif")).unwrap();
+        assert!(String::from_utf8_lossy(&t).contains("Leica M6"));
+        assert_eq!(image::open(dir.join("a.tif")).unwrap().to_rgb16().get_pixel(3, 3).0, [30000, 20000, 10000]);
+        let rgb8 = image::RgbImage::from_pixel(8, 6, image::Rgb([200, 100, 50]));
+        write_png(&rgb8, &dir.join("a.png"), &e).unwrap();
+        let p = std::fs::read(dir.join("a.png")).unwrap();
+        let s = String::from_utf8_lossy(&p);
+        assert!(s.contains("eXIf") && s.contains("XML:com.adobe.xmp") && s.contains("Leica M6"));
+        assert_eq!(image::open(dir.join("a.png")).unwrap().to_rgb8().get_pixel(1, 1).0, [200, 100, 50]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -98,6 +98,7 @@ pub fn parse(x: &str) -> (Option<String>, Params) {
     });
     let (r, l) = rating_label(x);
     apply_rating_label(&mut p, r, l);
+    p.keywords = keywords(x).unwrap_or_default();
     (name, p)
 }
 
@@ -139,6 +140,70 @@ pub fn apply_rating_label(p: &mut Params, r: Option<i32>, l: Option<u8>) {
     }
 }
 
+/// Keywords in `dc:subject` (a Bag of rdf:li), as Lightroom, Bridge and darktable write them. None = no subject.
+pub fn keywords(x: &str) -> Option<Vec<String>> {
+    let i = x.find("<dc:subject")?;
+    let rest = &x[i..];
+    let end = rest.find("</dc:subject>").unwrap_or(rest.len());
+    let body = &rest[..end];
+    let mut out = vec![];
+    let mut s = body;
+    while let Some(a) = s.find("<rdf:li") {
+        let after = &s[a..];
+        let Some(gt) = after.find('>') else { break };
+        let inner = &after[gt + 1..];
+        let Some(close) = inner.find("</rdf:li>") else { break };
+        let k = unescape(inner[..close].trim());
+        if !k.is_empty() && !out.contains(&k) {
+            out.push(k);
+        }
+        s = &inner[close..];
+    }
+    Some(out)
+}
+
+fn unescape(s: &str) -> String {
+    s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&")
+}
+
+fn escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+/// Replace (or add, or remove when empty) the dc:subject keywords on the first rdf:Description.
+fn set_keywords(x: &mut String, kws: &[String]) {
+    if let (Some(i), Some(j)) = (x.find("<dc:subject"), x.find("</dc:subject>")) {
+        let mut start = i;
+        // Take the line's leading whitespace with it.
+        while start > 0 && matches!(x.as_bytes()[start - 1], b' ' | b'\t') {
+            start -= 1;
+        }
+        let mut end = j + "</dc:subject>".len();
+        if x[end..].starts_with('\n') {
+            end += 1;
+        }
+        x.replace_range(start..end, "");
+    }
+    if kws.is_empty() {
+        return;
+    }
+    let Some(d) = x.find("<rdf:Description") else { return };
+    if !x.contains("xmlns:dc=") {
+        let at = d + "<rdf:Description".len();
+        x.insert_str(at, " xmlns:dc=\"http://purl.org/dc/elements/1.1/\"");
+    }
+    let d = x.find("<rdf:Description").unwrap_or(0);
+    let items: String = kws.iter().map(|k| format!("<rdf:li>{}</rdf:li>", escape(k))).collect();
+    let subject = format!("\n   <dc:subject><rdf:Bag>{items}</rdf:Bag></dc:subject>\n  ");
+    // Self-closing description: open it up to hold the element.
+    let tag_end = x[d..].find('>').map(|e| d + e).unwrap_or(x.len());
+    if x[..tag_end].ends_with('/') {
+        x.replace_range(tag_end - 1..tag_end + 1, &format!(">{subject}</rdf:Description>"));
+    } else if let Some(close) = x[d..].find("</rdf:Description>").map(|c| d + c) {
+        x.insert_str(close, &subject);
+    }
+}
+
 /// Set (or add) one attribute on the first rdf:Description, declaring the xmp namespace if needed.
 fn set_attr(x: &mut String, name: &str, value: &str) {
     let a = format!("{name}=\"");
@@ -173,7 +238,8 @@ pub fn with_rating_label(existing: Option<&str>, p: &Params) -> Option<String> {
             // A label outside Lightroom's five (Bridge's "Approved", "To Do") reads as none; only rewrite the label
             // when ours really differs, so changing the stars keeps it.
             let label_changed = l.unwrap_or(0) != p.label.min(5);
-            if r.unwrap_or(0) == rating && !label_changed {
+            let kw_changed = keywords(x).unwrap_or_default() != p.keywords;
+            if r.unwrap_or(0) == rating && !label_changed && !kw_changed {
                 return None;
             }
             let mut x = x.to_string();
@@ -181,12 +247,19 @@ pub fn with_rating_label(existing: Option<&str>, p: &Params) -> Option<String> {
             if label_changed {
                 set_attr(&mut x, "xmp:Label", label);
             }
+            if kw_changed {
+                set_keywords(&mut x, &p.keywords);
+            }
             Some(x)
         }
-        None if rating == 0 && label.is_empty() => None,
-        None => Some(format!(
-            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n  <rdf:Description rdf:about=\"\" xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\" xmp:Rating=\"{rating}\" xmp:Label=\"{label}\"/>\n </rdf:RDF>\n</x:xmpmeta>\n"
-        )),
+        None if rating == 0 && label.is_empty() && p.keywords.is_empty() => None,
+        None => {
+            let mut x = format!(
+                "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n  <rdf:Description rdf:about=\"\" xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\" xmp:Rating=\"{rating}\" xmp:Label=\"{label}\"/>\n </rdf:RDF>\n</x:xmpmeta>\n"
+            );
+            set_keywords(&mut x, &p.keywords);
+            Some(x)
+        }
     }
 }
 
@@ -208,6 +281,26 @@ mod tests {
         assert!((p.crop[0] - 0.1).abs() < 1e-6 && (p.crop[2] - 0.1).abs() < 1e-6);
         assert_eq!(p.curves[0].len(), 3);
         assert!((p.curves[0][0][1] - 20.0 / 255.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn keywords_round_trip_with_other_apps() {
+        let p = Params { keywords: vec!["street".into(), "Lisbon & Porto".into()], rating: 2, ..Default::default() };
+        let fresh = with_rating_label(None, &p).unwrap();
+        assert_eq!(keywords(&fresh).unwrap(), p.keywords);
+        assert_eq!(rating_label(&fresh).0, Some(2));
+        // Lightroom's file: its own settings stay, the subject is replaced.
+        let lr = r#"<x:xmpmeta><rdf:RDF><rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/" crs:Exposure2012="+1.00" xmp:Rating="2">
+   <dc:subject><rdf:Bag><rdf:li>old</rdf:li></rdf:Bag></dc:subject>
+  </rdf:Description></rdf:RDF></x:xmpmeta>"#;
+        assert_eq!(keywords(lr).unwrap(), vec!["old".to_string()]);
+        let out = with_rating_label(Some(lr), &p).unwrap();
+        assert_eq!(keywords(&out).unwrap(), p.keywords);
+        assert!(out.contains("crs:Exposure2012=\"+1.00\"") && !out.contains(">old<"));
+        assert!(with_rating_label(Some(&out), &p).is_none(), "unchanged");
+        // Removing every keyword removes the subject.
+        let none = with_rating_label(Some(&out), &Params { rating: 2, ..Default::default() }).unwrap();
+        assert!(keywords(&none).is_none());
     }
 
     #[test]

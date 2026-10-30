@@ -204,6 +204,12 @@ enum Msg {
     /// it sends nothing but `skipped`, so it is tried again when you come back.
     Cull(PathBuf, Option<CullData>, bool),
     Denoised(PathBuf, Result<Vec<f32>, String>),
+    /// Search details for a folder generation.
+    Indexed(usize, Vec<(PathBuf, crate::library::Entry)>),
+    /// A collection's photos, found (by name).
+    Collection(String, Vec<PathBuf>),
+    /// Infrared cleaning finished: the photo, the strength, the cleaned source (None: the scan has no infrared).
+    IrCleaned(PathBuf, f32, Option<Arc<Rgb32FImage>>),
     AiInstalled(Result<(), String>),
     /// A 1:1 window finished rendering: the settings and window it shows.
     Zoomed(Params, [u32; 4], f32, ColorImage),
@@ -245,14 +251,18 @@ struct Opened {
     cam: Vec<[f32; 2]>,
 }
 
-type RenderKey = (Params, bool, bool, usize, Option<usize>);
+/// Settings, clipping view, draft, proof, mask overlay, and which source image (the cleaned or denoised one
+/// replaces it in place, so a render of the old one must not count).
+type RenderKey = (Params, bool, bool, usize, Option<usize>, usize);
 
 /// What the render thread hands back for the preview.
 struct RenderOut {
     /// Which photo this is for (see `App::photo_gen`) and the settings it shows.
     generation: usize,
     key: RenderKey,
+    /// For the screen (its colour profile applied), and plain sRGB for colour readouts.
     image: ColorImage,
+    srgb: ColorImage,
     bins: [[f32; 128]; 3],
     view_map: [f32; 8],
     photo_wh: [f32; 2],
@@ -266,6 +276,12 @@ struct Photo {
     /// AI denoise result as a difference from `orig`, once computed.
     delta: Option<Arc<Vec<f32>>>,
     nr_applied: f32,
+    /// Infrared-cleaned `orig` and the strength it was cleaned at; whether the scan has infrared (None = not
+    /// looked yet), a clean running, and the strength `full` was built with.
+    ir_base: Option<(f32, Arc<Rgb32FImage>)>,
+    has_ir: Option<bool>,
+    ir_busy: bool,
+    ir_applied: f32,
     preview: Arc<Rgb32FImage>,
     draft: Arc<Rgb32FImage>,
     auto_base: [f32; 3],
@@ -273,6 +289,20 @@ struct Photo {
 
 pub struct App {
     module: Module,
+    /// Search details per photo (built in the background the first time a search is typed in a folder), the
+    /// folder generation they belong to, and whether a build is running.
+    search: std::collections::HashMap<PathBuf, crate::library::Entry>,
+    search_gen: usize,
+    search_busy: bool,
+    /// Collections, the one open (shown instead of a folder), a new one being named (with its files), and the
+    /// keyword being typed.
+    collections: Vec<crate::library::Collection>,
+    collection: Option<String>,
+    new_coll: Option<(String, Vec<PathBuf>)>,
+    kw_text: String,
+    /// Roll notes of the open folder (see `roll`), and which folder they were read from.
+    roll: crate::roll::Roll,
+    roll_dir: Option<PathBuf>,
     folder: Option<PathBuf>,
     files: Vec<PathBuf>,
     /// Thumbnail textures, at most THUMB_KEEP; the rest are reloaded from the disk cache when they come into view.
@@ -367,6 +397,9 @@ pub struct App {
     export_dialog: Option<bool>,
     keymap: Keymap,
     keys_open: bool,
+    /// Screen profile and printer proofing settings, and the loaded printer profile.
+    colour: crate::colour::Settings,
+    printer: Option<Arc<crate::colour::Proof>>,
     /// Shortcut being set in the editor: waiting for a key.
     binding: Option<&'static str>,
     picking_wb: bool,
@@ -409,6 +442,10 @@ pub fn run(start: Option<PathBuf>) -> eframe::Result {
     eframe::run_native("Ferrotype", opts, Box::new(move |cc| {
         install_style(&cc.egui_ctx);
         let mut app = App::new();
+        crate::colour::set_screen(&app.colour.screen);
+        if !app.colour.printer.is_empty() {
+            app.load_printer();
+        }
         if let Some(p) = start {
             app.open_path(&cc.egui_ctx, &p);
         }
@@ -444,7 +481,7 @@ fn builtin_presets() -> Vec<(String, Params)> {
 
 /// The preview as shown: the photo rendered, the mask overlay and clipping marks, the border, the paper proof.
 /// Runs on the render thread; `key` and `generation` are filled in by the caller.
-fn render_preview(src: &Rgb32FImage, full_w: u32, shown: &Params, overlay: Option<usize>, clip_view: bool, proof: usize) -> RenderOut {
+fn render_preview(src: &Rgb32FImage, full_w: u32, shown: &Params, overlay: Option<usize>, clip_view: bool, proof: usize, printer: Option<Arc<crate::colour::Proof>>) -> RenderOut {
     let tex_scale = src.width() as f32 / full_w as f32;
     // Histogram from the photo alone; the border is added afterwards so it does not skew it.
     let out = develop::render(src, &Params { border: Default::default(), ..shown.clone() }, tex_scale);
@@ -474,13 +511,27 @@ fn render_preview(src: &Rgb32FImage, full_w: u32, shown: &Params, overlay: Optio
         });
     }
     let mut out = develop::add_border(out, &shown.border);
-    if proof > 0 {
+    // `proof` past the papers: the printer profile (+1), with the gamut warning (+2).
+    let papers = crate::output::PROOF_PAPERS.len();
+    if let Some(pr) = printer.filter(|_| proof > papers) {
+        // Through the printer profile; the gamut warning marks what the print can't hold in grey-blue.
+        let off = (proof == papers + 2).then(|| pr.out_of_gamut(&out));
+        pr.apply(&mut out);
+        if let Some(off) = off {
+            out.par_chunks_mut(3).zip(off.par_iter()).for_each(|(p, o)| {
+                if *o {
+                    p.copy_from_slice(&[0.45, 0.55, 0.75]);
+                }
+            });
+        }
+    } else if proof > 0 && proof <= papers {
         crate::output::proof(&mut out, proof - 1);
     }
     RenderOut {
         generation: 0,
-        key: (Params::default(), false, false, 0, None),
+        key: (Params::default(), false, false, 0, None, 0),
         image: to_color_image(&out),
+        srgb: srgb_color_image(&out),
         bins,
         view_map: [cw as f32, ch as f32, ox as f32, oy as f32, fw, fh, fox, foy],
         photo_wh: [w as f32, h as f32],
@@ -488,9 +539,16 @@ fn render_preview(src: &Rgb32FImage, full_w: u32, shown: &Params, overlay: Optio
     }
 }
 
-fn to_color_image(img: &Rgb32FImage) -> ColorImage {
+/// An sRGB-encoded picture as 8-bit sRGB pixels (for colour readouts).
+fn srgb_color_image(img: &Rgb32FImage) -> ColorImage {
     let bytes: Vec<u8> = img.par_iter().map(|v| (v * 255.0 + 0.5) as u8).collect();
     ColorImage::from_rgb([img.width() as usize, img.height() as usize], &bytes)
+}
+
+/// An sRGB-encoded picture as a texture, through the screen's colour profile when one is set.
+fn to_color_image(img: &Rgb32FImage) -> ColorImage {
+    let bytes: Vec<u8> = img.par_iter().map(|v| (v * 255.0 + 0.5) as u8).collect();
+    ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], &crate::colour::for_screen(&bytes))
 }
 
 fn encode(img: &Rgb32FImage) -> Rgb32FImage {
@@ -580,7 +638,7 @@ fn describe_change(a: &Params, b: &Params) -> (String, String) {
         ("t_rot", "Rotate"), ("t_scale", "Scale"), ("flip_h", "Flip"), ("crop", "Crop"), ("vig", "Vignette"), ("vig_mid", "Vignette midpoint"),
         ("vig_round", "Vignette roundness"), ("vig_fea", "Vignette feather"), ("vig_hi", "Vignette highlights"), ("gr_amt", "Grain"), ("gr_size", "Grain size"),
         ("gr_rough", "Grain roughness"), ("cal_sh", "Shadows tint"), ("cal", "Calibration"), ("neg", "Negative"), ("border", "Border"), ("spots", "Spot removal"), ("masks", "Mask"), ("hal_amt", "Halation"), ("hal_size", "Halation size"), ("hal_thr", "Halation threshold"), ("curves", "Point curve"), ("lut", "LUT"), ("lut_amt", "LUT amount"), ("rating", "Rating"), ("flag", "Flag"),
-        ("rot90", "Rotate 90°"), ("profile", "Profile"), ("label", "Label"), ("ai_nr", "AI denoise"), ("snapshots", "Snapshot"),
+        ("rot90", "Rotate 90°"), ("profile", "Profile"), ("label", "Label"), ("ai_nr", "AI denoise"), ("ir_clean", "Infrared clean"), ("snapshots", "Snapshot"),
     ];
     let changed: Vec<&(&str, &str)> = names.iter().filter(|(k, _)| ja.get(k) != jb.get(k)).collect();
     match changed.as_slice() {
@@ -589,6 +647,8 @@ fn describe_change(a: &Params, b: &Params) -> (String, String) {
             let val = jb.get(k).and_then(|v| v.as_f64()).map(|v| if v.abs() < 10.0 && v.fract() != 0.0 { format!("{v:+.2}") } else if *k == "temp" { format!("{v:.0}") } else { format!("{v:+.0}") }).unwrap_or_default();
             (n.to_string(), val)
         }
+        // Upright (or its Off button) moves several transform sliders at once.
+        many if many.iter().all(|(k, _)| k.starts_with("t_")) => ("Straighten".into(), String::new()),
         many => (format!("{} +{}", many[0].1, many.len() - 1), String::new()),
     }
 }
@@ -625,10 +685,11 @@ impl App {
             stock_tab: 0, mixer_tab: 0, open: [true, false, false, false, false, false, false, false, false, false, false, false, false, false], tool: Tool::None,
             zoom: None, curve_chan: 0, curve_grab: None, curve_big: false, samples: vec![], rename_dlg: None, mask_ui: MaskUi::default(), chart: ChartUi::new(), profiles: crate::calib::saved(),
             crop_grab: None, crop_aspect: 0, spot_size: 2.0, heal_clone: false, spot_sel: None, heal_drag: None, view_map: [1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0], photo_wh: [1.0, 1.0],
-            export: ExportOpts::load(), export_dialog: None, export_sel: vec![], export_sets: [false; 3], keymap: Keymap::load(), keys_open: false, binding: None, picking_wb: false,
+            export: ExportOpts::load(), export_dialog: None, export_sel: vec![], export_sets: [false; 3], keymap: Keymap::load(), keys_open: false, colour: crate::colour::Settings::load(), printer: None, binding: None, picking_wb: false,
             thumb_due: false, lens_query: String::new(), lib_multi: vec![], pano_busy: false,
             watch: false, watch_open: true, watch_apply: false, watch_at: 0.0, watch_sizes: Default::default(), wipe: 0.5, wipe_tex: None,
-            cull: Default::default(), ai_busy: false, tx, rx,
+            cull: Default::default(), ai_busy: false, tx, rx, roll: Default::default(), roll_dir: None,
+            search: Default::default(), search_gen: 0, search_busy: false, collections: crate::library::load(), collection: None, new_coll: None, kw_text: String::new(),
         }
     }
 
@@ -648,21 +709,76 @@ impl App {
         files.sort();
         self.subdirs = entries.into_iter().filter(|p| p.is_dir() && !p.file_name().unwrap_or_default().to_string_lossy().starts_with('.')).collect();
         self.subdirs.sort();
+        self.collection = None;
         // Ratings and edit marks arrive with each thumbnail: reading every sidecar here froze the window on cloud folders.
         self.meta.clear();
         self.cull.failed.clear();
-        self.folder = Some(dir);
+        self.show_files(ctx, files, Some(dir));
+        if let Some(f) = file {
+            self.select(ctx, f);
+        }
+    }
+
+    /// Show these photos in the Library: a folder's (with `dir`), or a collection's (from anywhere).
+    fn show_files(&mut self, ctx: &egui::Context, files: Vec<PathBuf>, dir: Option<PathBuf>) {
+        if dir.is_none() {
+            self.subdirs.clear();
+            self.meta.clear();
+        }
+        self.folder = dir;
         self.files = files.clone();
         self.thumbs.clear();
         self.thumb_used.borrow_mut().clear();
         self.thumb_pending.clear();
         self.thumb_ready.clear();
         self.lib_sel = files.first().cloned();
+        self.lib_multi.clear();
+        self.search.clear();
         use std::sync::atomic::Ordering::Relaxed;
         let gen_now = self.thumb_gen.fetch_add(1, Relaxed) + 1;
         self.spawn_thumbs(ctx, files, gen_now);
-        if let Some(f) = file {
-            self.select(ctx, f);
+    }
+
+    /// Build the search details for the photos shown, in the background, the first time they're searched.
+    fn ensure_search(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let generation = self.thumb_gen.load(Relaxed);
+        if self.lib_query.trim().is_empty() || self.search_busy || self.search_gen == generation {
+            return;
+        }
+        self.search_busy = true;
+        let (files, tx) = (self.files.clone(), self.tx.clone());
+        std::thread::spawn(move || {
+            let entries: Vec<(PathBuf, crate::library::Entry)> = files.par_iter().map(|f| {
+                let p = read_params(f).unwrap_or_default();
+                (f.clone(), crate::library::entry(f, &p))
+            }).collect();
+            let _ = tx.send(Msg::Indexed(generation, entries));
+        });
+    }
+
+    /// Refresh one photo's search details after its keywords or rating changed.
+    fn reindex(&mut self, f: &Path) {
+        if self.search.contains_key(f) {
+            let p = read_params(f).unwrap_or_default();
+            self.search.insert(f.to_path_buf(), crate::library::entry(f, &p));
+        }
+    }
+
+    /// Open a collection: its photos are found off the UI thread (a smart one searches its folder tree).
+    fn open_collection(&mut self, i: usize) {
+        let Some(c) = self.collections.get(i).cloned() else { return };
+        self.status = format!("Opening {}…", c.name);
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let files = crate::library::members(&c);
+            let _ = tx.send(Msg::Collection(c.name, files));
+        });
+    }
+
+    fn save_collections(&mut self) {
+        if let Err(e) = crate::library::save(&self.collections) {
+            self.status = format!("Could not save collections: {e}");
         }
     }
 
@@ -679,7 +795,7 @@ impl App {
                 let meta = params.as_ref().map(Meta::of);
                 let cached = thumb_cache(f).and_then(|c| image::open(c).ok()).map(|i| {
                     let i = i.to_rgb8();
-                    ColorImage::from_rgb([i.width() as usize, i.height() as usize], i.as_raw())
+                    ColorImage::from_rgba_unmultiplied([i.width() as usize, i.height() as usize], &crate::colour::for_screen(i.as_raw()))
                 });
                 let made = cached.or_else(|| {
                     let (img, toned) = load::load_quick_toned(f, THUMB).ok()?;
@@ -687,13 +803,14 @@ impl App {
                     if toned {
                         p.cam_curve.clear(); // the camera's JPEG already has it
                     }
-                    let ci = to_color_image(&develop::render(&img, &p, 0.05));
+                    let out = develop::render(&img, &p, 0.05);
+                    // The cache keeps sRGB; the screen's profile is applied when it's shown.
                     if let Some(c) = thumb_cache(f) {
                         let _ = std::fs::create_dir_all(c.parent().unwrap());
-                        let rgb: Vec<u8> = ci.pixels.iter().flat_map(|p| [p.r(), p.g(), p.b()]).collect();
-                        let _ = image::save_buffer(&c, &rgb, ci.size[0] as u32, ci.size[1] as u32, image::ExtendedColorType::Rgb8);
+                        let rgb: Vec<u8> = out.iter().map(|v| (v * 255.0 + 0.5) as u8).collect();
+                        let _ = image::save_buffer(&c, &rgb, out.width(), out.height(), image::ExtendedColorType::Rgb8);
                     }
-                    Some(ci)
+                    Some(to_color_image(&out))
                 });
                 // Sent even without a picture, so the rating still arrives.
                 let _ = tx.send(Msg::Thumb(gen_now, f.clone(), made.unwrap_or_default(), meta));
@@ -892,7 +1009,7 @@ impl App {
                                 format!("{} × {}", full.width(), full.height())
                             };
                             let full = Arc::new(full);
-                            self.photo = Some(Photo { full: full.clone(), orig: full, delta: delta.map(Arc::new), nr_applied: 0.0, preview: Arc::new(preview), draft: Arc::new(draft), auto_base });
+                            self.photo = Some(Photo { full: full.clone(), orig: full, delta: delta.map(Arc::new), nr_applied: 0.0, ir_base: None, has_ir: None, ir_busy: false, ir_applied: 0.0, preview: Arc::new(preview), draft: Arc::new(draft), auto_base });
                             // The previous photo's picture must not show under this one's name.
                             self.tex = None;
                             self.photo_gen += 1;
@@ -939,6 +1056,30 @@ impl App {
                         let tex = ctx.load_texture(format!("cull {name}"), d.img, TextureOptions::LINEAR);
                         let focus = ctx.load_texture(format!("focus {name}"), d.focus, TextureOptions::LINEAR);
                         self.cull.cache.insert(p, CullImg { tex, focus, bins: d.bins, clipped: d.clipped, raw: d.raw });
+                    }
+                }
+                Msg::Indexed(generation, entries) => {
+                    self.search_busy = false;
+                    if generation == self.thumb_gen.load(std::sync::atomic::Ordering::Relaxed) {
+                        self.search = entries.into_iter().collect();
+                        self.search_gen = generation;
+                    }
+                }
+                Msg::Collection(name, files) => {
+                    self.show_files(ctx, files, None);
+                    self.status = format!("{name}: {} photo{}", self.files.len(), if self.files.len() == 1 { "" } else { "s" });
+                    self.collection = Some(name);
+                }
+                Msg::IrCleaned(p, amt, r) => {
+                    if let Some(ph) = &mut self.photo
+                        && Some(&p) == self.current.as_ref()
+                    {
+                        ph.ir_busy = false;
+                        ph.has_ir = Some(r.is_some());
+                        match r {
+                            Some(img) => ph.ir_base = Some((amt, img)),
+                            None => self.status = "This scan has no infrared channel".into(),
+                        }
                     }
                 }
                 Msg::Denoised(p, r) => {
@@ -1071,7 +1212,8 @@ impl App {
             && let Some(rgba) = image::RgbaImage::from_raw(ci.size[0] as u32, ci.size[1] as u32, ci.as_raw().to_vec())
         {
             let small = image::imageops::thumbnail(&rgba, THUMB, THUMB * ci.size[1] as u32 / ci.size[0].max(1) as u32);
-            t.set(ColorImage::from_rgba_unmultiplied([small.width() as usize, small.height() as usize], small.as_raw()), TextureOptions::LINEAR);
+            let rgb: Vec<u8> = small.pixels().flat_map(|p| [p[0], p[1], p[2]]).collect();
+            t.set(ColorImage::from_rgba_unmultiplied([small.width() as usize, small.height() as usize], &crate::colour::for_screen(&rgb)), TextureOptions::LINEAR);
         }
         self.thumb_due = false;
     }
@@ -1092,7 +1234,7 @@ impl App {
         // Cropping and placing a chart show the whole frame, without the border, with the crop drawn on top.
         let shown = if matches!(self.tool, Tool::Crop | Tool::Chart) { Params { crop: [0.0; 4], border: Default::default(), ..self.params.clone() } } else { self.params.clone() };
         let overlay = (self.tool == Tool::Mask && self.mask_ui.overlay && self.mask_ui.sel < shown.masks.len()).then_some(self.mask_ui.sel);
-        let key = (shown.clone(), self.clip_view, draft, self.proof, overlay);
+        let key = (shown.clone(), self.clip_view, draft, self.proof, overlay, Arc::as_ptr(&photo.preview) as usize);
         if self.rendered.as_ref() == Some(&key) {
             return;
         }
@@ -1105,8 +1247,9 @@ impl App {
         let src = if draft { photo.draft.clone() } else { photo.preview.clone() };
         let full_w = photo.full.width();
         let (proof, clip_view, generation, tx, ctx2) = (self.proof, self.clip_view, self.photo_gen, self.tx.clone(), ctx.clone());
+        let printer = self.printer.clone();
         std::thread::spawn(move || {
-            let out = render_preview(&src, full_w, &shown, overlay, clip_view, proof);
+            let out = render_preview(&src, full_w, &shown, overlay, clip_view, proof, printer);
             let _ = tx.send(Msg::Rendered(Box::new(RenderOut { generation, key, ..out })));
             ctx2.request_repaint();
         });
@@ -1123,7 +1266,7 @@ impl App {
             Some(t) => t.set(r.image.clone(), TextureOptions::LINEAR),
             None => self.tex = Some(ctx.load_texture("preview", r.image.clone(), TextureOptions::LINEAR)),
         }
-        self.last_rgb = Some(r.image);
+        self.last_rgb = Some(r.srgb);
         self.rendered = Some(r.key);
         if self.thumb_due && !draft && !matches!(self.tool, Tool::Crop | Tool::Chart) && overlay.is_none() {
             self.refresh_thumb();
@@ -1150,12 +1293,30 @@ impl App {
                 ctx2.request_repaint();
             });
         }
+        // Infrared cleaning: off the UI thread, once the slider is let go.
+        let held = ctx.input(|i| i.pointer.any_down());
+        let ir_amt = self.params.ir_clean;
+        if ir_amt > 0.0 && ph.has_ir != Some(false) && !ph.ir_busy && ph.ir_base.as_ref().map(|b| b.0) != Some(ir_amt) && !held {
+            ph.ir_busy = true;
+            let (img, path, tx, ctx2) = (ph.orig.clone(), cur.clone(), self.tx.clone(), ctx.clone());
+            std::thread::spawn(move || {
+                let r = scan::ir_channel(&path).map(|ir| Arc::new(scan::ir_clean(&img, &ir, ir_amt)));
+                let _ = tx.send(Msg::IrCleaned(path, ir_amt, r));
+                ctx2.request_repaint();
+            });
+        }
+        let ir_use = if ir_amt > 0.0 { ph.ir_base.as_ref().map_or(0.0, |b| b.0) } else { 0.0 };
         let want = if ph.delta.is_some() { amt } else { 0.0 };
-        if want != ph.nr_applied && !ctx.input(|i| i.pointer.any_down()) {
-            ph.full = match &ph.delta {
-                Some(d) if want > 0.0 => Arc::new(denoise::apply_delta(&ph.orig, d, want / 100.0)),
+        if (want != ph.nr_applied || ir_use != ph.ir_applied) && !held {
+            let base = match &ph.ir_base {
+                Some((_, img)) if ir_use > 0.0 => img.clone(),
                 _ => ph.orig.clone(),
             };
+            ph.full = match &ph.delta {
+                Some(d) if want > 0.0 => Arc::new(denoise::apply_delta(&base, d, want / 100.0)),
+                _ => base,
+            };
+            ph.ir_applied = ir_use;
             ph.preview = Arc::new(load::fit(&ph.full, PREVIEW));
             ph.draft = Arc::new(load::fit(&ph.preview, DRAFT));
             ph.nr_applied = want;
@@ -1264,8 +1425,9 @@ impl App {
         let ext = self.export.ext;
         // A JPEG/PNG/TIFF source would be offered its own name: suggest "-edit" so one click can't replace it.
         let stem = if self.export.name.trim().is_empty() { stem } else {
-            let shot = crate::lens::shot(cur).unwrap_or_default();
-            crate::output::file_name(&self.export.name, cur, 1, &self.export.roll, &self.params, &shot)
+            let shot = crate::export_shot(cur);
+            let roll = if self.export.roll.trim().is_empty() { crate::roll::for_photo(cur).map(|r| r.0.roll).unwrap_or_default() } else { self.export.roll.clone() };
+            crate::output::file_name(&self.export.name, cur, 1, &roll, &self.params, &shot)
         };
         let name = if load::is_raw(load::copy_of(cur).as_deref().unwrap_or(cur)) || !self.export.name.trim().is_empty() { format!("{stem}.{ext}") } else { format!("{stem}-edit.{ext}") };
         let Some(mut out) = rfd::FileDialog::new().set_file_name(name).add_filter(ext.to_uppercase(), &[ext]).save_file() else { return };
@@ -1286,10 +1448,11 @@ impl App {
         let (orig, delta, params, tx, o, cur) = (photo.orig.clone(), photo.delta.clone(), self.params.clone(), self.tx.clone(), self.export.clone(), cur.clone());
         self.status = "Printing…".into();
         std::thread::spawn(move || {
+            let base = scan::prepare_ir((*orig).clone(), &cur, &params);
             let src = match (&delta, params.ai_nr > 0.0) {
-                (Some(d), true) => Ok(denoise::apply_delta(&orig, d, params.ai_nr / 100.0)),
-                (None, true) => denoise::prepare((*orig).clone(), &cur, &params),
-                _ => Ok((*orig).clone()),
+                (Some(d), true) => Ok(denoise::apply_delta(&base, d, params.ai_nr / 100.0)),
+                (None, true) => denoise::prepare(base, &cur, &params),
+                _ => Ok(base),
             };
             let r = src.and_then(|src| write_export(&src, &params, &o, &out, &cur));
             let _ = tx.send(Msg::Status(match r { Ok(()) => format!("Printed {}", out.file_name().unwrap_or_default().to_string_lossy()), Err(e) => format!("Print failed: {e}") }));
@@ -1483,6 +1646,21 @@ impl App {
                         ui.label(RichText::new("Highlights glow up to 2 stops brighter on HDR screens (recent phones, Macs, Chrome); everywhere else it's a normal JPEG.").size(11.5).color(TEXT2));
                     }
                 }
+                ui.label(caps("Colour space"));
+                let mut si = crate::colour::Space::ALL.iter().position(|x| x.0 == o.space).unwrap_or(0);
+                segmented(ui, &mut si, &crate::colour::Space::ALL.map(|x| x.1));
+                o.space = crate::colour::Space::ALL[si].0;
+                let mut note = o.space.hint().to_string();
+                if o.space != crate::colour::Space::Srgb {
+                    if o.ext == "jpg" && o.hdr {
+                        note = "HDR JPEGs are always sRGB.".into();
+                    } else if o.space == crate::colour::Space::ProPhoto && o.ext != "tif" {
+                        note = "ProPhoto is too wide for 8 bits: smooth skies may band. Use TIFF 16-bit.".into();
+                    } else {
+                        note += ". The profile is embedded in the file.";
+                    }
+                }
+                ui.label(RichText::new(note).size(11.5).color(TEXT2));
                 disclose(ui, "Watermark", "wm", |ui| {
                     ui.add(egui::TextEdit::singleline(&mut o.wm_text).hint_text("© Your name").desired_width(f32::INFINITY));
                     ui.horizontal(|ui| {
@@ -2115,6 +2293,9 @@ impl App {
             };
             self.cull.flash = Some((text, std::time::Instant::now()));
         }
+        if let (Some(r), Some(e)) = (rating, self.search.get_mut(f)) {
+            e.rating = r;
+        }
         let apply = |p: &mut Params| {
             if let Some(r) = rating {
                 p.rating = r;
@@ -2402,7 +2583,7 @@ impl App {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
                 // Shortcuts is a dialog, not a view: a small button at the end of the bar, not a tab.
-                if ui.add(egui::Button::new(RichText::new("?").family(mono500()).size(13.0).color(TEXT2)).min_size(vec2(28.0, 28.0))).on_hover_text(format!("Keyboard shortcuts\nRendering: {}", crate::gpu::status())).clicked() {
+                if ui.add(egui::Button::new(RichText::new("?").family(mono500()).size(13.0).color(TEXT2)).min_size(vec2(28.0, 28.0))).on_hover_text(format!("Keyboard shortcuts and screen colour\nRendering: {}", crate::gpu::status())).clicked() {
                     self.keys_open = true;
                 }
                 let develop = !matches!(self.module, Module::Library | Module::Cull);
@@ -2416,7 +2597,9 @@ impl App {
                     self.open_path(ui.ctx(), &d);
                 }
                 if !develop {
-                    ui.add(egui::TextEdit::singleline(&mut self.lib_query).hint_text("Search frames").desired_width(240.0).margin(vec2(10.0, 6.0)));
+                    ui.add(egui::TextEdit::singleline(&mut self.lib_query).hint_text("Search: keyword, camera, lens, iso>1600…").desired_width(260.0).margin(vec2(10.0, 6.0)))
+                        .on_hover_text("Words match the name, keywords, camera, lens, date, roll and film notes; -word leaves out. Also iso>1600, focal<35, f<2.8, stars>=3, date:2026-05, \"two words\".");
+                    self.ensure_search();
                 } else {
                     let name = self.current.as_ref().and_then(|c| c.file_name()).map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
                     let line = [name, self.status.clone()].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ");
@@ -2456,12 +2639,47 @@ impl App {
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if !neg {
+                    let papers = crate::output::PROOF_PAPERS.len();
                     let names: Vec<&str> = std::iter::once("Screen").chain(crate::output::PROOF_PAPERS.iter().map(|p| p.0)).collect();
-                    egui::ComboBox::from_id_salt("proof").width(96.0).selected_text(if self.proof == 0 { "Proof: off".to_string() } else { format!("Proof: {}", names[self.proof]) }).show_ui(ui, |ui| {
+                    let printer_name = self.printer.as_ref().map(|p| p.name.clone());
+                    let shown = match (self.proof, &printer_name) {
+                        (0, _) => "Proof: off".to_string(),
+                        (k, Some(n)) if k > papers => format!("Proof: {n}"),
+                        (k, _) => format!("Proof: {}", names[k.min(papers)]),
+                    };
+                    let before = (self.proof, self.colour.perceptual, self.colour.paper);
+                    let mut load = false;
+                    egui::ComboBox::from_id_salt("proof").width(110.0).selected_text(shown).show_ui(ui, |ui| {
                         for (k, n) in names.iter().enumerate() {
                             ui.selectable_value(&mut self.proof, k, *n);
                         }
-                    }).response.on_hover_text("Paper preview: roughly how a print on this paper will look");
+                        ui.separator();
+                        if let Some(n) = &printer_name {
+                            ui.selectable_value(&mut self.proof, papers + 1, format!("Printer: {n}"));
+                            let mut warn = self.proof == papers + 2;
+                            if ui.checkbox(&mut warn, "Show what it can't print").changed() {
+                                self.proof = if warn { papers + 2 } else { papers + 1 };
+                            }
+                            ui.checkbox(&mut self.colour.perceptual, "Perceptual (else relative)");
+                            ui.checkbox(&mut self.colour.paper, "Simulate paper and ink");
+                        }
+                        load = ui.button("Printer profile…").on_hover_text("Load the ICC profile for your printer and paper (RGB or CMYK)").clicked();
+                    }).response.on_hover_text("Soft proof: how a print will look. The papers are approximations; a printer profile is exact");
+                    if load
+                        && let Some(f) = rfd::FileDialog::new().add_filter("ICC profile", &["icc", "icm"]).pick_file()
+                    {
+                        self.colour.printer = f.to_string_lossy().to_string();
+                        self.load_printer();
+                        if self.printer.is_some() {
+                            self.proof = papers + 1;
+                        }
+                    }
+                    if before.1 != self.colour.perceptual || before.2 != self.colour.paper {
+                        self.load_printer();
+                    }
+                    if before != (self.proof, self.colour.perceptual, self.colour.paper) {
+                        self.rendered = None;
+                    }
                 }
                 if let Some(t) = &self.tex
                     && self.photo.is_some()
@@ -2811,34 +3029,43 @@ impl App {
             let kind = if load::is_raw(&real) { 0 } else if e == "jpg" || e == "jpeg" { 1 } else if e == "tif" || e == "tiff" { 2 } else { 3 };
             let m = self.meta.get(*f).copied().unwrap_or_default();
             let rating_ok = match self.lib_rating { 1 => m.rating >= 1 && m.flag >= 0, 2 => m.rating >= 3 && m.flag >= 0, 3 => m.flag > 0, _ => true };
-            self.lib_filter[kind]
-                && (!self.lib_filter[4] || m.edited)
-                && rating_ok
-                && (q.is_empty() || f.file_name().unwrap_or_default().to_string_lossy().to_lowercase().contains(&q))
+            // The full search once its details are in; the file name meanwhile.
+            let found = q.trim().is_empty() || match self.search.get(*f) {
+                Some(e) => crate::library::matches(e, &q),
+                None => f.file_name().unwrap_or_default().to_string_lossy().to_lowercase().contains(q.trim()),
+            };
+            self.lib_filter[kind] && (!self.lib_filter[4] || m.edited) && rating_ok && found
         }).cloned().collect()
     }
 
     fn library_left(&mut self, ui: &mut Ui) {
         ui.label(caps("Roll"));
         ui.add_space(2.0);
-        let Some(dir) = self.folder.clone() else {
-            ui.label(RichText::new("No roll open").color(TEXT3));
-            return;
-        };
-        if let Some(parent) = dir.parent()
-            && ui.add(egui::Button::new(RichText::new("‹  Up one level").color(TEXT2)).fill(Color32::TRANSPARENT).stroke(Stroke::NONE)).clicked()
-        {
-            self.open_path(ui.ctx(), &parent.to_path_buf());
-            return;
-        }
-        let name = dir.file_name().unwrap_or_default().to_string_lossy().to_string();
-        list_row(ui, &name, &self.files.len().to_string(), true);
-        for s in self.subdirs.clone().iter().take(40) {
-            if list_row(ui, &format!("   {}", s.file_name().unwrap_or_default().to_string_lossy()), "", false).clicked() {
-                self.open_path(ui.ctx(), s);
-                return;
+        match self.folder.clone() {
+            None if self.collection.is_none() => {
+                ui.label(RichText::new("No roll open").color(TEXT3));
+            }
+            None => {
+                ui.label(RichText::new("Showing a collection").size(12.0).color(TEXT2));
+            }
+            Some(dir) => {
+                if let Some(parent) = dir.parent()
+                    && ui.add(egui::Button::new(RichText::new("‹  Up one level").color(TEXT2)).fill(Color32::TRANSPARENT).stroke(Stroke::NONE)).clicked()
+                {
+                    self.open_path(ui.ctx(), &parent.to_path_buf());
+                    return;
+                }
+                let name = dir.file_name().unwrap_or_default().to_string_lossy().to_string();
+                list_row(ui, &name, &self.files.len().to_string(), true);
+                for s in self.subdirs.clone().iter().take(40) {
+                    if list_row(ui, &format!("   {}", s.file_name().unwrap_or_default().to_string_lossy()), "", false).clicked() {
+                        self.open_path(ui.ctx(), s);
+                        return;
+                    }
+                }
             }
         }
+        self.collections_panel(ui);
         ui.add_space(18.0);
         ui.label(caps("Show rated"));
         segmented(ui, &mut self.lib_rating, &["All", "1+ stars", "3+", "Picks"]);
@@ -2932,6 +3159,8 @@ impl App {
         let mut export_sel = false;
         let (mut rename, mut rename_one, mut undo_rename) = (None::<bool>, None::<PathBuf>, false);
         let mut hdr = None::<bool>;
+        let (mut add_to, mut add_files) = (None::<Option<usize>>, Vec::<PathBuf>::new());
+        let lib_multi = self.lib_multi.clone();
         let can_undo_rename = self.folder.as_deref().is_some_and(crate::rename::can_undo);
         let (cmd, shift) = ui.input(|i| (i.modifiers.command, i.modifiers.shift));
         let gap = 12.0;
@@ -2982,6 +3211,7 @@ impl App {
                                 ui.painter().rect_filled(Rect::from_min_max(pos2(r.right() - 26.0, r.bottom() - 6.0), pos2(r.right() - 6.0, r.bottom() - 2.0)), 2.0, LABEL_COLORS[(m.label - 1).min(4) as usize]);
                             }
                             let is_copy = load::copy_of(f).is_some();
+                            let colls: Vec<String> = self.collections.iter().filter(|c| !c.is_smart()).map(|c| c.name.clone()).collect();
                             let multi = self.lib_multi.len();
                             let in_multi = self.lib_multi.contains(f);
                             let pano_busy = self.pano_busy;
@@ -3024,6 +3254,20 @@ impl App {
                                     undo_rename = true;
                                     ui.close();
                                 }
+                                ui.menu_button(if multi >= 2 && in_multi { format!("Add {multi} to collection") } else { "Add to collection".into() }, |ui| {
+                                    for (k, n) in colls.iter().enumerate() {
+                                        if ui.button(n).clicked() {
+                                            add_to = Some(Some(k));
+                                            add_files = if multi >= 2 && in_multi { lib_multi.clone() } else { vec![f.clone()] };
+                                            ui.close();
+                                        }
+                                    }
+                                    if ui.button("New collection…").clicked() {
+                                        add_to = Some(None);
+                                        add_files = if multi >= 2 && in_multi { lib_multi.clone() } else { vec![f.clone()] };
+                                        ui.close();
+                                    }
+                                });
                                 if ui.button("Make a virtual copy").clicked() {
                                     copy = Some(f.clone());
                                     ui.close();
@@ -3108,6 +3352,23 @@ impl App {
                 self.open_path(ui.ctx(), &d);
             }
         }
+        match add_to {
+            Some(Some(k)) => {
+                // Index among the plain collections (smart ones can't hold a hand-picked file).
+                if let Some(c) = self.collections.iter_mut().filter(|c| !c.is_smart()).nth(k) {
+                    let n = add_files.iter().filter(|f| !c.files.contains(f)).count();
+                    for f in add_files {
+                        if !c.files.contains(&f) {
+                            c.files.push(f);
+                        }
+                    }
+                    self.status = format!("Added {n} to {}", c.name);
+                }
+                self.save_collections();
+            }
+            Some(None) => self.new_coll = Some((String::new(), add_files)),
+            None => {}
+        }
         if export_sel {
             let mut files = self.lib_multi.clone();
             files.sort();
@@ -3130,6 +3391,142 @@ impl App {
         }
         if let Some(f) = remove {
             self.remove_copy(&f);
+        }
+    }
+
+    /// Collections: open one, save the search as a smart one, name a new one, delete one (right-click).
+    fn collections_panel(&mut self, ui: &mut Ui) {
+        ui.add_space(18.0);
+        ui.horizontal(|ui| {
+            ui.label(caps("Collections"));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let q = self.lib_query.trim().to_string();
+                if !q.is_empty()
+                    && let Some(dir) = self.folder.clone()
+                    && small_action(ui, "Save search", false).on_hover_text("A smart collection: this search over this folder and its subfolders, kept up to date").clicked()
+                {
+                    let name = format!("{q} · {}", dir.file_name().unwrap_or_default().to_string_lossy());
+                    self.collections.push(crate::library::Collection { name, query: q, folder: dir, ..Default::default() });
+                    self.save_collections();
+                }
+                if self.new_coll.is_none() && small_action(ui, "+ New", false).on_hover_text("A collection of the selected photos (or an empty one)").clicked() {
+                    let files = if self.lib_multi.is_empty() { self.lib_sel.clone().into_iter().collect() } else { self.lib_multi.clone() };
+                    self.new_coll = Some((String::new(), files));
+                }
+            });
+        });
+        if let Some((name, files)) = &mut self.new_coll {
+            let n = files.len();
+            let resp = ui.add(egui::TextEdit::singleline(name).id_salt("new_coll").hint_text(format!("Name for {n} photo{}, then Enter", if n == 1 { "" } else { "s" })).desired_width(f32::INFINITY));
+            // Focus it once when it appears, not every frame (that would trap the keyboard).
+            let id = resp.id;
+            if ui.memory(|m| m.data.get_temp::<bool>(id)).is_none() {
+                resp.request_focus();
+                ui.memory_mut(|m| m.data.insert_temp(id, true));
+            }
+            let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let done = (resp.has_focus() || resp.lost_focus()) && enter;
+            let cancel = resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape));
+            if done || cancel {
+                ui.memory_mut(|m| m.data.remove::<bool>(id));
+            }
+            if done && !name.trim().is_empty() {
+                let c = crate::library::Collection { name: name.trim().to_string(), files: files.clone(), ..Default::default() };
+                self.status = format!("Collection {} made", c.name);
+                self.collections.push(c);
+                self.new_coll = None;
+                self.save_collections();
+            } else if cancel || (done && name.trim().is_empty()) {
+                self.new_coll = None;
+            }
+        }
+        if self.collections.is_empty() && self.new_coll.is_none() {
+            ui.label(RichText::new("Right-click photos to add them to one, or save a search.").size(11.5).color(TEXT3));
+        }
+        let mut open = None;
+        let mut delete = None;
+        for (i, c) in self.collections.iter().enumerate() {
+            let on = self.collection.as_ref() == Some(&c.name);
+            let count = if c.is_smart() { "smart".to_string() } else { c.files.len().to_string() };
+            let resp = list_row(ui, &c.name, &count, on).on_hover_text(if c.is_smart() { format!("Search \"{}\" in {}", c.query, c.folder.display()) } else { "Right-click to delete".into() });
+            if resp.clicked() {
+                open = Some(i);
+            }
+            resp.context_menu(|ui| {
+                if ui.button("Delete collection").on_hover_text("Only the collection: the photos stay where they are").clicked() {
+                    delete = Some(i);
+                    ui.close();
+                }
+            });
+        }
+        if let Some(i) = open {
+            self.open_collection(i);
+        }
+        if let Some(i) = delete {
+            let c = self.collections.remove(i);
+            if self.collection.as_ref() == Some(&c.name) {
+                self.collection = None;
+            }
+            self.save_collections();
+        }
+    }
+
+    /// Keywords of the selected photo (or of every selected photo, when several are): chips with ×, and a field.
+    fn keywords_panel(&mut self, ui: &mut Ui, f: &Path) {
+        let targets: Vec<PathBuf> = if self.lib_multi.len() >= 2 && self.lib_multi.iter().any(|m| m == f) { self.lib_multi.clone() } else { vec![f.to_path_buf()] };
+        let kws = read_params(f).unwrap_or_default().keywords;
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            ui.label(caps("Keywords"));
+            if targets.len() > 1 {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.label(RichText::new(format!("{} photos", targets.len())).size(11.0).color(TEXT3)));
+            }
+        });
+        let mut remove = None;
+        ui.horizontal_wrapped(|ui| {
+            for k in &kws {
+                if chip(ui, &format!("{k}  ×"), false).on_hover_text("Remove").clicked() {
+                    remove = Some(k.clone());
+                }
+            }
+        });
+        let resp = ui.add(egui::TextEdit::singleline(&mut self.kw_text).hint_text("Add: street, Lisbon, night").desired_width(f32::INFINITY));
+        let add = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let mut change: Option<(Vec<String>, Option<String>)> = None;
+        if add {
+            let new = crate::library::split_keywords(&self.kw_text);
+            self.kw_text.clear();
+            if !new.is_empty() {
+                change = Some((new, None));
+            }
+            resp.request_focus();
+        }
+        if let Some(r) = remove {
+            change = Some((vec![], Some(r)));
+        }
+        if let Some((add, rm)) = change {
+            for t in &targets {
+                let mut q = read_params(t).unwrap_or_default();
+                for k in &add {
+                    if !q.keywords.iter().any(|o| o.eq_ignore_ascii_case(k)) {
+                        q.keywords.push(k.clone());
+                    }
+                }
+                if let Some(r) = &rm {
+                    q.keywords.retain(|o| !o.eq_ignore_ascii_case(r));
+                }
+                if write_params(t, &q).is_ok() {
+                    self.meta.insert(t.clone(), Meta::of(&q));
+                    // The open photo's settings in memory must not write the old keywords back.
+                    if self.current.as_deref() == Some(t.as_path()) {
+                        self.params.keywords = q.keywords.clone();
+                        for h in &mut self.history {
+                            h.keywords = q.keywords.clone();
+                        }
+                    }
+                }
+                self.reindex(t);
+            }
         }
     }
 
@@ -3209,6 +3606,7 @@ impl App {
                 }
             });
         });
+        self.keywords_panel(ui, &f);
         ui.add_space(12.0);
         ui.columns(2, |c| {
             if c[0].add(egui::Button::new("Open as negative").min_size(vec2(c[0].available_width(), 32.0))).clicked() {
@@ -3228,6 +3626,141 @@ impl App {
                 }
             });
         });
+    }
+
+    /// Roll notes for the open folder, and the selected frame's own notes. Saved as they are typed.
+    fn roll_panel(&mut self, ui: &mut Ui) {
+        let Some(dir) = self.folder.clone() else { return };
+        if self.roll_dir.as_ref() != Some(&dir) {
+            self.roll = crate::roll::read(&dir).unwrap_or_default();
+            self.roll_dir = Some(dir.clone());
+        }
+        ui.add_space(20.0);
+        ui.horizontal(|ui| {
+            ui.label(caps("Roll notes"));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(RichText::new("for this folder").size(11.0).color(TEXT3));
+            });
+        });
+        ui.add_space(4.0);
+        let mut changed = false;
+        let r = &mut self.roll;
+        let row = |ui: &mut Ui, label: &str, add: &mut dyn FnMut(&mut Ui) -> egui::Response| -> bool {
+            ui.horizontal(|ui| {
+                ui.allocate_ui_with_layout(vec2(78.0, 22.0), Layout::left_to_right(Align::Center), |ui| {
+                    ui.set_min_width(78.0);
+                    ui.label(RichText::new(label).size(12.0).color(TEXT3));
+                });
+                add(ui).changed()
+            }).inner
+        };
+        fn text<'a>(v: &'a mut String, hint: &'a str) -> impl FnMut(&mut Ui) -> egui::Response + 'a {
+            move |ui: &mut Ui| ui.add(egui::TextEdit::singleline(v).hint_text(hint).desired_width(f32::INFINITY))
+        }
+        changed |= row(ui, "Roll", &mut text(&mut r.roll, "12"));
+        changed |= row(ui, "Camera", &mut text(&mut r.camera, "Nikon FM2"));
+        changed |= row(ui, "Lens", &mut text(&mut r.lens, "50mm f/1.8"));
+        // Film: one of the known stocks (so the conversion can use it), or any name.
+        let known = negative::STOCKS.iter().find(|s| s.id == r.stock);
+        let shown = known.map_or_else(|| if r.stock.is_empty() { "Not noted".to_string() } else { r.stock.clone() }, |s| format!("{} {}", s.brand, s.name));
+        changed |= row(ui, "Film", &mut |ui: &mut Ui| {
+            let mut resp = egui::ComboBox::from_id_salt("roll_stock").selected_text(shown.clone()).width(ui.available_width()).height(320.0).show_ui(ui, |ui| {
+                let mut c = false;
+                if ui.selectable_label(r.stock.is_empty(), "Not noted").clicked() {
+                    r.stock.clear();
+                    c = true;
+                }
+                for s in STOCKS {
+                    if ui.selectable_label(r.stock == s.id, format!("{} {}", s.brand, s.name)).clicked() {
+                        r.stock = s.id.to_string();
+                        // Fill in the box speed from the name when it has one ("Portra 400").
+                        if let Some(iso) = s.name.split_whitespace().filter_map(|w| w.trim_end_matches(['D', 'T']).parse::<f32>().ok()).last() {
+                            r.iso = iso;
+                        }
+                        c = true;
+                    }
+                }
+                c
+            });
+            if resp.inner == Some(true) {
+                resp.response.mark_changed();
+            }
+            resp.response
+        });
+        if known.is_none() {
+            changed |= row(ui, "", &mut text(&mut r.stock, "or type a film name"));
+        }
+        changed |= row(ui, "Box speed", &mut |ui: &mut Ui| ui.add(egui::DragValue::new(&mut r.iso).range(0.0..=25600.0).speed(5.0).suffix(" ISO")));
+        changed |= row(ui, "Shot at", &mut |ui: &mut Ui| {
+            let resp = ui.add(egui::DragValue::new(&mut r.ei).range(0.0..=25600.0).speed(5.0).custom_formatter(|v, _| if v <= 0.0 { "box speed".into() } else { format!("{v:.0} EI") }));
+            let p = r.push_label();
+            if !p.is_empty() {
+                ui.label(RichText::new(p).size(11.5).color(TEXT2));
+            }
+            resp
+        });
+        changed |= row(ui, "Developer", &mut text(&mut r.developer, "D-76 1+1, 9:45"));
+        changed |= row(ui, "Date", &mut text(&mut r.date, "YYYY-MM-DD"));
+        ui.add_space(2.0);
+        changed |= ui.add(egui::TextEdit::multiline(&mut r.notes).hint_text("Notes for the roll").desired_rows(2).desired_width(f32::INFINITY)).changed();
+        // This frame's settings, when one is selected.
+        if let Some(f) = self.lib_sel.clone() {
+            let key = crate::roll::frame_key(&f);
+            let mut fr = r.frames.get(&key).cloned().unwrap_or_default();
+            ui.add_space(10.0);
+            ui.label(caps("This frame"));
+            let mut fc = false;
+            fc |= row(ui, "Aperture", &mut |ui: &mut Ui| ui.add(egui::DragValue::new(&mut fr.aperture).range(0.0..=64.0).speed(0.1).custom_formatter(|v, _| if v <= 0.0 { "—".into() } else { format!("f/{v:.1}") })));
+            fc |= row(ui, "Shutter", &mut text(&mut fr.shutter, "1/125"));
+            fc |= row(ui, "Focal length", &mut |ui: &mut Ui| ui.add(egui::DragValue::new(&mut fr.focal).range(0.0..=2000.0).speed(0.5).custom_formatter(|v, _| if v <= 0.0 { "roll's lens".into() } else { format!("{v:.0} mm") })));
+            fc |= row(ui, "Note", &mut text(&mut fr.note, ""));
+            if fc {
+                if fr.is_empty() {
+                    r.frames.remove(&key);
+                } else {
+                    r.frames.insert(key, fr);
+                }
+                changed = true;
+            }
+        }
+        if changed {
+            if let Err(e) = crate::roll::write(&dir, &self.roll) {
+                self.status = format!("Could not save the roll notes: {e}");
+            }
+        }
+        // The film and its push set up every frame's conversion in one go.
+        let usable = negative::STOCKS.iter().any(|s| s.id == self.roll.stock) || self.my_stocks.iter().any(|(_, c)| c.name == self.roll.stock.trim());
+        if usable {
+            ui.add_space(8.0);
+            let push = self.roll.push_label();
+            let label = if push.is_empty() { "Convert the roll with this film".to_string() } else { format!("Convert the roll with this film ({push})") };
+            if ui.add(egui::Button::new(label).min_size(vec2(ui.available_width(), 28.0)))
+                .on_hover_text("Every frame in this folder becomes a negative of this film; a push adds contrast, a pull takes it away").clicked()
+            {
+                let mut n = 0;
+                for f in self.files.clone() {
+                    let mut q = read_params(&f).unwrap_or_default();
+                    let before = q.neg.clone();
+                    // Re-applying shouldn't stack the push contrast: start from the stock's own contrast.
+                    if q.neg.enabled && q.neg.stock == self.roll.stock {
+                        q.neg.contrast = 0.0;
+                    }
+                    crate::roll::apply_stock(&self.roll, &mut q);
+                    if q.neg != before && write_params(&f, &q).is_ok() {
+                        self.meta.insert(f.clone(), Meta::of(&q));
+                        n += 1;
+                    }
+                }
+                if let Some(cur) = self.current.clone()
+                    && cur.parent() == Some(dir.as_path())
+                    && let Some(q) = read_params(&cur)
+                {
+                    self.params.neg = q.neg;
+                    self.commit();
+                }
+                self.status = format!("{n} frame{} set to {}", if n == 1 { "" } else { "s" }, self.roll.stock_name());
+            }
+        }
     }
 
     // ---------- Develop ----------
@@ -3639,6 +4172,29 @@ impl App {
                 slider(ui, "Defringe", &mut p.o_fringe, 0.0, 20.0, 0.0, None);
             });
             section(ui, "Transform & crop", o_geo, changed(&["t_vert","t_hor","t_rot","t_scale","flip_h","crop","rot90"]), |ui| {
+                // Upright: found from the photo's straight lines, then written into the three sliders below, so
+                // the result stays adjustable by hand.
+                ui.horizontal(|ui| {
+                    ui.label(caps("Upright"));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if small_action(ui, "Off", false).on_hover_text("Rotate, Vertical and Horizontal back to 0, Scale to 100").clicked() {
+                            (p.t_rot, p.t_vert, p.t_hor, p.t_scale) = (0.0, 0.0, 0.0, 100.0);
+                        }
+                        for (m, name) in crate::upright::Mode::ALL.iter().rev() {
+                            let tip = match m {
+                                crate::upright::Mode::Auto => "Level, plus a gentle fix for leaning verticals when the photo clearly has them",
+                                crate::upright::Mode::Level => "Level the horizon from the photo's straight lines",
+                                crate::upright::Mode::Vertical => "Level and make converging verticals parallel (buildings)",
+                                crate::upright::Mode::Full => "Level and straighten verticals and horizontals",
+                            };
+                            if small_action(ui, name, false).on_hover_text(tip).clicked()
+                                && let Some(ph) = photo
+                            {
+                                *p = crate::upright::apply(&ph.preview, p, *m);
+                            }
+                        }
+                    });
+                });
                 slider(ui, "Vertical", &mut p.t_vert, -100.0, 100.0, 0.0, None);
                 slider(ui, "Horizontal", &mut p.t_hor, -100.0, 100.0, 0.0, None);
                 slider(ui, "Rotate", &mut p.t_rot, -45.0, 45.0, 0.0, None);
@@ -4070,6 +4626,8 @@ impl App {
     fn negative_right(&mut self, ui: &mut Ui) {
         let auto_base = self.auto_base();
         let profile = self.params.profile.clone();
+        let has_ir = self.photo.as_ref().map(|p| (p.has_ir, p.ir_busy));
+        let ir_clean = &mut self.params.ir_clean;
         let np = &mut self.params.neg;
         let st = negative::stock(&np.stock);
         let mut add_character = false;
@@ -4214,6 +4772,18 @@ impl App {
                         scan_action = Some(3);
                     }
                 });
+                // Infrared cleaning (Digital ICE style) for scans saved with their infrared channel.
+                slider(ui, "Infrared clean", ir_clean, 0.0, 100.0, 0.0, None);
+                let note = match has_ir {
+                    Some((Some(false), _)) => Some("This scan has no infrared channel. Save scans as 64-bit RGBI TIFF (VueScan, SilverFast) to use it."),
+                    Some((_, true)) => Some("Cleaning with the infrared channel…"),
+                    _ if st.kind == Kind::Bw => Some("Silver black-and-white film blocks infrared, so this works on colour film and C-41 black-and-white only."),
+                    _ if *ir_clean <= 0.0 => Some("Removes dust and scratches found in the scan's infrared channel."),
+                    _ => None,
+                };
+                if let Some(n) = note {
+                    ui.label(RichText::new(n).size(11.5).color(TEXT2));
+                }
             });
         });
         match scan_action {
@@ -4439,13 +5009,71 @@ impl App {
     }
 
     /// The shortcut editor: click a key, press the new one.
+    /// (Re)load the printer profile for soft proofing from the settings, and save them.
+    fn load_printer(&mut self) {
+        self.printer = None;
+        if !self.colour.printer.is_empty() {
+            match crate::colour::load_proof(&self.colour.printer, self.colour.perceptual, self.colour.paper) {
+                Ok(p) => self.printer = Some(Arc::new(p)),
+                Err(e) => self.status = format!("Printer profile: {e}"),
+            }
+        }
+        let _ = self.colour.save();
+        self.rendered = None;
+    }
+
+    /// Apply the screen colour setting to every picture shown from now on, and save it.
+    fn apply_screen(&mut self) {
+        let name = crate::colour::set_screen(&self.colour.screen);
+        if self.colour.screen.profile.trim().is_empty() || self.colour.screen.profile == "srgb" {
+            self.status = "Screen colour: sRGB".into();
+        } else {
+            self.status = match name { Some(n) => format!("Screen colour: {n}"), None => "That screen profile can't be used: showing sRGB".into() };
+        }
+        if let Err(e) = self.colour.save() {
+            self.status = format!("Could not save the colour settings: {e}");
+        }
+        // Everything on screen was made for the old screen setting.
+        self.rendered = None;
+        self.thumbs.clear();
+        self.thumb_ready.clear();
+        self.preset_tex.clear();
+    }
+
     fn keys_window(&mut self, ctx: &egui::Context) {
         if !self.keys_open {
             return;
         }
         // Esc while waiting for a key cancels the binding, not the dialog.
         let binding = self.binding.is_some();
-        let open = dialog(ctx, "keys", "Keyboard shortcuts", 380.0, |ui| {
+        let mut screen_changed = false;
+        let open = dialog(ctx, "keys", "Keyboard shortcuts and screen", 380.0, |ui| {
+            ui.label(caps("Screen colour"));
+            let cur = self.colour.screen.profile.clone();
+            let shown = match cur.as_str() {
+                "" | "srgb" => "sRGB (as is)".to_string(),
+                "p3" => "Display P3".into(),
+                "adobe" => "Adobe RGB".into(),
+                "auto" => "System profile".into(),
+                p => Path::new(p).file_name().map_or(p.to_string(), |n| n.to_string_lossy().to_string()),
+            };
+            egui::ComboBox::from_id_salt("screen").width(ui.available_width()).selected_text(shown).show_ui(ui, |ui| {
+                for (v, n) in [("", "sRGB (as is)"), ("p3", "Display P3"), ("adobe", "Adobe RGB"), ("auto", "System profile")] {
+                    if ui.selectable_label(cur == v, n).clicked() {
+                        self.colour.screen.profile = v.into();
+                        screen_changed = true;
+                    }
+                }
+                if ui.button("Profile file…").clicked()
+                    && let Some(f) = rfd::FileDialog::new().add_filter("ICC profile", &["icc", "icm"]).pick_file()
+                {
+                    self.colour.screen.profile = f.to_string_lossy().to_string();
+                    screen_changed = true;
+                }
+            });
+            ui.label(RichText::new("If colours look too strong on a wide-gamut monitor, choose its profile here. macOS usually manages colour itself, so keep sRGB there unless photos look oversaturated.").size(11.5).color(TEXT2));
+            ui.add_space(10.0);
+            ui.label(caps("Shortcuts"));
             ui.label(RichText::new("Click a shortcut, then press the new key (Esc cancels). Undo, copy, paste and Ctrl/Cmd+arrows stay fixed.").size(11.5).color(TEXT2));
             ui.add_space(6.0);
             egui::ScrollArea::vertical().max_height(460.0).show(ui, |ui| {
@@ -4468,6 +5096,9 @@ impl App {
             }
             ui.add_space(4.0);
         });
+        if screen_changed {
+            self.apply_screen();
+        }
         if !open && !(binding && ctx.input(|i| i.key_pressed(egui::Key::Escape))) {
             self.keys_open = false;
             self.binding = None;
@@ -4636,7 +5267,12 @@ impl eframe::App for App {
             }
             Module::Library => {
                 egui::Panel::left("lib_left").exact_size(260.0).resizable(false).frame(pad(PANEL, 12, 16)).show(ui, |ui| self.library_left(ui));
-                egui::Panel::right("lib_right").exact_size(320.0).resizable(false).frame(pad(PANEL, 16, 16)).show(ui, |ui| self.library_info(ui));
+                egui::Panel::right("lib_right").exact_size(320.0).resizable(false).frame(pad(PANEL, 16, 16)).show(ui, |ui| {
+                    egui::ScrollArea::vertical().id_salt("lib_info").auto_shrink([false, false]).show(ui, |ui| {
+                        self.library_info(ui);
+                        self.roll_panel(ui);
+                    });
+                });
                 egui::CentralPanel::default().frame(egui::Frame::new().fill(BG)).show(ui, |ui| {
                     if !self.files.is_empty() { egui::Panel::top("lib_tools").exact_size(48.0).frame(pad(BG, 16, 0)).show(ui, |ui| self.library_toolbar(ui)); }
                     egui::CentralPanel::default().frame(pad(BG, 16, 16)).show(ui, |ui| self.library_grid(ui));

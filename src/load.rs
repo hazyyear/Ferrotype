@@ -43,6 +43,12 @@ fn load_raw(path: &Path) -> Result<Rgb32FImage, String> {
     let dec = rawler::get_decoder(&src).map_err(|e| e.to_string())?;
     let raw = dec.raw_image(&src, &RawDecodeParams::default(), false).map_err(|e| e.to_string())?;
     let orient = Orientation::from_exif(raw.orientation.to_u16() as u8).unwrap_or(Orientation::NoTransforms);
+    // Our own demosaicing (RCD, X-Trans) and colour where we handle the sensor; rawler's develop otherwise.
+    if let Some(img) = crate::demosaic::develop(&raw) {
+        let mut img = DynamicImage::ImageRgb32F(img);
+        img.apply_orientation(orient);
+        return Ok(img.to_rgb32f());
+    }
     // Default steps minus the sRGB gamma: we want linear data.
     let steps: Vec<_> = RawDevelop::default().steps.into_iter().filter(|s| *s != ProcessingStep::SRgb).collect();
     let img = RawDevelop::new_with(&steps).develop_intermediate(&raw).map_err(|e| e.to_string())?;
@@ -187,12 +193,19 @@ pub fn srgb_to_linear(v: f32) -> f32 {
 }
 
 /// sRGB encode through a 4096-step table (linear in between): a powf per channel was a big share of a render.
+/// Extended below 0 (mirrored), so a colour outside sRGB keeps its negative channel for a wide-gamut export.
 pub fn linear_to_srgb(v: f32) -> f32 {
     static T: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
     let t = T.get_or_init(|| (0..=4096).map(|i| srgb_exact(i as f32 / 4096.0)).collect());
-    let x = v.clamp(0.0, 1.0) * 4096.0;
+    let x = v.abs().min(1.0) * 4096.0;
     let i = (x as usize).min(4095);
-    t[i] + (t[i + 1] - t[i]) * (x - i as f32)
+    let e = t[i] + (t[i + 1] - t[i]) * (x - i as f32);
+    if v < 0.0 { -e } else { e }
+}
+
+/// The inverse of `linear_to_srgb`, extended the same way.
+pub fn srgb_to_linear_ext(v: f32) -> f32 {
+    if v < 0.0 { -srgb_to_linear(-v) } else { srgb_to_linear(v) }
 }
 
 fn srgb_exact(v: f32) -> f32 {
