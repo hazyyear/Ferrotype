@@ -277,6 +277,8 @@ pub struct Shot {
     pub shutter: f32,
     pub bias: f32,
     pub taken: String,
+    /// Where it was taken, for exports that ask for it (never read from the camera file).
+    pub gps: Option<crate::geotag::Location>,
 }
 
 impl Shot {
@@ -358,6 +360,7 @@ pub fn shot(path: &Path) -> Option<Shot> {
             shutter: r(m.exif.exposure_time),
             bias: m.exif.exposure_bias.map_or(0.0, |b| b.n as f32 / (b.d as f32).max(1.0)),
             taken: m.exif.date_time_original.unwrap_or_default(),
+            gps: None,
         });
     }
     let exif = crate::load::exif_block(path)?;
@@ -371,9 +374,11 @@ pub fn parse_exif(b: &[u8]) -> Option<Shot> {
     let u32_at = |o: usize| b.get(o..o + 4).map(|s| { let a = [s[0], s[1], s[2], s[3]]; if le { u32::from_le_bytes(a) } else { u32::from_be_bytes(a) } });
     let mut shot = Shot::default();
     let mut f35 = 0.0;
-    let mut ifds = vec![u32_at(4)? as usize];
+    let mut ifds = vec![(u32_at(4)? as usize, false)];
     let mut seen = 0;
-    while let Some(ifd) = ifds.pop() {
+    // GPS: latitude, longitude (degrees, minutes, seconds), their N/S E/W references, altitude and its sign.
+    let (mut lat, mut lon, mut alt, mut refs) = (None::<f64>, None::<f64>, None::<f64>, [b'N', b'E', 0]);
+    while let Some((ifd, is_gps)) = ifds.pop() {
         seen += 1;
         if seen > 4 {
             break;
@@ -386,10 +391,25 @@ pub fn parse_exif(b: &[u8]) -> Option<Shot> {
             let data = if size <= 4 { at + 8 } else { u32_at(at + 8)? as usize };
             let text = || b.get(data..data + count).map(|s| String::from_utf8_lossy(s).trim_end_matches('\0').trim().to_string()).unwrap_or_default();
             let rational = || Some(u32_at(data)? as f32 / u32_at(data + 4)?.max(1) as f32);
+            let rat64 = |k: usize| Some(u32_at(data + 8 * k)? as f64 / u32_at(data + 8 * k + 4)?.max(1) as f64);
+            let dms = || Some(rat64(0)? + rat64(1).unwrap_or(0.0) / 60.0 + rat64(2).unwrap_or(0.0) / 3600.0);
+            if is_gps {
+                match tag {
+                    0x0001 => refs[0] = b.get(at + 8).copied().unwrap_or(b'N'),
+                    0x0002 if count == 3 && typ == 5 => lat = dms(),
+                    0x0003 => refs[1] = b.get(at + 8).copied().unwrap_or(b'E'),
+                    0x0004 if count == 3 && typ == 5 => lon = dms(),
+                    0x0005 => refs[2] = b.get(at + 8).copied().unwrap_or(0),
+                    0x0006 if typ == 5 => alt = rat64(0),
+                    _ => {}
+                }
+                continue;
+            }
             match tag {
                 0x010F => shot.make = text(),
                 0x0110 => shot.model = text(),
-                0x8769 => ifds.push(u32_at(at + 8)? as usize),
+                0x8769 => ifds.push((u32_at(at + 8)? as usize, false)),
+                0x8825 => ifds.push((u32_at(at + 8)? as usize, true)),
                 0x829D => shot.fnum = rational().unwrap_or(0.0),
                 0x829A => shot.shutter = rational().unwrap_or(0.0),
                 0x8827 => shot.iso = u16_at(at + 8).unwrap_or(0) as f32,
@@ -405,6 +425,10 @@ pub fn parse_exif(b: &[u8]) -> Option<Shot> {
     }
     if f35 > 0.0 && shot.focal > 0.0 {
         shot.crop = Some(f35 / shot.focal);
+    }
+    if let (Some(la), Some(lo)) = (lat, lon) {
+        let ele = alt.map(|a| if refs[2] == 1 { -a } else { a });
+        shot.gps = Some(crate::geotag::Location { lat: if refs[0] == b'S' { -la } else { la }, lon: if refs[1] == b'W' { -lo } else { lo }, ele });
     }
     Some(shot)
 }

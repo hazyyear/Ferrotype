@@ -212,6 +212,8 @@ enum Val {
     Short(u16),
     Long(u32),
     Rational(u32, u32),
+    Rationals(Vec<(u32, u32)>),
+    Bytes(Vec<u8>),
 }
 
 /// n/d with small integers, as cameras write them: 1/125 s, 28/10 for f/2.8.
@@ -258,13 +260,36 @@ pub fn exif_tiff(shot: &Shot, description: &str) -> Vec<u8> {
     if !shot.lens.trim().is_empty() {
         exif.push((0xA434, Val::Ascii(shot.lens.trim().to_string())));
     }
+    // GPS IFD: version 2.3, latitude and longitude as degrees, minutes, seconds, and altitude.
+    let mut gps: Vec<(u16, Val)> = vec![];
+    if let Some(g) = shot.gps.filter(|g| g.lat.is_finite() && g.lon.is_finite()) {
+        let dms = |v: f64| {
+            let a = v.abs();
+            let (d, m) = (a.floor(), (a - a.floor()) * 60.0);
+            vec![(d as u32, 1), (m.floor() as u32, 1), (((m - m.floor()) * 60.0 * 10000.0).round() as u32, 10000)]
+        };
+        gps.push((0x0000, Val::Bytes(vec![2, 3, 0, 0])));
+        gps.push((0x0001, Val::Ascii(if g.lat >= 0.0 { "N" } else { "S" }.into())));
+        gps.push((0x0002, Val::Rationals(dms(g.lat))));
+        gps.push((0x0003, Val::Ascii(if g.lon >= 0.0 { "E" } else { "W" }.into())));
+        gps.push((0x0004, Val::Rationals(dms(g.lon))));
+        if let Some(e) = g.ele.filter(|e| e.is_finite()) {
+            gps.push((0x0005, Val::Bytes(vec![(e < 0.0) as u8])));
+            gps.push((0x0006, Val::Rationals(vec![((e.abs() * 10.0).round() as u32, 10)])));
+        }
+    }
     let has_exif = !exif.is_empty();
+    let has_gps = !gps.is_empty();
     if has_exif {
         ifd0.push((0x8769, Val::Long(0))); // offset filled in below
     }
+    if has_gps {
+        ifd0.push((0x8825, Val::Long(0)));
+    }
     let ifd_size = |n: usize| 2 + 12 * n + 4;
     let exif_at = 8 + ifd_size(ifd0.len());
-    let mut data_at = exif_at + if has_exif { ifd_size(exif.len()) } else { 0 };
+    let gps_at = exif_at + if has_exif { ifd_size(exif.len()) } else { 0 };
+    let mut data_at = gps_at + if has_gps { ifd_size(gps.len()) } else { 0 };
     let (mut head, mut data) = (b"II*\0".to_vec(), vec![]);
     head.extend_from_slice(&8u32.to_le_bytes());
     let mut write_ifd = |head: &mut Vec<u8>, entries: &[(u16, Val)]| {
@@ -278,8 +303,14 @@ pub fn exif_tiff(shot: &Shot, description: &str) -> Vec<u8> {
                     (2, b.len() as u32, b)
                 }
                 Val::Short(x) => (3, 1, x.to_le_bytes().to_vec()),
-                Val::Long(x) => (4, 1, if *tag == 0x8769 { (exif_at as u32).to_le_bytes().to_vec() } else { x.to_le_bytes().to_vec() }),
+                Val::Long(x) => (4, 1, match *tag {
+                    0x8769 => (exif_at as u32).to_le_bytes().to_vec(),
+                    0x8825 => (gps_at as u32).to_le_bytes().to_vec(),
+                    _ => x.to_le_bytes().to_vec(),
+                }),
                 Val::Rational(n, d) => (5, 1, [n.to_le_bytes(), d.to_le_bytes()].concat()),
+                Val::Rationals(v) => (5, v.len() as u32, v.iter().flat_map(|(n, d)| [n.to_le_bytes(), d.to_le_bytes()].concat()).collect()),
+                Val::Bytes(b) => (1, b.len() as u32, b.clone()),
             };
             head.extend_from_slice(&typ.to_le_bytes());
             head.extend_from_slice(&count.to_le_bytes());
@@ -303,6 +334,9 @@ pub fn exif_tiff(shot: &Shot, description: &str) -> Vec<u8> {
     write_ifd(&mut head, &ifd0);
     if has_exif {
         write_ifd(&mut head, &exif);
+    }
+    if has_gps {
+        write_ifd(&mut head, &gps);
     }
     head.extend(data);
     head
@@ -347,6 +381,17 @@ pub fn xmp_packet(shot: &Shot, description: &str, keywords: &[String]) -> String
     let t = shot.taken.trim();
     if t.len() >= 19 && t.is_ascii() {
         add("exif:DateTimeOriginal", format!("{}T{}", t[..10].replace(':', "-"), &t[11..19]));
+    }
+    if let Some(g) = shot.gps.filter(|g| g.lat.is_finite() && g.lon.is_finite()) {
+        // XMP writes GPS as "DDD,MM.mmmmmmK".
+        let dm = |v: f64, pos: char, neg: char| { let a = v.abs(); format!("{},{:.6}{}", a.floor(), (a - a.floor()) * 60.0, if v >= 0.0 { pos } else { neg }) };
+        add("exif:GPSVersionID", "2.3.0.0".into());
+        add("exif:GPSLatitude", dm(g.lat, 'N', 'S'));
+        add("exif:GPSLongitude", dm(g.lon, 'E', 'W'));
+        if let Some(e) = g.ele.filter(|e| e.is_finite()) {
+            add("exif:GPSAltitudeRef", if e < 0.0 { "1" } else { "0" }.into());
+            add("exif:GPSAltitude", format!("{}/10", (e.abs() * 10.0).round()));
+        }
     }
     let mut x = String::from("<?xpacket begin=\"\u{feff}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n");
     x += "<rdf:Description rdf:about=\"\" xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:tiff=\"http://ns.adobe.com/tiff/1.0/\" xmlns:exif=\"http://ns.adobe.com/exif/1.0/\" xmlns:exifEX=\"http://cipa.jp/exif/1.0/\" xmlns:aux=\"http://ns.adobe.com/exif/1.0/aux/\"";
@@ -505,6 +550,19 @@ mod tests {
         let x = xmp_packet(&shot, "Roll <12>", &["street".into(), "Lisbon".into()]);
         assert!(x.contains("exif:FNumber=\"28/10\"") && x.contains("<rdf:li>1600</rdf:li>") && x.contains("Roll &lt;12&gt;"));
         assert!(x.contains("<rdf:li>Lisbon</rdf:li>") && x.contains("2026-05-04T12:00:00"));
+    }
+
+    #[test]
+    fn exif_and_xmp_carry_a_location() {
+        let at = crate::geotag::Location { lat: -33.856784, lon: 151.215297, ele: Some(12.5) };
+        let shot = Shot { model: "X100V".into(), iso: 200.0, gps: Some(at), ..Default::default() };
+        let back = crate::lens::parse_exif(&exif_tiff(&shot, "")).unwrap();
+        let g = back.gps.unwrap();
+        assert!((g.lat - at.lat).abs() < 1e-6 && (g.lon - at.lon).abs() < 1e-6 && g.ele == Some(12.5), "{g:?}");
+        assert_eq!((back.model.as_str(), back.iso), ("X100V", 200.0), "the other IFDs still read");
+        let x = xmp_packet(&shot, "", &[]);
+        assert!(x.contains("exif:GPSLatitude=\"33,51.407040S\"") && x.contains("exif:GPSLongitude=\"151,12.917820E\""), "{x}");
+        assert!(crate::lens::parse_exif(&exif_tiff(&Shot { gps: None, ..shot }, "")).unwrap().gps.is_none());
     }
 
     #[test]

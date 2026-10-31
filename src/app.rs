@@ -230,6 +230,8 @@ enum Msg {
     Bursts((usize, usize), Vec<Vec<PathBuf>>),
     /// An edit copy was written and its program started (the copy and the program's name).
     EditOut(Result<(PathBuf, String), String>),
+    /// A GPX track read, with the photos' capture times, ready for the geotag window.
+    Geo(Result<GeoDlg, String>),
     /// A batch rename finished: what moved where.
     Renamed(Result<Vec<(PathBuf, PathBuf)>, String>),
     /// Settings synced to these frames (with their new summaries).
@@ -250,6 +252,15 @@ struct RenameDlg {
     roll: String,
     preview: Vec<(String, String)>,
     previewed: (String, String),
+}
+
+/// The geotag window: a GPX track, the photos to place (with their camera-clock capture times) and the camera
+/// clock's offset from UTC in minutes.
+struct GeoDlg {
+    name: String,
+    track: Vec<crate::geotag::Point>,
+    files: Vec<(PathBuf, Option<i64>)>,
+    offset: i32,
 }
 
 /// A photo read on the loader thread, with its preview sizes already made, so opening doesn't stall the UI.
@@ -400,6 +411,7 @@ pub struct App {
     target_mode: usize,
     target_hit: Option<develop::Target>,
     rename_dlg: Option<RenameDlg>,
+    geo_dlg: Option<GeoDlg>,
     mask_ui: MaskUi,
     tool: Tool,
     chart: ChartUi,
@@ -718,7 +730,7 @@ impl App {
             history: vec![Params::default()], hist_pos: 0, copied: None, view: View::After, holding_before: false, picking_base: false,
             status: String::new(), presets, preset_tex: vec![], last_preset: None, preset_mix: None, preset_amt: 100.0, preset_name: String::new(), stock_query: String::new(), my_stocks: negative::custom_stocks(), my_stock_name: String::new(), proof: 0,
             stock_tab: 0, mixer_tab: 0, open: [true, false, false, false, false, false, false, false, false, false, false, false, false, false], tool: Tool::None,
-            zoom: None, curve_chan: 0, curve_grab: None, curve_big: false, samples: vec![], target_mode: 0, target_hit: None, rename_dlg: None, mask_ui: MaskUi::default(), chart: ChartUi::new(), profiles: crate::calib::saved(),
+            zoom: None, curve_chan: 0, curve_grab: None, curve_big: false, samples: vec![], target_mode: 0, target_hit: None, rename_dlg: None, geo_dlg: None, mask_ui: MaskUi::default(), chart: ChartUi::new(), profiles: crate::calib::saved(),
             crop_grab: None, crop_aspect: 0, spot_size: 2.0, heal_clone: false, spot_sel: None, heal_drag: None, view_map: [1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0], photo_wh: [1.0, 1.0],
             export: ExportOpts::load(), editors: crate::editors::all(), edit_watch: vec![], edit_watch_at: 0.0, export_dialog: None, export_sel: vec![], export_sets: [false; 3], keymap: Keymap::load(), keys_open: false, colour: crate::colour::Settings::load(), printer: None, binding: None, picking_wb: false,
             thumb_due: false, lens_query: String::new(), lib_multi: vec![], pano_busy: false,
@@ -1062,6 +1074,13 @@ impl App {
                     }
                 }
                 Msg::Status(s) => self.status = s,
+                Msg::Geo(r) => match r {
+                    Ok(d) => {
+                        self.status.clear();
+                        self.geo_dlg = Some(d);
+                    }
+                    Err(e) => self.status = format!("Geotag: {e}"),
+                },
                 Msg::EditOut(r) => match r {
                     Ok((out, name)) => {
                         self.status = format!("Opened {} in {name}. Save it there and it updates here", out.file_name().unwrap_or_default().to_string_lossy());
@@ -1663,6 +1682,82 @@ impl App {
         }
     }
 
+    /// Pick a GPX track, then read it and the capture times of `files` off the UI thread.
+    fn start_geotag(&mut self, files: Vec<PathBuf>) {
+        let Some(gpx) = rfd::FileDialog::new().set_title("Choose a GPX track").add_filter("GPX track", &["gpx"]).pick_file() else { return };
+        self.status = "Reading the track…".into();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let r = crate::geotag::read_gpx(&gpx).map(|track| {
+                let files: Vec<(PathBuf, Option<i64>)> = files.par_iter().filter(|f| load::copy_of(f).is_none())
+                    .map(|f| (f.clone(), crate::lens::shot(f).and_then(|s| crate::geotag::camera_seconds(&s.taken)))).collect();
+                let times: Vec<i64> = files.iter().filter_map(|f| f.1).collect();
+                let offset = crate::geotag::guess_offset(&track, &times);
+                GeoDlg { name: gpx.file_name().unwrap_or_default().to_string_lossy().to_string(), track, files, offset }
+            });
+            let _ = tx.send(Msg::Geo(r));
+        });
+    }
+
+    fn geotag_window(&mut self, ctx: &egui::Context) {
+        let Some(d) = &mut self.geo_dlg else { return };
+        let placed: Vec<(PathBuf, crate::geotag::Gps)> = d.files.iter()
+            .filter_map(|(f, t)| Some((f.clone(), crate::geotag::locate(&d.track, (*t)? - d.offset as i64 * 60)?))).collect();
+        let mut go = false;
+        let open = dialog(ctx, "geotag", "Geotag from a GPX track", 380.0, |ui| {
+            let (a, b) = (d.track.first().map(|p| p.t).unwrap_or(0), d.track.last().map(|p| p.t).unwrap_or(0));
+            ui.label(RichText::new(format!("{} has {} points over {:.1} hours.", d.name, d.track.len(), (b - a) as f32 / 3600.0)).size(12.0).color(TEXT2));
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Camera clock").size(12.0).color(LABEL));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button("Guess").on_hover_text("Finds the time zone that puts the most photos on the track").clicked() {
+                        let times: Vec<i64> = d.files.iter().filter_map(|f| f.1).collect();
+                        d.offset = crate::geotag::guess_offset(&d.track, &times);
+                    }
+                    if ui.button("+").clicked() {
+                        d.offset = (d.offset + 15).min(14 * 60);
+                    }
+                    ui.label(RichText::new(format!("UTC{:+}:{:02}", d.offset / 60, (d.offset % 60).abs())).monospace().size(12.0));
+                    if ui.button("−").clicked() {
+                        d.offset = (d.offset - 15).max(-14 * 60);
+                    }
+                });
+            });
+            ui.label(RichText::new("The time zone the camera's clock was set to. A camera an hour fast in UTC+1 is UTC+2.").size(11.5).color(TEXT2));
+            ui.add_space(6.0);
+            let no_time = d.files.iter().filter(|f| f.1.is_none()).count();
+            let mut msg = format!("{} of {} photos fall on the track.", placed.len(), d.files.len());
+            if no_time > 0 {
+                msg += &format!(" {no_time} have no capture time.");
+            }
+            ui.label(RichText::new(msg).size(12.0));
+            ui.label(RichText::new("Locations are saved with the edits. Exports include them only when you switch on Location in Print.").size(11.5).color(TEXT2));
+            go = primary(ui, &format!("Place {} photos", placed.len()), !placed.is_empty()).clicked();
+        });
+        if go {
+            self.commit();
+            let mut n = 0;
+            for (f, g) in &placed {
+                let mut p = if self.current.as_ref() == Some(f) { self.params.clone() } else { read_params(f).unwrap_or_default() };
+                p.gps = Some((*g).into());
+                if write_params(f, &p).is_ok() {
+                    n += 1;
+                    if self.current.as_ref() == Some(f) {
+                        self.params.gps = p.gps;
+                        for h in &mut self.history {
+                            h.gps = p.gps;
+                        }
+                    }
+                }
+            }
+            self.status = format!("Placed {n} photos on the map");
+        }
+        if go || !open {
+            self.geo_dlg = None;
+        }
+    }
+
     /// Export settings: format, size and quality, then the file or folder dialog.
     fn export_window(&mut self, ctx: &egui::Context) {
         let Some(all) = self.export_dialog else { return };
@@ -1765,6 +1860,11 @@ impl App {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("Camera, lens, roll & stock in JPEG").size(12.0).color(LABEL));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| switch(ui, &mut o.meta));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Location (GPS), if the photo has one").size(12.0).color(LABEL))
+                            .on_hover_text("Off by default, so shared photos don't show where they were taken");
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| switch(ui, &mut o.gps));
                     });
                 });
                 if all && self.export_sel.is_empty() {
@@ -3301,6 +3401,10 @@ impl App {
                     self.export_sel.clear();
                     self.export_dialog = Some(true);
                 }
+                if ui.add_enabled(!self.files.is_empty(), egui::Button::new("Geotag…")).on_hover_text("Place photos on the map from a GPX track (phone, watch or GPS logger). Uses the selected photos, or all shown").clicked() {
+                    let files = if self.lib_multi.len() >= 2 { self.lib_multi.clone() } else { self.lib_visible() };
+                    self.start_geotag(files);
+                }
                 if ui.add_enabled(!self.files.is_empty(), egui::Button::new("Contact sheet…")).on_hover_text("One image of every photo shown, numbered, like a darkroom contact print").clicked() {
                     self.make_contact_sheet();
                 }
@@ -3797,6 +3901,18 @@ impl App {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(k).size(12.0).color(TEXT3));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.label(RichText::new(v).size(12.0)));
+            });
+        }
+        let gps = if self.current.as_ref() == Some(&f) { self.params.gps } else { read_params(&f).and_then(|p| p.gps) };
+        if let Some(g) = gps {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Location").size(12.0).color(TEXT3));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.add(egui::Button::new(RichText::new("Map").size(12.0)).small()).on_hover_text("Open this place on OpenStreetMap").clicked() {
+                        ui.ctx().open_url(egui::OpenUrl::new_tab(crate::geotag::map_url(&g.gps())));
+                    }
+                    ui.label(RichText::new(crate::geotag::describe(&g.gps())).size(12.0));
+                });
             });
         }
         // Rating and flag, also on the keyboard: 0–5, P pick, X reject, U clear.
@@ -5643,6 +5759,7 @@ impl eframe::App for App {
         }
         self.export_window(&ctx);
         self.rename_window(&ctx);
+        self.geotag_window(&ctx);
         self.keys_window(&ctx);
         // One history step (and one sidecar write) per caption, not per keystroke.
         if !ctx.input(|i| i.pointer.any_down()) && !ctx.memory(|m| m.has_focus(egui::Id::NULL.with("caption"))) {
