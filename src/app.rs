@@ -2538,6 +2538,31 @@ impl App {
         }
     }
 
+    /// Web gallery of the selected photos (or all shown), in a new folder inside one the user picks.
+    fn make_gallery(&mut self) {
+        let files = if self.lib_multi.len() >= 2 { let mut f = self.lib_multi.clone(); load::sort_photos(&mut f); f } else { self.lib_visible() };
+        let Some(parent) = rfd::FileDialog::new().set_title("Where to put the gallery folder").pick_folder() else { return };
+        let title = match (&self.collection, &self.folder) {
+            (Some(c), _) => c.clone(),
+            (None, Some(d)) => d.file_name().unwrap_or_default().to_string_lossy().to_string(),
+            _ => "Photos".into(),
+        };
+        self.commit();
+        self.status = format!("Making a web gallery of {} photos…", files.len());
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let o = crate::gallery::Options { title: title.clone(), ..Default::default() };
+            let r = crate::gallery::new_folder(&parent, &title).and_then(|dir| {
+                let tx2 = tx.clone();
+                crate::gallery::make(&files, &dir, &o, &move |n, t| { let _ = tx2.send(Msg::Status(format!("Web gallery: {n} of {t}…"))); })
+            });
+            let _ = tx.send(Msg::Status(match r {
+                Ok(page) => format!("Web gallery saved: {}", page.parent().unwrap_or(&page).display()),
+                Err(e) => format!("Web gallery failed: {e}"),
+            }));
+        });
+    }
+
     fn make_contact_sheet(&mut self) {
         let files = self.lib_visible();
         let Some(mut out) = rfd::FileDialog::new().set_file_name("contact-sheet.jpg").add_filter("JPEG", &["jpg"]).save_file() else { return };
@@ -3400,6 +3425,9 @@ impl App {
                 if ui.add_enabled(!self.files.is_empty(), egui::Button::new("Print all…")).clicked() {
                     self.export_sel.clear();
                     self.export_dialog = Some(true);
+                }
+                if ui.add_enabled(!self.files.is_empty(), egui::Button::new("Web gallery…")).on_hover_text("A folder with a web page of the photos shown (or selected), ready to upload anywhere").clicked() {
+                    self.make_gallery();
                 }
                 if ui.add_enabled(!self.files.is_empty(), egui::Button::new("Geotag…")).on_hover_text("Place photos on the map from a GPX track (phone, watch or GPS logger). Uses the selected photos, or all shown").clicked() {
                     let files = if self.lib_multi.len() >= 2 { self.lib_multi.clone() } else { self.lib_visible() };

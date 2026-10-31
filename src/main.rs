@@ -27,6 +27,7 @@ mod focus;
 mod bursts;
 mod editors;
 mod geotag;
+mod gallery;
 
 use develop::Params;
 use image::{DynamicImage, Rgb32FImage, codecs::jpeg::JpegEncoder};
@@ -584,6 +585,8 @@ ferrotype hdr --auto FOLDER     find brackets (by capture time and exposure) and
 ferrotype geotag --gpx TRACK.gpx [--offset HOURS] [--dry-run] FILES...
                                 give photos the GPX track's position when they were taken; --offset is the
                                 camera clock's time zone (+2 = UTC+2), guessed from the track when left out
+ferrotype gallery [--out FOLDER] [--title TEXT] [--size PX] [--no-details] FILES...
+                                a web gallery (index.html, photos, thumbnails) to upload anywhere
 ferrotype stack FILES...        focus-stack photos focused at different distances into FIRST-stack.exr
 ferrotype contact [--out FILE] [--cols N] FILES...
                                 one contact sheet image of all FILES (default contact.jpg, 6 columns)
@@ -844,6 +847,38 @@ fn cli_geotag(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn cli_gallery(args: &[String]) -> Result<(), String> {
+    let (mut out, mut o, mut files) = (None::<PathBuf>, gallery::Options::default(), vec![]);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--out" => out = Some(it.next().ok_or("--out needs a folder")?.into()),
+            "--title" => o.title = it.next().ok_or("--title needs a title")?.clone(),
+            "--size" => o.size = it.next().and_then(|v| v.parse().ok()).ok_or("--size needs the long edge in pixels")?,
+            "--no-details" => o.details = false,
+            f => files.push(PathBuf::from(f)),
+        }
+    }
+    let mut files: Vec<PathBuf> = files.iter().flat_map(|f| if f.is_dir() { photos_under(f).into_iter().map(|p| p.1).collect() } else { vec![f.clone()] }).collect();
+    if files.is_empty() {
+        return Err(USAGE.into());
+    }
+    load::sort_photos(&mut files);
+    let dir = match out {
+        Some(d) => {
+            std::fs::create_dir_all(&d).map_err(|e| e.to_string())?;
+            if d.join("index.html").exists() {
+                return Err(format!("{} already has a gallery: choose another folder", d.display()));
+            }
+            d
+        }
+        None => gallery::new_folder(Path::new("."), &o.title)?,
+    };
+    let page = gallery::make(&files, &dir, &o, &|n, t| eprintln!("{n}/{t}"))?;
+    println!("{}", page.display());
+    Ok(())
+}
+
 fn cli_stack(args: &[String]) -> Result<(), String> {
     let mut files: Vec<PathBuf> = args.iter().map(PathBuf::from).collect();
     if files.len() < 2 {
@@ -937,6 +972,7 @@ fn main() {
         Some("hdr") => cli_hdr(&args[1..]),
         Some("stack") => cli_stack(&args[1..]),
         Some("geotag") => cli_geotag(&args[1..]),
+        Some("gallery") => cli_gallery(&args[1..]),
         Some("lens") => {
             for f in &args[1..] {
                 let shot = lens::shot(Path::new(f)).unwrap_or_default();
