@@ -31,10 +31,12 @@ pub const ACTIONS: &[(&str, &str, &str)] = &[
     ("heal", "Heal tool", "Q"),
     ("gradient", "Linear mask", "M"),
     ("brush", "Brush mask", "K"),
+    ("target", "Targeted adjustment", "T"),
     ("wb", "White balance picker", "W"),
     ("rot_left", "Rotate left", "OpenBracket"),
     ("rot_right", "Rotate right", "CloseBracket"),
     ("vcopy", "Virtual copy", "Shift+V"),
+    ("edit_in", "Edit in another program", "E"),
     ("snapshot", "New snapshot", "Shift+S"),
     ("focus", "Focus check (culling)", "F"),
 ];

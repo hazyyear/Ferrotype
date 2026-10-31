@@ -123,6 +123,9 @@ pub struct Params {
     /// rating: never copied by paste, presets or sync.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub keywords: Vec<String>,
+    /// Where it was taken (from a GPX track). Belongs to the photo: never copied by paste, presets or sync.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gps: Option<crate::geotag::Location>,
     /// 1 = made before the camera curve existed (settings tuned on the flat look, so it never gets one);
     /// 2 = starts from the camera's look. `read_params` marks a sidecar without the field as 1.
     pub process: u8,
@@ -296,7 +299,7 @@ impl Default for Params {
             grads: vec![],
             brushes: vec![],
             masks: vec![],
-            rot90: 0, label: 0, ai_nr: 0.0, ir_clean: 0.0, keywords: vec![], snapshots: vec![],
+            rot90: 0, label: 0, ai_nr: 0.0, ir_clean: 0.0, keywords: vec![], gps: None, snapshots: vec![],
             lens: String::new(), lens_focal: 0.0, lens_f: 0.0, lens_crop: 1.0, lens_dist: 100.0, lens_vig: 100.0,
             profile: None,
             cam_curve: vec![],
@@ -323,6 +326,7 @@ impl Params {
         p.profile = self.profile.clone();
         (p.cam_curve, p.process) = (self.cam_curve.clone(), self.process);
         p.keywords = self.keywords.clone();
+        p.gps = self.gps;
         p.strip_frame = self.strip_frame;
         p
     }
@@ -353,7 +357,7 @@ impl Params {
         let (Ok(a), Ok(b)) = (serde_json::to_value(from), serde_json::to_value(to)) else { return to.clone() };
         let mut p: Params = serde_json::from_value(mix(&a, &b, t as f64)).unwrap_or_else(|_| to.clone());
         // Ratings and the like are never part of a look.
-        (p.rating, p.flag, p.label) = (from.rating, from.flag, from.label);
+        (p.rating, p.flag, p.label, p.gps) = (from.rating, from.flag, from.label, from.gps);
         (p.cam_curve, p.process) = (from.cam_curve.clone(), from.process);
         p
     }
@@ -400,7 +404,7 @@ impl Params {
 
     /// True when the photo has edits, ignoring its rating, flag, label and snapshots.
     pub fn is_edited(&self) -> bool {
-        Params { rating: 0, flag: 0, label: 0, snapshots: vec![], cam_curve: vec![], process: 2, keywords: vec![], strip_frame: false, ..self.clone() } != Params::default()
+        Params { rating: 0, flag: 0, label: 0, snapshots: vec![], cam_curve: vec![], process: 2, keywords: vec![], gps: None, strip_frame: false, ..self.clone() } != Params::default()
     }
 
     /// Turn a quarter clockwise (or back), carrying the crop, spots, filters and brush strokes along.
@@ -1234,6 +1238,45 @@ fn bump(x: f32, center: f32, width: f32) -> f32 {
     (1.0 - t * t).max(0.0).powi(2)
 }
 
+/// What a targeted adjustment (dragging on the photo) changes: how much the picked colour belongs to each
+/// tone-curve region (Shadows, Darks, Lights, Highlights) and which two mixer bands its hue lies between.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Target {
+    pub tone: [f32; 4],
+    pub bands: (usize, usize, f32),
+    /// Grey colours have no hue, so the mixer modes leave them alone.
+    pub sat: f32,
+}
+
+/// The targeted-adjustment weights for a rendered (display sRGB) colour. The strongest tone region gets 1.
+pub fn target_at(rgb: [u8; 3]) -> Target {
+    let e = rgb.map(|v| v as f32 / 255.0);
+    let l = luma(e).clamp(0.0, 1.0);
+    let mut tone = [bump(l, 0.12, 0.2), bump(l, 0.35, 0.22), bump(l, 0.62, 0.22), bump(l, 0.88, 0.2)];
+    let mx = tone.iter().cloned().fold(0.0, f32::max);
+    if mx > 1e-6 {
+        tone = tone.map(|t| t / mx);
+    }
+    let (h, s, _) = rgb_to_hsv(e);
+    Target { tone, bands: band_pair(h), sat: s }
+}
+
+/// Apply a targeted drag of `amount` slider units. Mode 0 moves the tone-curve regions, 1 to 3 move mixer
+/// Hue, Saturation or Luminance for the picked colour's bands.
+pub fn apply_target(p: &mut Params, t: &Target, mode: usize, amount: f32) {
+    let step = |v: &mut f32, w: f32| *v = (*v + amount * w).clamp(-100.0, 100.0);
+    if mode == 0 {
+        for (v, w) in [&mut p.c_sh, &mut p.c_da, &mut p.c_li, &mut p.c_hi].into_iter().zip(t.tone) {
+            step(v, w);
+        }
+    } else if t.sat > 0.04 {
+        let (a, b, f) = t.bands;
+        let k = (mode - 1).min(2);
+        step(&mut p.hsl[a][k], 1.0 - f);
+        step(&mut p.hsl[b][k], f);
+    }
+}
+
 /// Parametric tone curve (Highlights, Lights, Darks, Shadows regions) on perceptual luminance.
 pub fn tone_curve(l: f32, p: &Params) -> f32 {
     l + 0.15 * (p.c_sh / 100.0 * bump(l, 0.12, 0.2) + p.c_da / 100.0 * bump(l, 0.35, 0.22) + p.c_li / 100.0 * bump(l, 0.62, 0.22) + p.c_hi / 100.0 * bump(l, 0.88, 0.2))
@@ -1832,6 +1875,23 @@ pub fn auto_tone(src: &Rgb32FImage, p: &Params) -> Params {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn target_picks_region_and_band() {
+        let dark = target_at([20, 20, 20]);
+        assert_eq!(dark.tone[0], 1.0);
+        assert!(dark.tone[3] == 0.0);
+        let mut p = Params::default();
+        apply_target(&mut p, &dark, 3, 20.0);
+        assert_eq!(p.hsl, Params::default().hsl, "grey has no hue to move");
+        apply_target(&mut p, &dark, 0, 20.0);
+        assert_eq!(p.c_sh, 20.0);
+        let red = target_at([220, 30, 30]);
+        apply_target(&mut p, &red, 2, -30.0);
+        assert!(p.hsl[0][1] < -20.0, "red saturation down: {:?}", p.hsl[0]);
+        apply_target(&mut p, &red, 2, -500.0);
+        assert_eq!(p.hsl[0][1], -100.0);
+    }
 
     #[test]
     fn band_pair_matches_band_weight() {

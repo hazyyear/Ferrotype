@@ -23,6 +23,11 @@ mod roll;
 mod colour;
 mod demosaic;
 mod library;
+mod focus;
+mod bursts;
+mod editors;
+mod geotag;
+mod gallery;
 
 use develop::Params;
 use image::{DynamicImage, Rgb32FImage, codecs::jpeg::JpegEncoder};
@@ -253,6 +258,8 @@ pub struct ExportOpts {
     pub roll: String,
     /// JPEG: write camera, lens, roll and film stock (never GPS or serial numbers).
     pub meta: bool,
+    /// Write the photo's location (from a GPX track, or the camera's own) into the file. Off unless asked for.
+    pub gps: bool,
     /// Exporting a folder: include its subfolders and recreate the folder tree in the destination.
     pub tree: bool,
     /// Colour space of the file (sRGB, Display P3, Adobe RGB, ProPhoto), with its ICC profile embedded.
@@ -267,7 +274,7 @@ impl Default for ExportOpts {
         Self {
             ext: "jpg", long_edge: 0, quality: 92, hdr: false, canvas: [0, 0], print: [0.0, 0.0, 300.0], print_fill: false,
             wm_text: String::new(), wm_logo: String::new(), wm_pos: 0, wm_size: 4.0, wm_opacity: 70.0,
-            name: String::new(), roll: String::new(), meta: false, tree: false, upright: None, space: colour::Space::Srgb,
+            name: String::new(), roll: String::new(), meta: false, gps: false, tree: false, upright: None, space: colour::Space::Srgb,
         }
     }
 }
@@ -359,9 +366,11 @@ pub fn export_description(p: &Params, o: &ExportOpts, src: &Path) -> String {
 /// What the export of `src` carries besides pixels: camera details when `o.meta` asks for them, print DPI.
 pub fn export_embed(p: &Params, o: &ExportOpts, src: &Path) -> output::Embed {
     let mut e = output::Embed { dpi: (o.print[0] > 0.0 && o.canvas[0] == 0).then(|| o.print[2].round() as u16), icc: o.space.icc(), ..Default::default() };
-    if o.meta {
-        let shot = export_shot(src);
-        let desc = export_description(p, o, src);
+    let location = if o.gps { p.gps.or_else(|| lens::shot(src).and_then(|s| s.gps)) } else { None };
+    if o.meta || location.is_some() {
+        let mut shot = if o.meta { export_shot(src) } else { lens::Shot::default() };
+        shot.gps = location;
+        let desc = if o.meta { export_description(p, o, src) } else { String::new() };
         e.exif = output::exif_tiff(&shot, &desc);
         e.xmp = output::xmp_packet(&shot, &desc, &p.keywords);
     }
@@ -561,10 +570,10 @@ const USAGE: &str = "ferrotype                      open the editor
 ferrotype <folder|file>         open the editor on a folder or photo
 ferrotype export [--out DIR] [--tif|--png|--hdr] [--size PX] [--quality Q] [--neg STOCK] [--lens] [--upright MODE] [--space SPACE] FILES...
                 [--set instagram|story|portfolio] [--print 8x10|20x30cm] [--dpi N] [--watermark TEXT] [--logo PNG]
-                [--name PATTERN] [--roll N] [--meta]
+                [--name PATTERN] [--roll N] [--meta] [--gps]
                                 render files with their saved edits (headless); --lens adds the lens profile;
                                 --name uses {name} {n} {date} {roll} {stock} {camera} {lens};
-                                --meta writes camera, lens, roll and stock into the JPEG;
+                                --meta writes camera, lens, roll and stock into the JPEG; --gps adds the location;
                                 a FOLDER is exported with its subfolders, keeping the folder tree
 ferrotype rename --name PATTERN [--roll N] [--dry-run] FILES...
                                 rename photos and their edits from a pattern (tokens as for export)
@@ -573,6 +582,12 @@ ferrotype pano [--projection auto|cylindrical|spherical|perspective] FILES...
                                 merge overlapping photos into FIRST-pano.tif
 ferrotype hdr FILES...          merge an exposure bracket into FIRST-hdr.exr (32-bit, opens like any photo)
 ferrotype hdr --auto FOLDER     find brackets (by capture time and exposure) and merge each
+ferrotype geotag --gpx TRACK.gpx [--offset HOURS] [--dry-run] FILES...
+                                give photos the GPX track's position when they were taken; --offset is the
+                                camera clock's time zone (+2 = UTC+2), guessed from the track when left out
+ferrotype gallery [--out FOLDER] [--title TEXT] [--size PX] [--no-details] FILES...
+                                a web gallery (index.html, photos, thumbnails) to upload anywhere
+ferrotype stack FILES...        focus-stack photos focused at different distances into FIRST-stack.exr
 ferrotype contact [--out FILE] [--cols N] FILES...
                                 one contact sheet image of all FILES (default contact.jpg, 6 columns)
 ferrotype lens FILES...         show which lens profile each photo gets
@@ -604,6 +619,7 @@ fn cli_export(args: &[String]) -> Result<(), String> {
             "--name" => o.name = it.next().ok_or("--name needs a pattern like \"{roll}-{n}\"")?.clone(),
             "--roll" => o.roll = it.next().ok_or("--roll needs a roll number")?.clone(),
             "--meta" => o.meta = true,
+            "--gps" => o.gps = true,
             "--watermark" => o.wm_text = it.next().ok_or("--watermark needs text")?.clone(),
             "--logo" => o.wm_logo = it.next().ok_or("--logo needs an image file")?.clone(),
             "--print" => {
@@ -795,6 +811,85 @@ fn cli_hdr(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn cli_geotag(args: &[String]) -> Result<(), String> {
+    let (mut gpx, mut offset, mut dry, mut files) = (None::<PathBuf>, None::<i32>, false, vec![]);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--gpx" => gpx = Some(it.next().ok_or("--gpx needs a track file")?.into()),
+            "--offset" => offset = Some((it.next().and_then(|v| v.parse::<f32>().ok()).ok_or("--offset needs hours, like +2 or -5.5")? * 60.0).round() as i32),
+            "--dry-run" => dry = true,
+            f => files.push(PathBuf::from(f)),
+        }
+    }
+    let gpx = gpx.ok_or(USAGE)?;
+    let track = geotag::read_gpx(&gpx)?;
+    let times: Vec<(PathBuf, Option<i64>)> = files.iter().map(|f| (f.clone(), lens::shot(f).and_then(|s| geotag::camera_seconds(&s.taken)))).collect();
+    let minutes = offset.unwrap_or_else(|| geotag::guess_offset(&track, &times.iter().filter_map(|t| t.1).collect::<Vec<_>>()));
+    println!("Camera clock at UTC{:+}:{:02}", minutes / 60, (minutes % 60).abs());
+    let mut n = 0;
+    for (f, t) in times {
+        let at = t.and_then(|t| geotag::locate(&track, t - minutes as i64 * 60));
+        match at {
+            Some(g) => {
+                n += 1;
+                println!("{}  {}", f.display(), geotag::describe(&g));
+                if !dry {
+                    let mut p = read_params(&f).unwrap_or_default();
+                    p.gps = Some(g.into());
+                    write_params(&f, &p).map_err(|e| e.to_string())?;
+                }
+            }
+            None => println!("{}  (not on the track)", f.display()),
+        }
+    }
+    println!("{n} of {} photos placed{}", files.len(), if dry { " (dry run, nothing saved)" } else { "" });
+    Ok(())
+}
+
+fn cli_gallery(args: &[String]) -> Result<(), String> {
+    let (mut out, mut o, mut files) = (None::<PathBuf>, gallery::Options::default(), vec![]);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--out" => out = Some(it.next().ok_or("--out needs a folder")?.into()),
+            "--title" => o.title = it.next().ok_or("--title needs a title")?.clone(),
+            "--size" => o.size = it.next().and_then(|v| v.parse().ok()).ok_or("--size needs the long edge in pixels")?,
+            "--no-details" => o.details = false,
+            f => files.push(PathBuf::from(f)),
+        }
+    }
+    let mut files: Vec<PathBuf> = files.iter().flat_map(|f| if f.is_dir() { photos_under(f).into_iter().map(|p| p.1).collect() } else { vec![f.clone()] }).collect();
+    if files.is_empty() {
+        return Err(USAGE.into());
+    }
+    load::sort_photos(&mut files);
+    let dir = match out {
+        Some(d) => {
+            std::fs::create_dir_all(&d).map_err(|e| e.to_string())?;
+            if d.join("index.html").exists() {
+                return Err(format!("{} already has a gallery: choose another folder", d.display()));
+            }
+            d
+        }
+        None => gallery::new_folder(Path::new("."), &o.title)?,
+    };
+    let page = gallery::make(&files, &dir, &o, &|n, t| eprintln!("{n}/{t}"))?;
+    println!("{}", page.display());
+    Ok(())
+}
+
+fn cli_stack(args: &[String]) -> Result<(), String> {
+    let mut files: Vec<PathBuf> = args.iter().map(PathBuf::from).collect();
+    if files.len() < 2 {
+        return Err(USAGE.into());
+    }
+    load::sort_photos(&mut files);
+    let out = focus::stack_files(&files, &|s| eprintln!("{s}…"))?;
+    println!("{} -> {}", files.len(), out.display());
+    Ok(())
+}
+
 fn cli_rename(args: &[String]) -> Result<(), String> {
     let (mut pattern, mut roll, mut dry, mut files) = (String::new(), String::new(), false, vec![]);
     let mut it = args.iter();
@@ -875,6 +970,9 @@ fn main() {
         Some("pano") => cli_pano(&args[1..]),
         Some("rename") => cli_rename(&args[1..]),
         Some("hdr") => cli_hdr(&args[1..]),
+        Some("stack") => cli_stack(&args[1..]),
+        Some("geotag") => cli_geotag(&args[1..]),
+        Some("gallery") => cli_gallery(&args[1..]),
         Some("lens") => {
             for f in &args[1..] {
                 let shot = lens::shot(Path::new(f)).unwrap_or_default();

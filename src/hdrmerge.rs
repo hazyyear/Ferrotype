@@ -99,7 +99,7 @@ pub fn merge(imgs: &[Rgb32FImage], shots: &[Shot], progress: &dyn Fn(&str)) -> R
 }
 
 /// `img` resampled so that output pixel p shows img at H⁻¹·p (H maps img into the reference).
-fn warp(img: &Rgb32FImage, hm: &[[f64; 3]; 3]) -> Rgb32FImage {
+pub(crate) fn warp(img: &Rgb32FImage, hm: &[[f64; 3]; 3]) -> Rgb32FImage {
     let m = hm;
     let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
     let inv = [

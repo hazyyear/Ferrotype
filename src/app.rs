@@ -49,6 +49,8 @@ enum Tool {
     Heal,
     Mask,
     Sample,
+    /// Targeted adjustment: drag up or down on the photo to change the curve or mixer for the colour under the pointer.
+    Target,
     /// Place a colour chart on the photo to build a camera or scanner profile.
     Chart,
 }
@@ -222,6 +224,14 @@ enum Msg {
     Pano(Result<PathBuf, String>),
     /// HDR merges finished: the files written (or the first error).
     Hdr(Result<Vec<PathBuf>, String>),
+    /// A focus stack finished: the file written.
+    Stacked(Result<PathBuf, String>),
+    /// Burst and duplicate groups found for a folder (its generation and photo count).
+    Bursts((usize, usize), Vec<Vec<PathBuf>>),
+    /// An edit copy was written and its program started (the copy and the program's name).
+    EditOut(Result<(PathBuf, String), String>),
+    /// A GPX track read, with the photos' capture times, ready for the geotag window.
+    Geo(Result<GeoDlg, String>),
     /// A batch rename finished: what moved where.
     Renamed(Result<Vec<(PathBuf, PathBuf)>, String>),
     /// Settings synced to these frames (with their new summaries).
@@ -242,6 +252,15 @@ struct RenameDlg {
     roll: String,
     preview: Vec<(String, String)>,
     previewed: (String, String),
+}
+
+/// The geotag window: a GPX track, the photos to place (with their camera-clock capture times) and the camera
+/// clock's offset from UTC in minutes.
+struct GeoDlg {
+    name: String,
+    track: Vec<crate::geotag::Point>,
+    files: Vec<(PathBuf, Option<i64>)>,
+    offset: i32,
 }
 
 /// A photo read on the loader thread, with its preview sizes already made, so opening doesn't stall the UI.
@@ -333,6 +352,13 @@ pub struct App {
     lib_sel: Option<PathBuf>,
     lib_query: String,
     lib_filter: [bool; 5], // RAW, JPEG, TIFF, Other, Edited only
+    /// Library: show bursts and duplicates as one thumbnail. `bursts` are the groups found for `bursts_key`
+    /// (folder generation, photo count), `burst_open` the groups shown expanded (by their first photo).
+    stack_bursts: bool,
+    bursts: Vec<Vec<PathBuf>>,
+    burst_of: std::collections::HashMap<PathBuf, usize>,
+    burst_open: std::collections::HashSet<PathBuf>,
+    bursts_key: Option<(usize, usize)>,
     current: Option<PathBuf>,
     photo: Option<Photo>,
     loading: bool,
@@ -381,7 +407,11 @@ pub struct App {
     curve_big: bool,
     /// Colour sample points pinned on the photo (fractions of the photo without its border), for this session.
     samples: Vec<[f32; 2]>,
+    /// Targeted adjustment: 0 tone curve, 1 hue, 2 saturation, 3 luminance; and what the current drag picked.
+    target_mode: usize,
+    target_hit: Option<develop::Target>,
     rename_dlg: Option<RenameDlg>,
+    geo_dlg: Option<GeoDlg>,
     mask_ui: MaskUi,
     tool: Tool,
     chart: ChartUi,
@@ -398,6 +428,11 @@ pub struct App {
     view_map: [f32; 8],
     photo_wh: [f32; 2],
     export: ExportOpts,
+    /// "Edit in…" programs, and the edit copies handed to them (with the time they were last changed), watched so
+    /// a save there refreshes the thumbnail.
+    editors: Vec<crate::editors::Editor>,
+    edit_watch: Vec<(PathBuf, Option<std::time::SystemTime>)>,
+    edit_watch_at: f64,
     /// Some(false) = export this photo, Some(true) = export the folder.
     export_dialog: Option<bool>,
     keymap: Keymap,
@@ -690,14 +725,14 @@ impl App {
         Self {
             module: Module::Library, folder: None, files: vec![], thumbs: Default::default(), thumb_used: Default::default(), thumb_want: Default::default(), thumb_pending: Default::default(), thumb_ready: Default::default(), frame: 0, thumb_gen: Default::default(), load_gen: Default::default(), open_error: None, meta: Default::default(), lib_rating: 0,
             subdirs: vec![], tex_scale: 1.0, thumb_size: 190.0, lib_sel: None, lib_query: String::new(),
-            lib_filter: [true, true, true, true, false], current: None, photo: None, loading: false, params: Params::default(), prev_params: None,
+            lib_filter: [true, true, true, true, false], stack_bursts: false, bursts: vec![], burst_of: Default::default(), burst_open: Default::default(), bursts_key: None, current: None, photo: None, loading: false, params: Params::default(), prev_params: None,
             rendered: None, render_busy: false, photo_gen: 0, tex: None, before_tex: None, last_rgb: None, hover_rgb: None, shown_w: 0.0, bins: [[0.0; 128]; 3], clip_view: false,
             history: vec![Params::default()], hist_pos: 0, copied: None, view: View::After, holding_before: false, picking_base: false,
             status: String::new(), presets, preset_tex: vec![], last_preset: None, preset_mix: None, preset_amt: 100.0, preset_name: String::new(), stock_query: String::new(), my_stocks: negative::custom_stocks(), my_stock_name: String::new(), proof: 0,
             stock_tab: 0, mixer_tab: 0, open: [true, false, false, false, false, false, false, false, false, false, false, false, false, false], tool: Tool::None,
-            zoom: None, curve_chan: 0, curve_grab: None, curve_big: false, samples: vec![], rename_dlg: None, mask_ui: MaskUi::default(), chart: ChartUi::new(), profiles: crate::calib::saved(),
+            zoom: None, curve_chan: 0, curve_grab: None, curve_big: false, samples: vec![], target_mode: 0, target_hit: None, rename_dlg: None, geo_dlg: None, mask_ui: MaskUi::default(), chart: ChartUi::new(), profiles: crate::calib::saved(),
             crop_grab: None, crop_aspect: 0, spot_size: 2.0, heal_clone: false, spot_sel: None, heal_drag: None, view_map: [1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0], photo_wh: [1.0, 1.0],
-            export: ExportOpts::load(), export_dialog: None, export_sel: vec![], export_sets: [false; 3], keymap: Keymap::load(), keys_open: false, colour: crate::colour::Settings::load(), printer: None, binding: None, picking_wb: false,
+            export: ExportOpts::load(), editors: crate::editors::all(), edit_watch: vec![], edit_watch_at: 0.0, export_dialog: None, export_sel: vec![], export_sets: [false; 3], keymap: Keymap::load(), keys_open: false, colour: crate::colour::Settings::load(), printer: None, binding: None, picking_wb: false,
             thumb_due: false, lens_query: String::new(), lib_multi: vec![], pano_busy: false,
             watch: false, watch_open: true, watch_apply: false, watch_at: 0.0, watch_sizes: Default::default(), wipe: 0.5, wipe_tex: None,
             cull: Default::default(), scan: ScanUi::default(), ai_busy: false, tx, rx, roll: Default::default(), roll_dir: None,
@@ -1039,6 +1074,36 @@ impl App {
                     }
                 }
                 Msg::Status(s) => self.status = s,
+                Msg::Geo(r) => match r {
+                    Ok(d) => {
+                        self.status.clear();
+                        self.geo_dlg = Some(d);
+                    }
+                    Err(e) => self.status = format!("Geotag: {e}"),
+                },
+                Msg::EditOut(r) => match r {
+                    Ok((out, name)) => {
+                        self.status = format!("Opened {} in {name}. Save it there and it updates here", out.file_name().unwrap_or_default().to_string_lossy());
+                        let t = std::fs::metadata(&out).and_then(|m| m.modified()).ok();
+                        self.edit_watch.push((out.clone(), t));
+                        if let Some(d) = self.folder.clone()
+                            && out.parent() == Some(d.as_path())
+                            && !self.files.contains(&out)
+                        {
+                            self.files.push(out);
+                            load::sort_photos(&mut self.files);
+                        }
+                    }
+                    Err(e) => self.status = format!("Edit in: {e}"),
+                },
+                Msg::Bursts(key, groups) => {
+                    if self.bursts_key == Some(key) {
+                        self.burst_of = groups.iter().enumerate().flat_map(|(k, g)| g.iter().map(move |f| (f.clone(), k))).collect();
+                        let n: usize = groups.iter().map(|g| g.len() - 1).sum();
+                        self.status = if groups.is_empty() { "No bursts or duplicates found".into() } else { format!("Stacked {} bursts and duplicates ({n} photos tucked away)", groups.len()) };
+                        self.bursts = groups;
+                    }
+                }
                 Msg::ChartFit(generation, name, fit) => {
                     self.chart.busy = false;
                     if generation == self.photo_gen {
@@ -1148,6 +1213,20 @@ impl App {
                             self.lib_multi.clear();
                         }
                         Err(e) => self.status = format!("HDR merge failed: {e}"),
+                    }
+                }
+                Msg::Stacked(r) => {
+                    self.pano_busy = false;
+                    match r {
+                        Ok(out) => {
+                            self.status = format!("Focus stack saved as {}", out.file_name().unwrap_or_default().to_string_lossy());
+                            if let Some(d) = self.folder.clone() {
+                                self.open_path(ctx, &d);
+                            }
+                            self.lib_sel = Some(out);
+                            self.lib_multi.clear();
+                        }
+                        Err(e) => self.status = format!("Focus stack failed: {e}"),
                     }
                 }
                 Msg::Renamed(r) => match r {
@@ -1603,6 +1682,83 @@ impl App {
         }
     }
 
+    /// Pick a GPX track, then read it and the capture times of `files` off the UI thread.
+    fn start_geotag(&mut self, ctx: &egui::Context, files: Vec<PathBuf>) {
+        let Some(gpx) = rfd::FileDialog::new().set_title("Choose a GPX track").add_filter("GPX track", &["gpx"]).pick_file() else { return };
+        self.status = "Reading the track…".into();
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let r = crate::geotag::read_gpx(&gpx).map(|track| {
+                let files: Vec<(PathBuf, Option<i64>)> = files.par_iter().filter(|f| load::copy_of(f).is_none())
+                    .map(|f| (f.clone(), crate::lens::shot(f).and_then(|s| crate::geotag::camera_seconds(&s.taken)))).collect();
+                let times: Vec<i64> = files.iter().filter_map(|f| f.1).collect();
+                let offset = crate::geotag::guess_offset(&track, &times);
+                GeoDlg { name: gpx.file_name().unwrap_or_default().to_string_lossy().to_string(), track, files, offset }
+            });
+            let _ = tx.send(Msg::Geo(r));
+            ctx.request_repaint();
+        });
+    }
+
+    fn geotag_window(&mut self, ctx: &egui::Context) {
+        let Some(d) = &mut self.geo_dlg else { return };
+        let placed: Vec<(PathBuf, crate::geotag::Gps)> = d.files.iter()
+            .filter_map(|(f, t)| Some((f.clone(), crate::geotag::locate(&d.track, (*t)? - d.offset as i64 * 60)?))).collect();
+        let mut go = false;
+        let open = dialog(ctx, "geotag", "Geotag from a GPX track", 380.0, |ui| {
+            let (a, b) = (d.track.first().map(|p| p.t).unwrap_or(0), d.track.last().map(|p| p.t).unwrap_or(0));
+            ui.label(RichText::new(format!("{} has {} points over {:.1} hours.", d.name, d.track.len(), (b - a) as f32 / 3600.0)).size(12.0).color(TEXT2));
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Camera clock").size(12.0).color(LABEL));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button("Guess").on_hover_text("Finds the time zone that puts the most photos on the track").clicked() {
+                        let times: Vec<i64> = d.files.iter().filter_map(|f| f.1).collect();
+                        d.offset = crate::geotag::guess_offset(&d.track, &times);
+                    }
+                    if ui.button("+").clicked() {
+                        d.offset = (d.offset + 15).min(14 * 60);
+                    }
+                    ui.label(RichText::new(format!("UTC{:+}:{:02}", d.offset / 60, (d.offset % 60).abs())).monospace().size(12.0));
+                    if ui.button("−").clicked() {
+                        d.offset = (d.offset - 15).max(-14 * 60);
+                    }
+                });
+            });
+            ui.label(RichText::new("The time zone the camera's clock was set to. A camera an hour fast in UTC+1 is UTC+2.").size(11.5).color(TEXT2));
+            ui.add_space(6.0);
+            let no_time = d.files.iter().filter(|f| f.1.is_none()).count();
+            let mut msg = format!("{} of {} photos fall on the track.", placed.len(), d.files.len());
+            if no_time > 0 {
+                msg += &format!(" {no_time} have no capture time.");
+            }
+            ui.label(RichText::new(msg).size(12.0));
+            ui.label(RichText::new("Locations are saved with the edits. Exports include them only when you switch on Location in Print.").size(11.5).color(TEXT2));
+            go = primary(ui, &format!("Place {} photos", placed.len()), !placed.is_empty()).clicked();
+        });
+        if go {
+            self.commit();
+            let mut n = 0;
+            for (f, g) in &placed {
+                let mut p = if self.current.as_ref() == Some(f) { self.params.clone() } else { read_params(f).unwrap_or_default() };
+                p.gps = Some((*g).into());
+                if write_params(f, &p).is_ok() {
+                    n += 1;
+                    if self.current.as_ref() == Some(f) {
+                        self.params.gps = p.gps;
+                        for h in &mut self.history {
+                            h.gps = p.gps;
+                        }
+                    }
+                }
+            }
+            self.status = format!("Placed {n} photos on the map");
+        }
+        if go || !open {
+            self.geo_dlg = None;
+        }
+    }
+
     /// Export settings: format, size and quality, then the file or folder dialog.
     fn export_window(&mut self, ctx: &egui::Context) {
         let Some(all) = self.export_dialog else { return };
@@ -1706,6 +1862,11 @@ impl App {
                         ui.label(RichText::new("Camera, lens, roll & stock in JPEG").size(12.0).color(LABEL));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| switch(ui, &mut o.meta));
                     });
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Location (GPS), if the photo has one").size(12.0).color(LABEL))
+                            .on_hover_text("Off by default, so shared photos don't show where they were taken");
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| switch(ui, &mut o.gps));
+                    });
                 });
                 if all && self.export_sel.is_empty() {
                     switch_row(ui, "Include subfolders, keep the folder tree", &mut o.tree);
@@ -1757,6 +1918,45 @@ impl App {
             }
         }
         Some(sum.map(|v| (v / 9) as u8))
+    }
+
+    /// Targeted adjustment on the photo: press on a colour, then drag up to raise or down to lower the curve
+    /// regions or mixer bands that colour belongs to. The colour is picked once, when the drag starts.
+    fn target_tool(&mut self, ui: &Ui, resp: &egui::Response, r: Rect) {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+        if resp.drag_started()
+            && let Some(p) = ui.input(|i| i.pointer.press_origin())
+        {
+            let uv = (p - r.min) / r.size();
+            let [cw, ch, ox, oy, ..] = self.view_map;
+            let [pw, ph] = self.photo_wh;
+            let f = [(uv.x * cw - ox) / pw, (uv.y * ch - oy) / ph];
+            self.target_hit = ((0.0..=1.0).contains(&f[0]) && (0.0..=1.0).contains(&f[1])).then(|| self.sample_rgb(f)).flatten().map(develop::target_at);
+        }
+        if resp.dragged()
+            && let Some(t) = self.target_hit
+        {
+            // Half a slider unit per screen point; hold Shift for fine steps.
+            let fine = if ui.input(|i| i.modifiers.shift) { 0.15 } else { 0.5 };
+            develop::apply_target(&mut self.params, &t, self.target_mode, -resp.drag_delta().y * fine);
+        }
+        if resp.drag_stopped() {
+            self.target_hit = None;
+        }
+        if let (Some(p), Some(t)) = (resp.hover_pos(), self.target_hit) {
+            let names = ["Red", "Orange", "Yellow", "Green", "Aqua", "Blue", "Purple", "Magenta"];
+            let label = if self.target_mode == 0 {
+                let i = (0..4).max_by(|a, b| t.tone[*a].total_cmp(&t.tone[*b])).unwrap_or(0);
+                ["Shadows", "Darks", "Lights", "Highlights"][i].to_string()
+            } else if t.sat <= 0.04 {
+                "Grey: no colour to change".to_string()
+            } else {
+                let (a, b, f) = t.bands;
+                if f < 0.25 { names[a].into() } else if f > 0.75 { names[b].into() } else { format!("{} and {}", names[a], names[b]) }
+            };
+            let pt = ui.painter_at(r);
+            pt.text(p + vec2(14.0, 14.0), Align2::LEFT_TOP, label, FontId::new(11.5, semi()), Color32::WHITE);
+        }
     }
 
     /// Sample tool: click to pin a colour readout (up to 8), right-click one to remove it. Pins are always drawn.
@@ -2339,6 +2539,36 @@ impl App {
         }
     }
 
+    /// Web gallery of the selected photos (or all shown), in a new folder inside one the user picks.
+    fn make_gallery(&mut self, ctx: &egui::Context) {
+        let files = if self.lib_multi.len() >= 2 { let mut f = self.lib_multi.clone(); load::sort_photos(&mut f); f } else { self.lib_visible() };
+        let Some(parent) = rfd::FileDialog::new().set_title("Where to put the gallery folder").pick_folder() else { return };
+        let title = match (&self.collection, &self.folder) {
+            (Some(c), _) => c.clone(),
+            (None, Some(d)) => d.file_name().unwrap_or_default().to_string_lossy().to_string(),
+            _ => "Photos".into(),
+        };
+        self.commit();
+        self.status = format!("Making a web gallery of {} photos…", files.len());
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let o = crate::gallery::Options { title: title.clone(), ..Default::default() };
+            let r = crate::gallery::new_folder(&parent, &title).and_then(|dir| {
+                let tx2 = tx.clone();
+                let c2 = ctx.clone();
+                crate::gallery::make(&files, &dir, &o, &move |n, t| {
+                    let _ = tx2.send(Msg::Status(format!("Web gallery: {n} of {t}…")));
+                    c2.request_repaint();
+                })
+            });
+            let _ = tx.send(Msg::Status(match r {
+                Ok(page) => format!("Web gallery saved: {}", page.parent().unwrap_or(&page).display()),
+                Err(e) => format!("Web gallery failed: {e}"),
+            }));
+            ctx.request_repaint();
+        });
+    }
+
     fn make_contact_sheet(&mut self) {
         let files = self.lib_visible();
         let Some(mut out) = rfd::FileDialog::new().set_file_name("contact-sheet.jpg").add_filter("JPEG", &["jpg"]).save_file() else { return };
@@ -2645,13 +2875,25 @@ impl App {
             if !neg {
                 divider(ui);
                 for (t, name, tip) in [(Tool::Crop, "Crop", "Drag the corners, or drag inside to move"), (Tool::Heal, "Heal", "Click a spot to heal it. Right-click a circle to remove it"),
-                                       (Tool::Mask, "Mask", "Adjust part of the photo with gradients, circles, painting, or brightness and colour ranges"), (Tool::Sample, "Sample", "Click to pin a colour readout (up to 8). Right-click one to remove it")] {
+                                       (Tool::Mask, "Mask", "Adjust part of the photo with gradients, circles, painting, or brightness and colour ranges"), (Tool::Sample, "Sample", "Click to pin a colour readout (up to 8). Right-click one to remove it"),
+                                       (Tool::Target, "Target", "Drag up or down on the photo to change the colour or tone under the pointer")] {
                     if ghost(ui, name, self.tool == t).on_hover_text(tip).clicked() {
                         self.tool = if self.tool == t { Tool::None } else { t };
                         self.view = View::After;
                         self.zoom = None;
                         // Open the matching panel section.
-                        match self.tool { Tool::Crop => self.open[6] = true, Tool::Heal => self.open[10] = true, Tool::Mask => self.open[11] = true, Tool::None | Tool::Sample | Tool::Chart => {} }
+                        match self.tool { Tool::Crop => self.open[6] = true, Tool::Heal => self.open[10] = true, Tool::Mask => self.open[11] = true, Tool::Target => self.open[if self.target_mode == 0 { 1 } else { 2 }] = true, Tool::None | Tool::Sample | Tool::Chart => {} }
+                    }
+                }
+                if self.tool == Tool::Target {
+                    ui.add_space(6.0);
+                    let was = self.target_mode;
+                    segmented(ui, &mut self.target_mode, &["Curve", "Hue", "Sat", "Lum"]);
+                    if self.target_mode != was {
+                        self.open[if self.target_mode == 0 { 1 } else { 2 }] = true;
+                        if self.target_mode > 0 {
+                            self.mixer_tab = self.target_mode - 1;
+                        }
                     }
                 }
             }
@@ -2917,6 +3159,7 @@ impl App {
                         Tool::Heal => self.heal_tool(ui, &resp, r),
                         Tool::Mask => self.mask_tool(ui, &resp, r),
                         Tool::Chart => self.chart_tool(ui, &resp, r),
+                        Tool::Target => self.target_tool(ui, &resp, r),
                         Tool::None | Tool::Sample => {}
                     }
                     self.sample_marks(ui, &resp, r, tool == Tool::Sample);
@@ -3041,7 +3284,7 @@ impl App {
 
     fn lib_visible(&self) -> Vec<PathBuf> {
         let q = self.lib_query.to_lowercase();
-        self.files.iter().filter(|f| {
+        let mut v: Vec<PathBuf> = self.files.iter().filter(|f| {
             let real = load::copy_of(f).unwrap_or(f.to_path_buf());
             let e = ext_of(&real).to_lowercase();
             let kind = if load::is_raw(&real) { 0 } else if e == "jpg" || e == "jpeg" { 1 } else if e == "tif" || e == "tiff" { 2 } else { 3 };
@@ -3053,7 +3296,52 @@ impl App {
                 None => f.file_name().unwrap_or_default().to_string_lossy().to_lowercase().contains(q.trim()),
             };
             self.lib_filter[kind] && (!self.lib_filter[4] || m.edited) && rating_ok && found
-        }).cloned().collect()
+        }).cloned().collect();
+        if self.stack_bursts && !self.bursts.is_empty() {
+            let shown: std::collections::HashSet<PathBuf> = v.iter().cloned().collect();
+            // A closed stack shows one photo: its best rated, else the first.
+            let tops: Vec<Option<PathBuf>> = self.bursts.iter().map(|g| {
+                if self.burst_open.contains(&g[0]) {
+                    return None;
+                }
+                g.iter().filter(|f| shown.contains(*f)).max_by_key(|f| (self.meta.get(*f).map(|m| m.rating).unwrap_or(0), std::cmp::Reverse(g.iter().position(|x| x == *f)))).cloned()
+            }).collect();
+            v.retain(|f| match self.burst_of.get(f) {
+                Some(k) if !self.burst_open.contains(&self.bursts[*k][0]) => tops[*k].as_ref() == Some(f),
+                _ => true,
+            });
+        }
+        v
+    }
+
+    /// How many photos the closed stack topped by `f` holds (0 if it isn't the top of one), and whether `f` is in
+    /// an open stack.
+    fn burst_badge(&self, f: &PathBuf) -> (usize, bool) {
+        if !self.stack_bursts {
+            return (0, false);
+        }
+        match self.burst_of.get(f).map(|k| &self.bursts[*k]) {
+            Some(g) if self.burst_open.contains(&g[0]) => (0, true),
+            Some(g) => (g.len(), false),
+            None => (0, false),
+        }
+    }
+
+    /// Start finding bursts for the open folder, unless they are known or being found.
+    fn want_bursts(&mut self, ctx: &egui::Context) {
+        let key = (self.thumb_gen.load(std::sync::atomic::Ordering::Relaxed), self.files.len());
+        if !self.stack_bursts || self.bursts_key == Some(key) {
+            return;
+        }
+        self.bursts_key = Some(key);
+        self.bursts.clear();
+        self.burst_of.clear();
+        self.status = "Looking for bursts and duplicates…".into();
+        let (files, tx, ctx) = (self.files.clone(), self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(Msg::Bursts(key, crate::bursts::find(&files)));
+            ctx.request_repaint();
+        });
     }
 
     fn library_left(&mut self, ui: &mut Ui) {
@@ -3136,14 +3424,33 @@ impl App {
             if filter_chip(ui, "Edited only", self.lib_filter[4]).clicked() {
                 self.lib_filter[4] = !self.lib_filter[4];
             }
+            ui.add_space(10.0);
+            if filter_chip(ui, "Stack bursts", self.stack_bursts).on_hover_text("Show bursts and duplicate shots as one thumbnail with a count. Right-click one to open its stack").clicked() {
+                self.stack_bursts = !self.stack_bursts;
+            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui.add_enabled(!self.files.is_empty(), egui::Button::new("Print all…")).clicked() {
                     self.export_sel.clear();
                     self.export_dialog = Some(true);
                 }
-                if ui.add_enabled(!self.files.is_empty(), egui::Button::new("Contact sheet…")).on_hover_text("One image of every photo shown, numbered, like a darkroom contact print").clicked() {
-                    self.make_contact_sheet();
-                }
+                let has = !self.files.is_empty();
+                ui.add_enabled_ui(has, |ui| {
+                    ui.menu_button("Tools", |ui| {
+                        if ui.button("Contact sheet…").on_hover_text("One image of every photo shown, numbered, like a darkroom contact print").clicked() {
+                            self.make_contact_sheet();
+                            ui.close();
+                        }
+                        if ui.button("Web gallery…").on_hover_text("A folder with a web page of the photos shown (or selected), ready to upload anywhere").clicked() {
+                            self.make_gallery(&ui.ctx().clone());
+                            ui.close();
+                        }
+                        if ui.button("Geotag from GPX…").on_hover_text("Place photos on the map from a GPX track (phone, watch or GPS logger). Uses the selected photos, or all shown").clicked() {
+                            let files = if self.lib_multi.len() >= 2 { self.lib_multi.clone() } else { self.lib_visible() };
+                            self.start_geotag(&ui.ctx().clone(), files);
+                            ui.close();
+                        }
+                    });
+                });
                 ui.add_space(8.0);
                 plain_slider(ui, &mut self.thumb_size, 120.0, 320.0, 110.0).on_hover_text("Thumbnail size");
                 ui.label(RichText::new("Size").size(12.0).color(TEXT3));
@@ -3152,6 +3459,7 @@ impl App {
     }
 
     fn library_grid(&mut self, ui: &mut Ui) {
+        self.want_bursts(&ui.ctx().clone());
         let visible = self.lib_visible();
         if self.files.is_empty() {
             ui.centered_and_justified(|ui| {
@@ -3177,6 +3485,10 @@ impl App {
         let mut export_sel = false;
         let (mut rename, mut rename_one, mut undo_rename) = (None::<bool>, None::<PathBuf>, false);
         let mut hdr = None::<bool>;
+        let mut focus_stack = false;
+        let mut burst_toggle = None::<PathBuf>;
+        let mut edit_in = None::<(PathBuf, Option<crate::editors::Editor>)>;
+        let editors = self.editors.clone();
         let (mut add_to, mut add_files) = (None::<Option<usize>>, Vec::<PathBuf>::new());
         let lib_multi = self.lib_multi.clone();
         let can_undo_rename = self.folder.as_deref().is_some_and(crate::rename::can_undo);
@@ -3228,12 +3540,35 @@ impl App {
                             if m.label > 0 {
                                 ui.painter().rect_filled(Rect::from_min_max(pos2(r.right() - 26.0, r.bottom() - 6.0), pos2(r.right() - 6.0, r.bottom() - 2.0)), 2.0, LABEL_COLORS[(m.label - 1).min(4) as usize]);
                             }
+                            let (stacked, in_open) = self.burst_badge(f);
+                            if stacked > 0 {
+                                // A count over two offset cards, top right (left of the edited mark).
+                                let g = ui.painter().layout_no_wrap(stacked.to_string(), FontId::monospace(10.0), TEXT);
+                                let b = Rect::from_min_size(pos2(r.right() - 34.0 - g.size().x - 12.0, r.top() + 6.0), g.size() + vec2(18.0, 4.0));
+                                ui.painter().rect_filled(b, 4.0, Color32::from_rgba_unmultiplied(20, 20, 22, 215));
+                                for k in 0..2 {
+                                    let o = k as f32 * 2.0;
+                                    ui.painter().rect_stroke(Rect::from_min_size(b.min + vec2(4.0 + o, 4.0 - o + 2.0), vec2(5.0, 6.0)), 1.0, Stroke::new(1.0, TEXT), egui::StrokeKind::Inside);
+                                }
+                                ui.painter().galley(b.min + vec2(14.0, 2.0), g, TEXT);
+                            }
+                            if in_open {
+                                ui.painter().hline(r.x_range(), r.bottom() + 2.0, Stroke::new(2.0, TEXT2));
+                            }
                             let is_copy = load::copy_of(f).is_some();
                             let colls: Vec<String> = self.collections.iter().filter(|c| !c.is_smart()).map(|c| c.name.clone()).collect();
                             let multi = self.lib_multi.len();
                             let in_multi = self.lib_multi.contains(f);
                             let pano_busy = self.pano_busy;
                             resp.context_menu(|ui| {
+                                if stacked > 0 && ui.button(format!("Open stack ({stacked} photos)")).clicked() {
+                                    burst_toggle = Some(f.clone());
+                                    ui.close();
+                                }
+                                if in_open && ui.button("Close stack").clicked() {
+                                    burst_toggle = Some(f.clone());
+                                    ui.close();
+                                }
                                 if multi >= 2 && in_multi {
                                     if ui.button(format!("Print {multi} frames…")).clicked() {
                                         export_sel = true;
@@ -3241,6 +3576,10 @@ impl App {
                                     }
                                     if ui.add_enabled(!pano_busy, egui::Button::new(format!("Merge {multi} photos to HDR"))).on_hover_text("Lines up an exposure bracket of one scene and merges it into a 32-bit photo that keeps the highlight and shadow detail").clicked() {
                                         hdr = Some(true);
+                                        ui.close();
+                                    }
+                                    if ui.add_enabled(!pano_busy, egui::Button::new(format!("Focus-stack {multi} photos"))).on_hover_text("Lines up photos of one scene focused at different distances and keeps the sharpest part of each, so everything is in focus").clicked() {
+                                        focus_stack = true;
                                         ui.close();
                                     }
                                     if ui.button(format!("Rename {multi} photos…")).clicked() {
@@ -3259,6 +3598,18 @@ impl App {
                                     });
                                     ui.separator();
                                 }
+                                ui.menu_button("Edit in", |ui| {
+                                    for e in &editors {
+                                        if ui.button(&e.name).on_hover_text(e.path.display().to_string()).clicked() {
+                                            edit_in = Some((f.clone(), Some(e.clone())));
+                                            ui.close();
+                                        }
+                                    }
+                                    if ui.button("Choose a program…").on_hover_text("Opens a 16-bit TIFF copy with your edits in another program. Save it there and it appears next to the original").clicked() {
+                                        edit_in = Some((f.clone(), None));
+                                        ui.close();
+                                    }
+                                });
                                 if !(multi >= 2 && in_multi) && !is_copy && ui.button("Rename…").clicked() {
                                     rename = Some(false);
                                     rename_one = Some(f.clone());
@@ -3354,6 +3705,21 @@ impl App {
                 vec![files]
             });
             self.merge_hdr(ui.ctx(), groups);
+        }
+        if let Some((f, e)) = edit_in {
+            self.edit_in(ui.ctx(), f, e);
+        }
+        if let Some(f) = burst_toggle
+            && let Some(first) = self.burst_of.get(&f).map(|k| self.bursts[*k][0].clone())
+        {
+            if !self.burst_open.remove(&first) {
+                self.burst_open.insert(first);
+            }
+        }
+        if focus_stack {
+            let mut files = self.lib_multi.clone();
+            load::sort_photos(&mut files);
+            self.focus_stack(ui.ctx(), files);
         }
         if let Some(multi) = rename {
             let mut files = if multi { self.lib_multi.clone() } else { rename_one.into_iter().collect() };
@@ -3578,6 +3944,18 @@ impl App {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(k).size(12.0).color(TEXT3));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.label(RichText::new(v).size(12.0)));
+            });
+        }
+        let gps = if self.current.as_ref() == Some(&f) { self.params.gps } else { read_params(&f).and_then(|p| p.gps) };
+        if let Some(g) = gps {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Location").size(12.0).color(TEXT3));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.add(egui::Button::new(RichText::new("Map").size(12.0)).small()).on_hover_text("Open this place on OpenStreetMap").clicked() {
+                        ui.ctx().open_url(egui::OpenUrl::new_tab(crate::geotag::map_url(&g.gps())));
+                    }
+                    ui.label(RichText::new(crate::geotag::describe(&g.gps())).size(12.0));
+                });
             });
         }
         // Rating and flag, also on the keyboard: 0–5, P pick, X reject, U clear.
@@ -4497,6 +4875,86 @@ impl App {
         });
     }
 
+    /// Focus-stack `files` (in focus order) on a worker thread.
+    fn focus_stack(&mut self, ctx: &egui::Context, files: Vec<PathBuf>) {
+        if self.pano_busy {
+            return;
+        }
+        self.pano_busy = true;
+        self.status = "Focus stacking…".into();
+        let (tx, ctx2) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let (tx2, c3) = (tx.clone(), ctx2.clone());
+            let r = crate::focus::stack_files(&files, &move |m| {
+                let _ = tx2.send(Msg::Status(format!("Focus stack: {m}…")));
+                c3.request_repaint();
+            });
+            let _ = tx.send(Msg::Stacked(r));
+            ctx2.request_repaint();
+        });
+    }
+
+    /// Render `photo` with its edits to a 16-bit TIFF beside it and open that in `editor` (None: ask for a program
+    /// and remember it).
+    fn edit_in(&mut self, ctx: &egui::Context, photo: PathBuf, editor: Option<crate::editors::Editor>) {
+        let editor = match editor {
+            Some(e) => e,
+            None => {
+                let mut d = rfd::FileDialog::new().set_title("Choose an image editor");
+                if cfg!(windows) {
+                    d = d.add_filter("Programs", &["exe"]);
+                }
+                let Some(p) = d.pick_file() else { return };
+                match crate::editors::remember(&p) {
+                    Ok(_) => self.editors = crate::editors::all(),
+                    Err(e) => self.status = format!("Could not save the program list: {e}"),
+                }
+                crate::editors::Editor { name: p.file_stem().unwrap_or_default().to_string_lossy().to_string(), path: p }
+            }
+        };
+        if self.current.as_ref() == Some(&photo) {
+            self.commit(); // the copy shows the edits as they are now
+        }
+        self.status = format!("Preparing a copy for {}…", editor.name);
+        let (tx, ctx2, space) = (self.tx.clone(), ctx.clone(), self.export.space);
+        std::thread::spawn(move || {
+            let r = crate::editors::render_for_editing(&photo, space).and_then(|out| {
+                crate::editors::launch(&editor.path, &out)?;
+                Ok((out, editor.name.clone()))
+            });
+            let _ = tx.send(Msg::EditOut(r));
+            ctx2.request_repaint();
+        });
+    }
+
+    /// Every two seconds: an edit copy saved in its program gets a fresh thumbnail (and reloads if it is open).
+    fn watch_edits(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|i| i.time);
+        if self.edit_watch.is_empty() || now - self.edit_watch_at < 2.0 {
+            if !self.edit_watch.is_empty() {
+                ctx.request_repaint_after(std::time::Duration::from_secs(2));
+            }
+            return;
+        }
+        self.edit_watch_at = now;
+        let mut changed = vec![];
+        for (f, t) in &mut self.edit_watch {
+            let m = std::fs::metadata(&*f).and_then(|m| m.modified()).ok();
+            if m.is_some() && m != *t {
+                *t = m;
+                changed.push(f.clone());
+            }
+        }
+        for f in changed {
+            self.thumbs.remove(&f);
+            self.thumb_pending.remove(&f);
+            self.status = format!("{} was updated", f.file_name().unwrap_or_default().to_string_lossy());
+            if self.current.as_ref() == Some(&f) {
+                self.select(ctx, f);
+            }
+        }
+    }
+
     fn install_ai(&mut self, ctx: &egui::Context) {
         self.ai_busy = true;
         let (tx, ctx2) = (self.tx.clone(), ctx.clone());
@@ -4972,12 +5430,22 @@ impl App {
                     }
                 }
                 "vcopy" => self.new_copy_of_current(),
+                "edit_in" => {
+                    let f = if self.module == Module::Library { self.lib_sel.clone() } else { self.current.clone() };
+                    if let Some(f) = f {
+                        let first = self.editors.first().cloned();
+                        self.edit_in(ctx, f, first);
+                    }
+                }
                 _ if browsing => {}
                 "zoom" => self.toggle_zoom([0.5, 0.5]),
                 "before" => self.view = if self.view == View::Before { View::After } else { View::Before },
                 "clipping" => self.clip_view = !self.clip_view,
-                "crop" | "heal" | "gradient" | "brush" if self.module == Module::Develop => {
-                    let t = match id { "crop" => Tool::Crop, "heal" => Tool::Heal, _ => Tool::Mask };
+                "crop" | "heal" | "gradient" | "brush" | "target" if self.module == Module::Develop => {
+                    let t = match id { "crop" => Tool::Crop, "heal" => Tool::Heal, "target" => Tool::Target, _ => Tool::Mask };
+                    if t == Tool::Target {
+                        self.open[if self.target_mode == 0 { 1 } else { 2 }] = true;
+                    }
                     if t == Tool::Mask {
                         self.mask_ui.draw = if id == "brush" { Draw::Brush } else { Draw::Linear };
                     }
@@ -5283,6 +5751,7 @@ impl eframe::App for App {
         self.poll(&ctx);
         self.scan_poll(&ctx);
         self.watch_folder(&ctx);
+        self.watch_edits(&ctx);
         self.shortcuts(&ctx);
         if let Some(f) = ctx.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf())) {
             self.open_path(&ctx, &f);
@@ -5336,6 +5805,7 @@ impl eframe::App for App {
         }
         self.export_window(&ctx);
         self.rename_window(&ctx);
+        self.geotag_window(&ctx);
         self.keys_window(&ctx);
         // One history step (and one sidecar write) per caption, not per keystroke.
         if !ctx.input(|i| i.pointer.any_down()) && !ctx.memory(|m| m.has_focus(egui::Id::NULL.with("caption"))) {
