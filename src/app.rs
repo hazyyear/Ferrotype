@@ -49,6 +49,8 @@ enum Tool {
     Heal,
     Mask,
     Sample,
+    /// Targeted adjustment: drag up or down on the photo to change the curve or mixer for the colour under the pointer.
+    Target,
     /// Place a colour chart on the photo to build a camera or scanner profile.
     Chart,
 }
@@ -381,6 +383,9 @@ pub struct App {
     curve_big: bool,
     /// Colour sample points pinned on the photo (fractions of the photo without its border), for this session.
     samples: Vec<[f32; 2]>,
+    /// Targeted adjustment: 0 tone curve, 1 hue, 2 saturation, 3 luminance; and what the current drag picked.
+    target_mode: usize,
+    target_hit: Option<develop::Target>,
     rename_dlg: Option<RenameDlg>,
     mask_ui: MaskUi,
     tool: Tool,
@@ -695,7 +700,7 @@ impl App {
             history: vec![Params::default()], hist_pos: 0, copied: None, view: View::After, holding_before: false, picking_base: false,
             status: String::new(), presets, preset_tex: vec![], last_preset: None, preset_mix: None, preset_amt: 100.0, preset_name: String::new(), stock_query: String::new(), my_stocks: negative::custom_stocks(), my_stock_name: String::new(), proof: 0,
             stock_tab: 0, mixer_tab: 0, open: [true, false, false, false, false, false, false, false, false, false, false, false, false, false], tool: Tool::None,
-            zoom: None, curve_chan: 0, curve_grab: None, curve_big: false, samples: vec![], rename_dlg: None, mask_ui: MaskUi::default(), chart: ChartUi::new(), profiles: crate::calib::saved(),
+            zoom: None, curve_chan: 0, curve_grab: None, curve_big: false, samples: vec![], target_mode: 0, target_hit: None, rename_dlg: None, mask_ui: MaskUi::default(), chart: ChartUi::new(), profiles: crate::calib::saved(),
             crop_grab: None, crop_aspect: 0, spot_size: 2.0, heal_clone: false, spot_sel: None, heal_drag: None, view_map: [1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0], photo_wh: [1.0, 1.0],
             export: ExportOpts::load(), export_dialog: None, export_sel: vec![], export_sets: [false; 3], keymap: Keymap::load(), keys_open: false, colour: crate::colour::Settings::load(), printer: None, binding: None, picking_wb: false,
             thumb_due: false, lens_query: String::new(), lib_multi: vec![], pano_busy: false,
@@ -1759,6 +1764,45 @@ impl App {
         Some(sum.map(|v| (v / 9) as u8))
     }
 
+    /// Targeted adjustment on the photo: press on a colour, then drag up to raise or down to lower the curve
+    /// regions or mixer bands that colour belongs to. The colour is picked once, when the drag starts.
+    fn target_tool(&mut self, ui: &Ui, resp: &egui::Response, r: Rect) {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+        if resp.drag_started()
+            && let Some(p) = ui.input(|i| i.pointer.press_origin())
+        {
+            let uv = (p - r.min) / r.size();
+            let [cw, ch, ox, oy, ..] = self.view_map;
+            let [pw, ph] = self.photo_wh;
+            let f = [(uv.x * cw - ox) / pw, (uv.y * ch - oy) / ph];
+            self.target_hit = ((0.0..=1.0).contains(&f[0]) && (0.0..=1.0).contains(&f[1])).then(|| self.sample_rgb(f)).flatten().map(develop::target_at);
+        }
+        if resp.dragged()
+            && let Some(t) = self.target_hit
+        {
+            // Half a slider unit per screen point; hold Shift for fine steps.
+            let fine = if ui.input(|i| i.modifiers.shift) { 0.15 } else { 0.5 };
+            develop::apply_target(&mut self.params, &t, self.target_mode, -resp.drag_delta().y * fine);
+        }
+        if resp.drag_stopped() {
+            self.target_hit = None;
+        }
+        if let (Some(p), Some(t)) = (resp.hover_pos(), self.target_hit) {
+            let names = ["Red", "Orange", "Yellow", "Green", "Aqua", "Blue", "Purple", "Magenta"];
+            let label = if self.target_mode == 0 {
+                let i = (0..4).max_by(|a, b| t.tone[*a].total_cmp(&t.tone[*b])).unwrap_or(0);
+                ["Shadows", "Darks", "Lights", "Highlights"][i].to_string()
+            } else if t.sat <= 0.04 {
+                "Grey: no colour to change".to_string()
+            } else {
+                let (a, b, f) = t.bands;
+                if f < 0.25 { names[a].into() } else if f > 0.75 { names[b].into() } else { format!("{} and {}", names[a], names[b]) }
+            };
+            let pt = ui.painter_at(r);
+            pt.text(p + vec2(14.0, 14.0), Align2::LEFT_TOP, label, FontId::new(11.5, semi()), Color32::WHITE);
+        }
+    }
+
     /// Sample tool: click to pin a colour readout (up to 8), right-click one to remove it. Pins are always drawn.
     fn sample_marks(&mut self, ui: &mut Ui, resp: &egui::Response, r: Rect, active: bool) {
         let [cw, ch, ox, oy, ..] = self.view_map;
@@ -2645,13 +2689,25 @@ impl App {
             if !neg {
                 divider(ui);
                 for (t, name, tip) in [(Tool::Crop, "Crop", "Drag the corners, or drag inside to move"), (Tool::Heal, "Heal", "Click a spot to heal it. Right-click a circle to remove it"),
-                                       (Tool::Mask, "Mask", "Adjust part of the photo with gradients, circles, painting, or brightness and colour ranges"), (Tool::Sample, "Sample", "Click to pin a colour readout (up to 8). Right-click one to remove it")] {
+                                       (Tool::Mask, "Mask", "Adjust part of the photo with gradients, circles, painting, or brightness and colour ranges"), (Tool::Sample, "Sample", "Click to pin a colour readout (up to 8). Right-click one to remove it"),
+                                       (Tool::Target, "Target", "Drag up or down on the photo to change the colour or tone under the pointer")] {
                     if ghost(ui, name, self.tool == t).on_hover_text(tip).clicked() {
                         self.tool = if self.tool == t { Tool::None } else { t };
                         self.view = View::After;
                         self.zoom = None;
                         // Open the matching panel section.
-                        match self.tool { Tool::Crop => self.open[6] = true, Tool::Heal => self.open[10] = true, Tool::Mask => self.open[11] = true, Tool::None | Tool::Sample | Tool::Chart => {} }
+                        match self.tool { Tool::Crop => self.open[6] = true, Tool::Heal => self.open[10] = true, Tool::Mask => self.open[11] = true, Tool::Target => self.open[if self.target_mode == 0 { 1 } else { 2 }] = true, Tool::None | Tool::Sample | Tool::Chart => {} }
+                    }
+                }
+                if self.tool == Tool::Target {
+                    ui.add_space(6.0);
+                    let was = self.target_mode;
+                    segmented(ui, &mut self.target_mode, &["Curve", "Hue", "Saturation", "Luminance"]);
+                    if self.target_mode != was {
+                        self.open[if self.target_mode == 0 { 1 } else { 2 }] = true;
+                        if self.target_mode > 0 {
+                            self.mixer_tab = self.target_mode - 1;
+                        }
                     }
                 }
             }
@@ -2917,6 +2973,7 @@ impl App {
                         Tool::Heal => self.heal_tool(ui, &resp, r),
                         Tool::Mask => self.mask_tool(ui, &resp, r),
                         Tool::Chart => self.chart_tool(ui, &resp, r),
+                        Tool::Target => self.target_tool(ui, &resp, r),
                         Tool::None | Tool::Sample => {}
                     }
                     self.sample_marks(ui, &resp, r, tool == Tool::Sample);
@@ -4976,8 +5033,8 @@ impl App {
                 "zoom" => self.toggle_zoom([0.5, 0.5]),
                 "before" => self.view = if self.view == View::Before { View::After } else { View::Before },
                 "clipping" => self.clip_view = !self.clip_view,
-                "crop" | "heal" | "gradient" | "brush" if self.module == Module::Develop => {
-                    let t = match id { "crop" => Tool::Crop, "heal" => Tool::Heal, _ => Tool::Mask };
+                "crop" | "heal" | "gradient" | "brush" | "target" if self.module == Module::Develop => {
+                    let t = match id { "crop" => Tool::Crop, "heal" => Tool::Heal, "target" => Tool::Target, _ => Tool::Mask };
                     if t == Tool::Mask {
                         self.mask_ui.draw = if id == "brush" { Draw::Brush } else { Draw::Linear };
                     }
