@@ -36,6 +36,7 @@ pub const ACTIONS: &[(&str, &str, &str)] = &[
     ("rot_left", "Rotate left", "OpenBracket"),
     ("rot_right", "Rotate right", "CloseBracket"),
     ("vcopy", "Virtual copy", "Shift+V"),
+    ("edit_in", "Edit in another program", "E"),
     ("snapshot", "New snapshot", "Shift+S"),
     ("focus", "Focus check (culling)", "F"),
 ];

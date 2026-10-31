@@ -228,6 +228,8 @@ enum Msg {
     Stacked(Result<PathBuf, String>),
     /// Burst and duplicate groups found for a folder (its generation and photo count).
     Bursts((usize, usize), Vec<Vec<PathBuf>>),
+    /// An edit copy was written and its program started (the copy and the program's name).
+    EditOut(Result<(PathBuf, String), String>),
     /// A batch rename finished: what moved where.
     Renamed(Result<Vec<(PathBuf, PathBuf)>, String>),
     /// Settings synced to these frames (with their new summaries).
@@ -414,6 +416,11 @@ pub struct App {
     view_map: [f32; 8],
     photo_wh: [f32; 2],
     export: ExportOpts,
+    /// "Edit in…" programs, and the edit copies handed to them (with the time they were last changed), watched so
+    /// a save there refreshes the thumbnail.
+    editors: Vec<crate::editors::Editor>,
+    edit_watch: Vec<(PathBuf, Option<std::time::SystemTime>)>,
+    edit_watch_at: f64,
     /// Some(false) = export this photo, Some(true) = export the folder.
     export_dialog: Option<bool>,
     keymap: Keymap,
@@ -713,7 +720,7 @@ impl App {
             stock_tab: 0, mixer_tab: 0, open: [true, false, false, false, false, false, false, false, false, false, false, false, false, false], tool: Tool::None,
             zoom: None, curve_chan: 0, curve_grab: None, curve_big: false, samples: vec![], target_mode: 0, target_hit: None, rename_dlg: None, mask_ui: MaskUi::default(), chart: ChartUi::new(), profiles: crate::calib::saved(),
             crop_grab: None, crop_aspect: 0, spot_size: 2.0, heal_clone: false, spot_sel: None, heal_drag: None, view_map: [1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0], photo_wh: [1.0, 1.0],
-            export: ExportOpts::load(), export_dialog: None, export_sel: vec![], export_sets: [false; 3], keymap: Keymap::load(), keys_open: false, colour: crate::colour::Settings::load(), printer: None, binding: None, picking_wb: false,
+            export: ExportOpts::load(), editors: crate::editors::all(), edit_watch: vec![], edit_watch_at: 0.0, export_dialog: None, export_sel: vec![], export_sets: [false; 3], keymap: Keymap::load(), keys_open: false, colour: crate::colour::Settings::load(), printer: None, binding: None, picking_wb: false,
             thumb_due: false, lens_query: String::new(), lib_multi: vec![], pano_busy: false,
             watch: false, watch_open: true, watch_apply: false, watch_at: 0.0, watch_sizes: Default::default(), wipe: 0.5, wipe_tex: None,
             cull: Default::default(), scan: ScanUi::default(), ai_busy: false, tx, rx, roll: Default::default(), roll_dir: None,
@@ -1055,6 +1062,21 @@ impl App {
                     }
                 }
                 Msg::Status(s) => self.status = s,
+                Msg::EditOut(r) => match r {
+                    Ok((out, name)) => {
+                        self.status = format!("Opened {} in {name}. Save it there and it updates here", out.file_name().unwrap_or_default().to_string_lossy());
+                        let t = std::fs::metadata(&out).and_then(|m| m.modified()).ok();
+                        self.edit_watch.push((out.clone(), t));
+                        if let Some(d) = self.folder.clone()
+                            && out.parent() == Some(d.as_path())
+                            && !self.files.contains(&out)
+                        {
+                            self.files.push(out);
+                            load::sort_photos(&mut self.files);
+                        }
+                    }
+                    Err(e) => self.status = format!("Edit in: {e}"),
+                },
                 Msg::Bursts(key, groups) => {
                     if self.bursts_key == Some(key) {
                         self.burst_of = groups.iter().enumerate().flat_map(|(k, g)| g.iter().map(move |f| (f.clone(), k))).collect();
@@ -3318,6 +3340,8 @@ impl App {
         let mut hdr = None::<bool>;
         let mut focus_stack = false;
         let mut burst_toggle = None::<PathBuf>;
+        let mut edit_in = None::<(PathBuf, Option<crate::editors::Editor>)>;
+        let editors = self.editors.clone();
         let (mut add_to, mut add_files) = (None::<Option<usize>>, Vec::<PathBuf>::new());
         let lib_multi = self.lib_multi.clone();
         let can_undo_rename = self.folder.as_deref().is_some_and(crate::rename::can_undo);
@@ -3427,6 +3451,18 @@ impl App {
                                     });
                                     ui.separator();
                                 }
+                                ui.menu_button("Edit in", |ui| {
+                                    for e in &editors {
+                                        if ui.button(&e.name).on_hover_text(e.path.display().to_string()).clicked() {
+                                            edit_in = Some((f.clone(), Some(e.clone())));
+                                            ui.close();
+                                        }
+                                    }
+                                    if ui.button("Choose a program…").on_hover_text("Opens a 16-bit TIFF copy with your edits in another program. Save it there and it appears next to the original").clicked() {
+                                        edit_in = Some((f.clone(), None));
+                                        ui.close();
+                                    }
+                                });
                                 if !(multi >= 2 && in_multi) && !is_copy && ui.button("Rename…").clicked() {
                                     rename = Some(false);
                                     rename_one = Some(f.clone());
@@ -3522,6 +3558,9 @@ impl App {
                 vec![files]
             });
             self.merge_hdr(ui.ctx(), groups);
+        }
+        if let Some((f, e)) = edit_in {
+            self.edit_in(ui.ctx(), f, e);
         }
         if let Some(f) = burst_toggle
             && let Some(first) = self.burst_of.get(&f).map(|k| self.bursts[*k][0].clone())
@@ -4696,6 +4735,67 @@ impl App {
         });
     }
 
+    /// Render `photo` with its edits to a 16-bit TIFF beside it and open that in `editor` (None: ask for a program
+    /// and remember it).
+    fn edit_in(&mut self, ctx: &egui::Context, photo: PathBuf, editor: Option<crate::editors::Editor>) {
+        let editor = match editor {
+            Some(e) => e,
+            None => {
+                let mut d = rfd::FileDialog::new().set_title("Choose an image editor");
+                if cfg!(windows) {
+                    d = d.add_filter("Programs", &["exe"]);
+                }
+                let Some(p) = d.pick_file() else { return };
+                match crate::editors::remember(&p) {
+                    Ok(_) => self.editors = crate::editors::all(),
+                    Err(e) => self.status = format!("Could not save the program list: {e}"),
+                }
+                crate::editors::Editor { name: p.file_stem().unwrap_or_default().to_string_lossy().to_string(), path: p }
+            }
+        };
+        if self.current.as_ref() == Some(&photo) {
+            self.commit(); // the copy shows the edits as they are now
+        }
+        self.status = format!("Preparing a copy for {}…", editor.name);
+        let (tx, ctx2, space) = (self.tx.clone(), ctx.clone(), self.export.space);
+        std::thread::spawn(move || {
+            let r = crate::editors::render_for_editing(&photo, space).and_then(|out| {
+                crate::editors::launch(&editor.path, &out)?;
+                Ok((out, editor.name.clone()))
+            });
+            let _ = tx.send(Msg::EditOut(r));
+            ctx2.request_repaint();
+        });
+    }
+
+    /// Every two seconds: an edit copy saved in its program gets a fresh thumbnail (and reloads if it is open).
+    fn watch_edits(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|i| i.time);
+        if self.edit_watch.is_empty() || now - self.edit_watch_at < 2.0 {
+            if !self.edit_watch.is_empty() {
+                ctx.request_repaint_after(std::time::Duration::from_secs(2));
+            }
+            return;
+        }
+        self.edit_watch_at = now;
+        let mut changed = vec![];
+        for (f, t) in &mut self.edit_watch {
+            let m = std::fs::metadata(&*f).and_then(|m| m.modified()).ok();
+            if m.is_some() && m != *t {
+                *t = m;
+                changed.push(f.clone());
+            }
+        }
+        for f in changed {
+            self.thumbs.remove(&f);
+            self.thumb_pending.remove(&f);
+            self.status = format!("{} was updated", f.file_name().unwrap_or_default().to_string_lossy());
+            if self.current.as_ref() == Some(&f) {
+                self.select(ctx, f);
+            }
+        }
+    }
+
     fn install_ai(&mut self, ctx: &egui::Context) {
         self.ai_busy = true;
         let (tx, ctx2) = (self.tx.clone(), ctx.clone());
@@ -5171,6 +5271,13 @@ impl App {
                     }
                 }
                 "vcopy" => self.new_copy_of_current(),
+                "edit_in" => {
+                    let f = if self.module == Module::Library { self.lib_sel.clone() } else { self.current.clone() };
+                    if let Some(f) = f {
+                        let first = self.editors.first().cloned();
+                        self.edit_in(ctx, f, first);
+                    }
+                }
                 _ if browsing => {}
                 "zoom" => self.toggle_zoom([0.5, 0.5]),
                 "before" => self.view = if self.view == View::Before { View::After } else { View::Before },
@@ -5482,6 +5589,7 @@ impl eframe::App for App {
         self.poll(&ctx);
         self.scan_poll(&ctx);
         self.watch_folder(&ctx);
+        self.watch_edits(&ctx);
         self.shortcuts(&ctx);
         if let Some(f) = ctx.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf())) {
             self.open_path(&ctx, &f);
