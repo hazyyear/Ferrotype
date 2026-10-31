@@ -24,6 +24,7 @@ mod colour;
 mod demosaic;
 mod library;
 mod focus;
+mod bursts;
 
 use develop::Params;
 use image::{DynamicImage, Rgb32FImage, codecs::jpeg::JpegEncoder};

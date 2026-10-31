@@ -226,6 +226,8 @@ enum Msg {
     Hdr(Result<Vec<PathBuf>, String>),
     /// A focus stack finished: the file written.
     Stacked(Result<PathBuf, String>),
+    /// Burst and duplicate groups found for a folder (its generation and photo count).
+    Bursts((usize, usize), Vec<Vec<PathBuf>>),
     /// A batch rename finished: what moved where.
     Renamed(Result<Vec<(PathBuf, PathBuf)>, String>),
     /// Settings synced to these frames (with their new summaries).
@@ -337,6 +339,13 @@ pub struct App {
     lib_sel: Option<PathBuf>,
     lib_query: String,
     lib_filter: [bool; 5], // RAW, JPEG, TIFF, Other, Edited only
+    /// Library: show bursts and duplicates as one thumbnail. `bursts` are the groups found for `bursts_key`
+    /// (folder generation, photo count), `burst_open` the groups shown expanded (by their first photo).
+    stack_bursts: bool,
+    bursts: Vec<Vec<PathBuf>>,
+    burst_of: std::collections::HashMap<PathBuf, usize>,
+    burst_open: std::collections::HashSet<PathBuf>,
+    bursts_key: Option<(usize, usize)>,
     current: Option<PathBuf>,
     photo: Option<Photo>,
     loading: bool,
@@ -697,7 +706,7 @@ impl App {
         Self {
             module: Module::Library, folder: None, files: vec![], thumbs: Default::default(), thumb_used: Default::default(), thumb_want: Default::default(), thumb_pending: Default::default(), thumb_ready: Default::default(), frame: 0, thumb_gen: Default::default(), load_gen: Default::default(), open_error: None, meta: Default::default(), lib_rating: 0,
             subdirs: vec![], tex_scale: 1.0, thumb_size: 190.0, lib_sel: None, lib_query: String::new(),
-            lib_filter: [true, true, true, true, false], current: None, photo: None, loading: false, params: Params::default(), prev_params: None,
+            lib_filter: [true, true, true, true, false], stack_bursts: false, bursts: vec![], burst_of: Default::default(), burst_open: Default::default(), bursts_key: None, current: None, photo: None, loading: false, params: Params::default(), prev_params: None,
             rendered: None, render_busy: false, photo_gen: 0, tex: None, before_tex: None, last_rgb: None, hover_rgb: None, shown_w: 0.0, bins: [[0.0; 128]; 3], clip_view: false,
             history: vec![Params::default()], hist_pos: 0, copied: None, view: View::After, holding_before: false, picking_base: false,
             status: String::new(), presets, preset_tex: vec![], last_preset: None, preset_mix: None, preset_amt: 100.0, preset_name: String::new(), stock_query: String::new(), my_stocks: negative::custom_stocks(), my_stock_name: String::new(), proof: 0,
@@ -1046,6 +1055,14 @@ impl App {
                     }
                 }
                 Msg::Status(s) => self.status = s,
+                Msg::Bursts(key, groups) => {
+                    if self.bursts_key == Some(key) {
+                        self.burst_of = groups.iter().enumerate().flat_map(|(k, g)| g.iter().map(move |f| (f.clone(), k))).collect();
+                        let n: usize = groups.iter().map(|g| g.len() - 1).sum();
+                        self.status = if groups.is_empty() { "No bursts or duplicates found".into() } else { format!("Stacked {} bursts and duplicates ({n} photos tucked away)", groups.len()) };
+                        self.bursts = groups;
+                    }
+                }
                 Msg::ChartFit(generation, name, fit) => {
                     self.chart.busy = false;
                     if generation == self.photo_gen {
@@ -3114,7 +3131,7 @@ impl App {
 
     fn lib_visible(&self) -> Vec<PathBuf> {
         let q = self.lib_query.to_lowercase();
-        self.files.iter().filter(|f| {
+        let mut v: Vec<PathBuf> = self.files.iter().filter(|f| {
             let real = load::copy_of(f).unwrap_or(f.to_path_buf());
             let e = ext_of(&real).to_lowercase();
             let kind = if load::is_raw(&real) { 0 } else if e == "jpg" || e == "jpeg" { 1 } else if e == "tif" || e == "tiff" { 2 } else { 3 };
@@ -3126,7 +3143,51 @@ impl App {
                 None => f.file_name().unwrap_or_default().to_string_lossy().to_lowercase().contains(q.trim()),
             };
             self.lib_filter[kind] && (!self.lib_filter[4] || m.edited) && rating_ok && found
-        }).cloned().collect()
+        }).cloned().collect();
+        if self.stack_bursts && !self.bursts.is_empty() {
+            let shown: std::collections::HashSet<PathBuf> = v.iter().cloned().collect();
+            // A closed stack shows one photo: its best rated, else the first.
+            let tops: Vec<Option<PathBuf>> = self.bursts.iter().map(|g| {
+                if self.burst_open.contains(&g[0]) {
+                    return None;
+                }
+                g.iter().filter(|f| shown.contains(*f)).max_by_key(|f| (self.meta.get(*f).map(|m| m.rating).unwrap_or(0), std::cmp::Reverse(g.iter().position(|x| x == *f)))).cloned()
+            }).collect();
+            v.retain(|f| match self.burst_of.get(f) {
+                Some(k) if !self.burst_open.contains(&self.bursts[*k][0]) => tops[*k].as_ref() == Some(f),
+                _ => true,
+            });
+        }
+        v
+    }
+
+    /// How many photos the closed stack topped by `f` holds (0 if it isn't the top of one), and whether `f` is in
+    /// an open stack.
+    fn burst_badge(&self, f: &PathBuf) -> (usize, bool) {
+        if !self.stack_bursts {
+            return (0, false);
+        }
+        match self.burst_of.get(f).map(|k| &self.bursts[*k]) {
+            Some(g) if self.burst_open.contains(&g[0]) => (0, true),
+            Some(g) => (g.len(), false),
+            None => (0, false),
+        }
+    }
+
+    /// Start finding bursts for the open folder, unless they are known or being found.
+    fn want_bursts(&mut self) {
+        let key = (self.thumb_gen.load(std::sync::atomic::Ordering::Relaxed), self.files.len());
+        if !self.stack_bursts || self.bursts_key == Some(key) {
+            return;
+        }
+        self.bursts_key = Some(key);
+        self.bursts.clear();
+        self.burst_of.clear();
+        self.status = "Looking for bursts and duplicates…".into();
+        let (files, tx) = (self.files.clone(), self.tx.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(Msg::Bursts(key, crate::bursts::find(&files)));
+        });
     }
 
     fn library_left(&mut self, ui: &mut Ui) {
@@ -3209,6 +3270,10 @@ impl App {
             if filter_chip(ui, "Edited only", self.lib_filter[4]).clicked() {
                 self.lib_filter[4] = !self.lib_filter[4];
             }
+            ui.add_space(10.0);
+            if filter_chip(ui, "Stack bursts", self.stack_bursts).on_hover_text("Show bursts and duplicate shots as one thumbnail with a count. Right-click one to open its stack").clicked() {
+                self.stack_bursts = !self.stack_bursts;
+            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui.add_enabled(!self.files.is_empty(), egui::Button::new("Print all…")).clicked() {
                     self.export_sel.clear();
@@ -3225,6 +3290,7 @@ impl App {
     }
 
     fn library_grid(&mut self, ui: &mut Ui) {
+        self.want_bursts();
         let visible = self.lib_visible();
         if self.files.is_empty() {
             ui.centered_and_justified(|ui| {
@@ -3251,6 +3317,7 @@ impl App {
         let (mut rename, mut rename_one, mut undo_rename) = (None::<bool>, None::<PathBuf>, false);
         let mut hdr = None::<bool>;
         let mut focus_stack = false;
+        let mut burst_toggle = None::<PathBuf>;
         let (mut add_to, mut add_files) = (None::<Option<usize>>, Vec::<PathBuf>::new());
         let lib_multi = self.lib_multi.clone();
         let can_undo_rename = self.folder.as_deref().is_some_and(crate::rename::can_undo);
@@ -3302,12 +3369,35 @@ impl App {
                             if m.label > 0 {
                                 ui.painter().rect_filled(Rect::from_min_max(pos2(r.right() - 26.0, r.bottom() - 6.0), pos2(r.right() - 6.0, r.bottom() - 2.0)), 2.0, LABEL_COLORS[(m.label - 1).min(4) as usize]);
                             }
+                            let (stacked, in_open) = self.burst_badge(f);
+                            if stacked > 0 {
+                                // A count over two offset cards, top right (left of the edited mark).
+                                let g = ui.painter().layout_no_wrap(stacked.to_string(), FontId::monospace(10.0), TEXT);
+                                let b = Rect::from_min_size(pos2(r.right() - 34.0 - g.size().x - 12.0, r.top() + 6.0), g.size() + vec2(18.0, 4.0));
+                                ui.painter().rect_filled(b, 4.0, Color32::from_rgba_unmultiplied(20, 20, 22, 215));
+                                for k in 0..2 {
+                                    let o = k as f32 * 2.0;
+                                    ui.painter().rect_stroke(Rect::from_min_size(b.min + vec2(4.0 + o, 4.0 - o + 2.0), vec2(5.0, 6.0)), 1.0, Stroke::new(1.0, TEXT), egui::StrokeKind::Inside);
+                                }
+                                ui.painter().galley(b.min + vec2(14.0, 2.0), g, TEXT);
+                            }
+                            if in_open {
+                                ui.painter().hline(r.x_range(), r.bottom() + 2.0, Stroke::new(2.0, TEXT2));
+                            }
                             let is_copy = load::copy_of(f).is_some();
                             let colls: Vec<String> = self.collections.iter().filter(|c| !c.is_smart()).map(|c| c.name.clone()).collect();
                             let multi = self.lib_multi.len();
                             let in_multi = self.lib_multi.contains(f);
                             let pano_busy = self.pano_busy;
                             resp.context_menu(|ui| {
+                                if stacked > 0 && ui.button(format!("Open stack ({stacked} photos)")).clicked() {
+                                    burst_toggle = Some(f.clone());
+                                    ui.close();
+                                }
+                                if in_open && ui.button("Close stack").clicked() {
+                                    burst_toggle = Some(f.clone());
+                                    ui.close();
+                                }
                                 if multi >= 2 && in_multi {
                                     if ui.button(format!("Print {multi} frames…")).clicked() {
                                         export_sel = true;
@@ -3432,6 +3522,13 @@ impl App {
                 vec![files]
             });
             self.merge_hdr(ui.ctx(), groups);
+        }
+        if let Some(f) = burst_toggle
+            && let Some(first) = self.burst_of.get(&f).map(|k| self.bursts[*k][0].clone())
+        {
+            if !self.burst_open.remove(&first) {
+                self.burst_open.insert(first);
+            }
         }
         if focus_stack {
             let mut files = self.lib_multi.clone();
