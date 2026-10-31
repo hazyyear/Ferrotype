@@ -23,6 +23,7 @@ mod roll;
 mod colour;
 mod demosaic;
 mod library;
+mod focus;
 
 use develop::Params;
 use image::{DynamicImage, Rgb32FImage, codecs::jpeg::JpegEncoder};
@@ -573,6 +574,7 @@ ferrotype pano [--projection auto|cylindrical|spherical|perspective] FILES...
                                 merge overlapping photos into FIRST-pano.tif
 ferrotype hdr FILES...          merge an exposure bracket into FIRST-hdr.exr (32-bit, opens like any photo)
 ferrotype hdr --auto FOLDER     find brackets (by capture time and exposure) and merge each
+ferrotype stack FILES...        focus-stack photos focused at different distances into FIRST-stack.exr
 ferrotype contact [--out FILE] [--cols N] FILES...
                                 one contact sheet image of all FILES (default contact.jpg, 6 columns)
 ferrotype lens FILES...         show which lens profile each photo gets
@@ -795,6 +797,17 @@ fn cli_hdr(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn cli_stack(args: &[String]) -> Result<(), String> {
+    let mut files: Vec<PathBuf> = args.iter().map(PathBuf::from).collect();
+    if files.len() < 2 {
+        return Err(USAGE.into());
+    }
+    load::sort_photos(&mut files);
+    let out = focus::stack_files(&files, &|s| eprintln!("{s}…"))?;
+    println!("{} -> {}", files.len(), out.display());
+    Ok(())
+}
+
 fn cli_rename(args: &[String]) -> Result<(), String> {
     let (mut pattern, mut roll, mut dry, mut files) = (String::new(), String::new(), false, vec![]);
     let mut it = args.iter();
@@ -875,6 +888,7 @@ fn main() {
         Some("pano") => cli_pano(&args[1..]),
         Some("rename") => cli_rename(&args[1..]),
         Some("hdr") => cli_hdr(&args[1..]),
+        Some("stack") => cli_stack(&args[1..]),
         Some("lens") => {
             for f in &args[1..] {
                 let shot = lens::shot(Path::new(f)).unwrap_or_default();

@@ -224,6 +224,8 @@ enum Msg {
     Pano(Result<PathBuf, String>),
     /// HDR merges finished: the files written (or the first error).
     Hdr(Result<Vec<PathBuf>, String>),
+    /// A focus stack finished: the file written.
+    Stacked(Result<PathBuf, String>),
     /// A batch rename finished: what moved where.
     Renamed(Result<Vec<(PathBuf, PathBuf)>, String>),
     /// Settings synced to these frames (with their new summaries).
@@ -1153,6 +1155,20 @@ impl App {
                             self.lib_multi.clear();
                         }
                         Err(e) => self.status = format!("HDR merge failed: {e}"),
+                    }
+                }
+                Msg::Stacked(r) => {
+                    self.pano_busy = false;
+                    match r {
+                        Ok(out) => {
+                            self.status = format!("Focus stack saved as {}", out.file_name().unwrap_or_default().to_string_lossy());
+                            if let Some(d) = self.folder.clone() {
+                                self.open_path(ctx, &d);
+                            }
+                            self.lib_sel = Some(out);
+                            self.lib_multi.clear();
+                        }
+                        Err(e) => self.status = format!("Focus stack failed: {e}"),
                     }
                 }
                 Msg::Renamed(r) => match r {
@@ -3234,6 +3250,7 @@ impl App {
         let mut export_sel = false;
         let (mut rename, mut rename_one, mut undo_rename) = (None::<bool>, None::<PathBuf>, false);
         let mut hdr = None::<bool>;
+        let mut focus_stack = false;
         let (mut add_to, mut add_files) = (None::<Option<usize>>, Vec::<PathBuf>::new());
         let lib_multi = self.lib_multi.clone();
         let can_undo_rename = self.folder.as_deref().is_some_and(crate::rename::can_undo);
@@ -3298,6 +3315,10 @@ impl App {
                                     }
                                     if ui.add_enabled(!pano_busy, egui::Button::new(format!("Merge {multi} photos to HDR"))).on_hover_text("Lines up an exposure bracket of one scene and merges it into a 32-bit photo that keeps the highlight and shadow detail").clicked() {
                                         hdr = Some(true);
+                                        ui.close();
+                                    }
+                                    if ui.add_enabled(!pano_busy, egui::Button::new(format!("Focus-stack {multi} photos"))).on_hover_text("Lines up photos of one scene focused at different distances and keeps the sharpest part of each, so everything is in focus").clicked() {
+                                        focus_stack = true;
                                         ui.close();
                                     }
                                     if ui.button(format!("Rename {multi} photos…")).clicked() {
@@ -3411,6 +3432,11 @@ impl App {
                 vec![files]
             });
             self.merge_hdr(ui.ctx(), groups);
+        }
+        if focus_stack {
+            let mut files = self.lib_multi.clone();
+            load::sort_photos(&mut files);
+            self.focus_stack(ui.ctx(), files);
         }
         if let Some(multi) = rename {
             let mut files = if multi { self.lib_multi.clone() } else { rename_one.into_iter().collect() };
@@ -4550,6 +4576,25 @@ impl App {
                 }
             }
             let _ = tx.send(Msg::Hdr(Ok(outs)));
+            ctx2.request_repaint();
+        });
+    }
+
+    /// Focus-stack `files` (in focus order) on a worker thread.
+    fn focus_stack(&mut self, ctx: &egui::Context, files: Vec<PathBuf>) {
+        if self.pano_busy {
+            return;
+        }
+        self.pano_busy = true;
+        self.status = "Focus stacking…".into();
+        let (tx, ctx2) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let (tx2, c3) = (tx.clone(), ctx2.clone());
+            let r = crate::focus::stack_files(&files, &move |m| {
+                let _ = tx2.send(Msg::Status(format!("Focus stack: {m}…")));
+                c3.request_repaint();
+            });
+            let _ = tx.send(Msg::Stacked(r));
             ctx2.request_repaint();
         });
     }
