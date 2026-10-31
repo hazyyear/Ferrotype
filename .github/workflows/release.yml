@@ -1,0 +1,110 @@
+# Release builds. Push a tag like v0.2.0 (or run this by hand from the Actions tab) and this builds:
+#   Windows: an installer (ferrotype-<version>-windows-setup.exe) and a portable zip
+#   macOS (Apple Silicon): a .dmg with ferrotype.app
+#   Linux (x86-64): a .tar.gz
+# A tag also creates a GitHub release with the files attached; a manual run keeps them as workflow artifacts.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Version
+        shell: bash
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          [[ "$GITHUB_REF_TYPE" == tag ]] || v="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)-dev.${GITHUB_RUN_NUMBER}"
+          echo "VERSION=$v" >> "$GITHUB_ENV"
+      - name: Build
+        run: cargo build --release --locked
+      - name: Installer
+        shell: pwsh
+        run: |
+          if (-not (Get-Command iscc -ErrorAction SilentlyContinue)) {
+            if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) { choco install innosetup -y --no-progress }
+            $env:Path += ";${env:ProgramFiles(x86)}\Inno Setup 6"
+          }
+          iscc /DAppVersion=$env:VERSION packaging\ferrotype.iss
+          New-Item -ItemType Directory -Force portable | Out-Null
+          Copy-Item target\release\ferrotype.exe, LICENSE, README.md portable\
+          Compress-Archive -Path portable\* -DestinationPath dist\ferrotype-$env:VERSION-windows-portable.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Version
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          [[ "$GITHUB_REF_TYPE" == tag ]] || v="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)-dev.${GITHUB_RUN_NUMBER}"
+          echo "VERSION=$v" >> "$GITHUB_ENV"
+      - name: Build
+        run: cargo build --release --locked
+      - name: App bundle and disk image
+        run: packaging/macos-bundle.sh "$VERSION"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/*
+
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Version
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          [[ "$GITHUB_REF_TYPE" == tag ]] || v="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)-dev.${GITHUB_RUN_NUMBER}"
+          echo "VERSION=$v" >> "$GITHUB_ENV"
+      - name: System libraries
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libgl1-mesa-dev libudev-dev
+      - name: Build
+        run: cargo build --release --locked
+      - name: Archive
+        run: |
+          d="ferrotype-$VERSION-linux-x86_64"
+          mkdir -p "dist/$d"
+          cp target/release/ferrotype LICENSE README.md "dist/$d/"
+          cp assets/brand/png/ferrotype-256.png "dist/$d/ferrotype.png"
+          tar -C dist -czf "dist/$d.tar.gz" "$d"
+          rm -r "dist/$d"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/*
+
+  publish:
+    if: github.ref_type == 'tag'
+    needs: [windows, macos, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
