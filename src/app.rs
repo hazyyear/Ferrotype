@@ -1683,10 +1683,10 @@ impl App {
     }
 
     /// Pick a GPX track, then read it and the capture times of `files` off the UI thread.
-    fn start_geotag(&mut self, files: Vec<PathBuf>) {
+    fn start_geotag(&mut self, ctx: &egui::Context, files: Vec<PathBuf>) {
         let Some(gpx) = rfd::FileDialog::new().set_title("Choose a GPX track").add_filter("GPX track", &["gpx"]).pick_file() else { return };
         self.status = "Reading the track…".into();
-        let tx = self.tx.clone();
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
         std::thread::spawn(move || {
             let r = crate::geotag::read_gpx(&gpx).map(|track| {
                 let files: Vec<(PathBuf, Option<i64>)> = files.par_iter().filter(|f| load::copy_of(f).is_none())
@@ -1696,6 +1696,7 @@ impl App {
                 GeoDlg { name: gpx.file_name().unwrap_or_default().to_string_lossy().to_string(), track, files, offset }
             });
             let _ = tx.send(Msg::Geo(r));
+            ctx.request_repaint();
         });
     }
 
@@ -2539,7 +2540,7 @@ impl App {
     }
 
     /// Web gallery of the selected photos (or all shown), in a new folder inside one the user picks.
-    fn make_gallery(&mut self) {
+    fn make_gallery(&mut self, ctx: &egui::Context) {
         let files = if self.lib_multi.len() >= 2 { let mut f = self.lib_multi.clone(); load::sort_photos(&mut f); f } else { self.lib_visible() };
         let Some(parent) = rfd::FileDialog::new().set_title("Where to put the gallery folder").pick_folder() else { return };
         let title = match (&self.collection, &self.folder) {
@@ -2549,17 +2550,22 @@ impl App {
         };
         self.commit();
         self.status = format!("Making a web gallery of {} photos…", files.len());
-        let tx = self.tx.clone();
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
         std::thread::spawn(move || {
             let o = crate::gallery::Options { title: title.clone(), ..Default::default() };
             let r = crate::gallery::new_folder(&parent, &title).and_then(|dir| {
                 let tx2 = tx.clone();
-                crate::gallery::make(&files, &dir, &o, &move |n, t| { let _ = tx2.send(Msg::Status(format!("Web gallery: {n} of {t}…"))); })
+                let c2 = ctx.clone();
+                crate::gallery::make(&files, &dir, &o, &move |n, t| {
+                    let _ = tx2.send(Msg::Status(format!("Web gallery: {n} of {t}…")));
+                    c2.request_repaint();
+                })
             });
             let _ = tx.send(Msg::Status(match r {
                 Ok(page) => format!("Web gallery saved: {}", page.parent().unwrap_or(&page).display()),
                 Err(e) => format!("Web gallery failed: {e}"),
             }));
+            ctx.request_repaint();
         });
     }
 
@@ -2882,7 +2888,7 @@ impl App {
                 if self.tool == Tool::Target {
                     ui.add_space(6.0);
                     let was = self.target_mode;
-                    segmented(ui, &mut self.target_mode, &["Curve", "Hue", "Saturation", "Luminance"]);
+                    segmented(ui, &mut self.target_mode, &["Curve", "Hue", "Sat", "Lum"]);
                     if self.target_mode != was {
                         self.open[if self.target_mode == 0 { 1 } else { 2 }] = true;
                         if self.target_mode > 0 {
@@ -3322,7 +3328,7 @@ impl App {
     }
 
     /// Start finding bursts for the open folder, unless they are known or being found.
-    fn want_bursts(&mut self) {
+    fn want_bursts(&mut self, ctx: &egui::Context) {
         let key = (self.thumb_gen.load(std::sync::atomic::Ordering::Relaxed), self.files.len());
         if !self.stack_bursts || self.bursts_key == Some(key) {
             return;
@@ -3331,9 +3337,10 @@ impl App {
         self.bursts.clear();
         self.burst_of.clear();
         self.status = "Looking for bursts and duplicates…".into();
-        let (files, tx) = (self.files.clone(), self.tx.clone());
+        let (files, tx, ctx) = (self.files.clone(), self.tx.clone(), ctx.clone());
         std::thread::spawn(move || {
             let _ = tx.send(Msg::Bursts(key, crate::bursts::find(&files)));
+            ctx.request_repaint();
         });
     }
 
@@ -3426,16 +3433,24 @@ impl App {
                     self.export_sel.clear();
                     self.export_dialog = Some(true);
                 }
-                if ui.add_enabled(!self.files.is_empty(), egui::Button::new("Web gallery…")).on_hover_text("A folder with a web page of the photos shown (or selected), ready to upload anywhere").clicked() {
-                    self.make_gallery();
-                }
-                if ui.add_enabled(!self.files.is_empty(), egui::Button::new("Geotag…")).on_hover_text("Place photos on the map from a GPX track (phone, watch or GPS logger). Uses the selected photos, or all shown").clicked() {
-                    let files = if self.lib_multi.len() >= 2 { self.lib_multi.clone() } else { self.lib_visible() };
-                    self.start_geotag(files);
-                }
-                if ui.add_enabled(!self.files.is_empty(), egui::Button::new("Contact sheet…")).on_hover_text("One image of every photo shown, numbered, like a darkroom contact print").clicked() {
-                    self.make_contact_sheet();
-                }
+                let has = !self.files.is_empty();
+                ui.add_enabled_ui(has, |ui| {
+                    ui.menu_button("Tools", |ui| {
+                        if ui.button("Contact sheet…").on_hover_text("One image of every photo shown, numbered, like a darkroom contact print").clicked() {
+                            self.make_contact_sheet();
+                            ui.close();
+                        }
+                        if ui.button("Web gallery…").on_hover_text("A folder with a web page of the photos shown (or selected), ready to upload anywhere").clicked() {
+                            self.make_gallery(&ui.ctx().clone());
+                            ui.close();
+                        }
+                        if ui.button("Geotag from GPX…").on_hover_text("Place photos on the map from a GPX track (phone, watch or GPS logger). Uses the selected photos, or all shown").clicked() {
+                            let files = if self.lib_multi.len() >= 2 { self.lib_multi.clone() } else { self.lib_visible() };
+                            self.start_geotag(&ui.ctx().clone(), files);
+                            ui.close();
+                        }
+                    });
+                });
                 ui.add_space(8.0);
                 plain_slider(ui, &mut self.thumb_size, 120.0, 320.0, 110.0).on_hover_text("Thumbnail size");
                 ui.label(RichText::new("Size").size(12.0).color(TEXT3));
@@ -3444,7 +3459,7 @@ impl App {
     }
 
     fn library_grid(&mut self, ui: &mut Ui) {
-        self.want_bursts();
+        self.want_bursts(&ui.ctx().clone());
         let visible = self.lib_visible();
         if self.files.is_empty() {
             ui.centered_and_justified(|ui| {
@@ -5428,6 +5443,9 @@ impl App {
                 "clipping" => self.clip_view = !self.clip_view,
                 "crop" | "heal" | "gradient" | "brush" | "target" if self.module == Module::Develop => {
                     let t = match id { "crop" => Tool::Crop, "heal" => Tool::Heal, "target" => Tool::Target, _ => Tool::Mask };
+                    if t == Tool::Target {
+                        self.open[if self.target_mode == 0 { 1 } else { 2 }] = true;
+                    }
                     if t == Tool::Mask {
                         self.mask_ui.draw = if id == "brush" { Draw::Brush } else { Draw::Linear };
                     }
