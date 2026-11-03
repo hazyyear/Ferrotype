@@ -80,11 +80,12 @@ struct Meta {
     rating: u8,
     flag: i8,
     label: u8,
+    gps: Option<crate::geotag::Location>,
 }
 
 impl Meta {
     fn of(p: &Params) -> Self {
-        Meta { edited: p.is_edited(), neg: p.neg.enabled, rating: p.rating, flag: p.flag, label: p.label }
+        Meta { edited: p.is_edited(), neg: p.neg.enabled, rating: p.rating, flag: p.flag, label: p.label, gps: p.gps }
     }
 }
 
@@ -778,6 +779,8 @@ impl App {
         // Ratings and edit marks arrive with each thumbnail: reading every sidecar here froze the window on cloud folders.
         self.meta.clear();
         self.cull.failed.clear();
+        // Stop watching edit copies left behind in other folders.
+        self.edit_watch.retain(|(f, _)| f.parent() == Some(dir.as_path()));
         self.show_files(ctx, files, Some(dir));
         if let Some(f) = file {
             self.select(ctx, f);
@@ -1831,6 +1834,7 @@ impl App {
                 p.gps = Some((*g).into());
                 if write_params(f, &p).is_ok() {
                     n += 1;
+                    self.meta.insert(f.clone(), Meta::of(&p));
                     if self.current.as_ref() == Some(f) {
                         self.params.gps = p.gps;
                         for h in &mut self.history {
@@ -3543,7 +3547,12 @@ impl App {
                             ui.close();
                         }
                         if ui.button("Geotag from GPX…").on_hover_text("Place photos on the map from a GPX track (phone, watch or GPS logger). Uses the selected photos, or all shown").clicked() {
-                            let files = if self.lib_multi.len() >= 2 { self.lib_multi.clone() } else { self.lib_visible() };
+                            let mut files = if self.lib_multi.len() >= 2 { self.lib_multi.clone() } else { self.lib_visible() };
+                            // A stack's hidden frames were taken at the same place: place them too.
+                            let hidden: Vec<PathBuf> = files.iter().filter(|_| self.stack_bursts).filter_map(|f| self.burst_of.get(f)).flat_map(|k| self.bursts[*k].iter().cloned()).collect();
+                            files.extend(hidden);
+                            files.sort();
+                            files.dedup();
                             self.start_geotag(&ui.ctx().clone(), files);
                             ui.close();
                         }
@@ -4044,7 +4053,7 @@ impl App {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.label(RichText::new(v).size(12.0)));
             });
         }
-        let gps = if self.current.as_ref() == Some(&f) { self.params.gps } else { read_params(&f).and_then(|p| p.gps) };
+        let gps = if self.current.as_ref() == Some(&f) { self.params.gps } else { mm.and_then(|m| m.gps) };
         if let Some(g) = gps {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Location").size(12.0).color(TEXT3));
