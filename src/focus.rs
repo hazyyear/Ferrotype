@@ -26,6 +26,13 @@ fn sharpness(img: &Rgb32FImage) -> Vec<f32> {
     crate::develop::blur(&lap, w, h, sigma)
 }
 
+/// The reference frame's sharpness and the scale every frame is weighed on.
+fn scale(reference: &Rgb32FImage) -> (Vec<f32>, f32) {
+    let s = sharpness(reference);
+    let top = s.par_iter().cloned().reduce(|| 0.0, f32::max).max(1e-9);
+    (s, top)
+}
+
 /// How strongly the sharpest frame wins. Higher is crisper but shows more seams where frames disagree.
 const POWER: f32 = 4.0;
 
@@ -40,10 +47,14 @@ impl Stack {
         Stack { acc: vec![0.0; (w * h * 3) as usize], sw: vec![0.0; (w * h) as usize] }
     }
 
-    fn add(&mut self, img: &Rgb32FImage) {
+    /// Add a frame. `top` is one sharpness scale shared by every frame (the reference frame's peak), so frames
+    /// are compared on the same footing and the power doesn't underflow.
+    fn add(&mut self, img: &Rgb32FImage, top: f32) {
         let s = sharpness(img);
-        // Normalise so the power doesn't underflow on dark or soft frames.
-        let top = s.par_iter().cloned().reduce(|| 0.0, f32::max).max(1e-9);
+        self.add_with(img, &s, top);
+    }
+
+    fn add_with(&mut self, img: &Rgb32FImage, s: &[f32], top: f32) {
         self.acc.par_chunks_mut(3).zip(self.sw.par_iter_mut()).zip(img.as_raw().par_chunks(3)).zip(s.par_iter()).for_each(|(((a, sw), px), s)| {
             let wgt = (s / top + 1e-4).powf(POWER);
             (0..3).for_each(|k| a[k] += px[k] * wgt);
@@ -53,7 +64,8 @@ impl Stack {
 
     fn finish(self, w: u32, h: u32) -> Rgb32FImage {
         let mut out = self.acc;
-        out.par_chunks_mut(3).zip(self.sw.par_iter()).for_each(|(px, sw)| px.iter_mut().for_each(|v| *v /= sw.max(1e-12)));
+        // Every weight is above zero (see the 1e-4 in `add`), so plain division keeps flat areas at their value.
+        out.par_chunks_mut(3).zip(self.sw.par_iter()).for_each(|(px, sw)| px.iter_mut().for_each(|v| *v /= sw));
         Rgb32FImage::from_raw(w, h, out).expect("buffer size matches")
     }
 }
@@ -81,10 +93,15 @@ pub fn stack(imgs: Vec<Rgb32FImage>, progress: &dyn Fn(&str)) -> Result<Rgb32FIm
     }
     let r = n / 2;
     let reference = imgs[r].clone();
+    let (ref_s, top) = scale(&reference);
     let mut st = Stack::new(w, h);
     for (i, img) in imgs.into_iter().enumerate() {
         progress(&format!("Frame {} of {n}", i + 1));
-        st.add(&if i == r { img } else { aligned(&reference, img) });
+        if i == r {
+            st.add_with(&img, &ref_s, top);
+        } else {
+            st.add(&aligned(&reference, img), top);
+        }
     }
     Ok(st.finish(w, h))
 }
@@ -100,18 +117,20 @@ pub fn stack_files(files: &[PathBuf], progress: &dyn Fn(&str)) -> Result<PathBuf
     progress("Loading the middle frame");
     let reference = crate::load::load(&files[r])?;
     let (w, h) = reference.dimensions();
+    let (ref_s, top) = scale(&reference);
     let mut st = Stack::new(w, h);
+    st.add_with(&reference, &ref_s, top);
+    drop(ref_s);
     for (i, f) in files.iter().enumerate() {
-        progress(&format!("Frame {} of {n}", i + 1));
         if i == r {
-            st.add(&reference);
             continue;
         }
+        progress(&format!("Frame {} of {n}", i + 1));
         let img = crate::load::load(f)?;
         if img.dimensions() != (w, h) {
             return Err(format!("{} is not the same size as the others", f.file_name().unwrap_or_default().to_string_lossy()));
         }
-        st.add(&aligned(&reference, img));
+        st.add(&aligned(&reference, img), top);
     }
     drop(reference);
     let out_img = st.finish(w, h);
@@ -162,5 +181,42 @@ mod tests {
             let (got, soft_err) = (err(x0, x1, &out), err(x0, x1, &blurred));
             assert!(got < soft_err * 0.25, "columns {x0}..{x1}: stacked error {got} vs blurred {soft_err}");
         }
+    }
+
+    #[test]
+    fn flat_areas_keep_their_brightness() {
+        // Blown highlights or a plain backdrop: no detail in any frame.
+        let flat = Rgb32FImage::from_pixel(64, 48, image::Rgb([0.9, 0.6, 0.3]));
+        let out = stack(vec![flat.clone(), flat.clone(), flat], &|_| {}).unwrap();
+        for px in out.pixels() {
+            assert!((px[0] - 0.9).abs() < 1e-4 && (px[1] - 0.6).abs() < 1e-4 && (px[2] - 0.3).abs() < 1e-4, "{px:?}");
+        }
+    }
+
+    #[test]
+    fn frames_are_weighed_on_one_scale() {
+        let (w, h) = (160u32, 100u32);
+        // Strong detail on the left, faint detail on the right.
+        let scene = Rgb32FImage::from_fn(w, h, |x, y| {
+            let on = (x / 3 + y / 3) % 2 == 0;
+            let v = if x < w / 2 { if on { 0.9 } else { 0.05 } } else if on { 0.5 } else { 0.42 };
+            image::Rgb([v, v, v])
+        });
+        let c = [0usize, 1, 2].map(|k| crate::develop::blur(&scene.as_raw().iter().skip(k).step_by(3).cloned().collect::<Vec<f32>>(), w as usize, h as usize, 1.5));
+        let soft = Rgb32FImage::from_fn(w, h, |x, y| { let i = (y * w + x) as usize; image::Rgb([c[0][i], c[1][i], c[2][i]]) });
+        // Frame A: all of it sharp. Frame B: blank on the left, the faint half soft. B's own peak is low, so on a
+        // per-frame scale B's soft detail would outweigh A's sharp but faint detail.
+        let b = Rgb32FImage::from_fn(w, h, |x, y| if x < w / 2 { image::Rgb([0.475; 3]) } else { *soft.get_pixel(x, y) });
+        let out = stack(vec![scene.clone(), b], &|_| {}).unwrap();
+        let err = |img: &Rgb32FImage| {
+            let mut e = 0.0;
+            for y in 10..h - 10 {
+                for x in w / 2 + 10..w - 10 {
+                    e += (img.get_pixel(x, y)[0] - scene.get_pixel(x, y)[0]).abs();
+                }
+            }
+            e
+        };
+        assert!(err(&out) < err(&soft) * 0.25, "faint half: stacked error {} vs soft {}", err(&out), err(&soft));
     }
 }
