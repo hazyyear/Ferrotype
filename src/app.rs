@@ -314,6 +314,8 @@ struct Photo {
 
 pub struct App {
     module: Module,
+    /// The tab shown last frame, so a status line from one tab doesn't follow you into the next.
+    shown_module: Module,
     /// Search details per photo (built in the background the first time a search is typed in a folder), the
     /// folder generation they belong to, and whether a build is running.
     search: std::collections::HashMap<PathBuf, crate::library::Entry>,
@@ -438,6 +440,8 @@ pub struct App {
     export_dialog: Option<bool>,
     keymap: Keymap,
     keys_open: bool,
+    keys_query: String,
+    settings_open: bool,
     /// Screen profile and printer proofing settings, and the loaded printer profile.
     colour: crate::colour::Settings,
     printer: Option<Arc<crate::colour::Proof>>,
@@ -669,6 +673,27 @@ fn stock_iso(s: &negative::Stock) -> String {
     negative::iso(s).map(|v| v.to_string()).unwrap_or_default()
 }
 
+/// A drop-down of the built-in stocks, for screens that convert but aren't Negative. True when one was picked.
+fn stock_picker(ui: &mut Ui, id: &str, np: &mut negative::NegParams) -> bool {
+    let st = negative::stock(&np.stock);
+    let mut picked_one = false;
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Stock").size(12.0).color(LABEL));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            egui::ComboBox::from_id_salt(id).selected_text(format!("{} {}", st.brand, st.name)).width(ui.available_width().min(210.0)).height(360.0).show_ui(ui, |ui| {
+                for s in STOCKS {
+                    if picked(ui, np.stock == s.id, format!("{} {}", s.brand, s.name)).clicked() {
+                        np.stock = s.id.into();
+                        np.enabled = true;
+                        picked_one = true;
+                    }
+                }
+            });
+        });
+    });
+    picked_one
+}
+
 fn kind_label(k: Kind) -> &'static str {
     match k { Kind::Color => "C-41 colour negative", Kind::Cine => "ECN-2 motion picture", Kind::Bw => "Black & white", Kind::Slide => "E-6 slide, no inversion" }
 }
@@ -680,12 +705,12 @@ fn describe_change(a: &Params, b: &Params) -> (String, String) {
         ("temp", "Temp"), ("tint", "Tint"), ("exposure", "Exposure"), ("contrast", "Contrast"), ("highlights", "Highlights"), ("shadows", "Shadows"),
         ("whites", "Whites"), ("blacks", "Blacks"), ("texture", "Texture"), ("clarity", "Clarity"), ("dehaze", "Dehaze"), ("vibrance", "Vibrance"),
         ("saturation", "Saturation"), ("c_hi", "Curve highlights"), ("c_li", "Curve lights"), ("c_da", "Curve darks"), ("c_sh", "Curve shadows"),
-        ("hsl", "Color mixer"), ("grade", "Color grading"), ("g_blend", "Grading blend"), ("g_bal", "Grading balance"), ("sh_amt", "Sharpening"),
+        ("hsl", "Colour mixer"), ("grade", "Colour grading"), ("g_blend", "Grading blend"), ("g_bal", "Grading balance"), ("sh_amt", "Sharpening"),
         ("sh_rad", "Sharpen radius"), ("sh_det", "Sharpen detail"), ("sh_mask", "Sharpen masking"), ("nr_lum", "Luminance NR"), ("nr_det", "NR detail"),
-        ("nr_col", "Color NR"), ("o_dist", "Distortion"), ("o_vig", "Lens vignetting"), ("o_fringe", "Defringe"), ("t_vert", "Vertical"), ("t_hor", "Horizontal"),
+        ("nr_col", "Colour NR"), ("o_dist", "Distortion"), ("o_vig", "Lens vignetting"), ("o_fringe", "Defringe"), ("t_vert", "Vertical"), ("t_hor", "Horizontal"),
         ("t_rot", "Rotate"), ("t_scale", "Scale"), ("flip_h", "Flip"), ("crop", "Crop"), ("vig", "Vignette"), ("vig_mid", "Vignette midpoint"),
         ("vig_round", "Vignette roundness"), ("vig_fea", "Vignette feather"), ("vig_hi", "Vignette highlights"), ("gr_amt", "Grain"), ("gr_size", "Grain size"),
-        ("gr_rough", "Grain roughness"), ("cal_sh", "Shadows tint"), ("cal", "Calibration"), ("neg", "Negative"), ("border", "Border"), ("spots", "Spot removal"), ("masks", "Mask"), ("hal_amt", "Halation"), ("hal_size", "Halation size"), ("hal_thr", "Halation threshold"), ("curves", "Point curve"), ("lut", "LUT"), ("lut_amt", "LUT amount"), ("rating", "Rating"), ("flag", "Flag"),
+        ("gr_rough", "Grain roughness"), ("cal_sh", "Shadows tint"), ("cal", "Calibration"), ("neg", "Negative"), ("border", "Border"), ("spots", "Heal"), ("masks", "Masks"), ("hal_amt", "Halation"), ("hal_size", "Halation size"), ("hal_thr", "Halation threshold"), ("curves", "Point curve"), ("lut", "LUT"), ("lut_amt", "LUT amount"), ("rating", "Rating"), ("flag", "Flag"),
         ("rot90", "Rotate 90°"), ("profile", "Profile"), ("label", "Label"), ("ai_nr", "AI denoise"), ("ir_clean", "Infrared clean"), ("snapshots", "Snapshot"),
     ];
     let changed: Vec<&(&str, &str)> = names.iter().filter(|(k, _)| ja.get(k) != jb.get(k)).collect();
@@ -724,7 +749,7 @@ impl App {
             presets.extend(user);
         }
         Self {
-            module: Module::Library, folder: None, files: vec![], thumbs: Default::default(), thumb_used: Default::default(), thumb_want: Default::default(), thumb_pending: Default::default(), thumb_ready: Default::default(), frame: 0, thumb_gen: Default::default(), load_gen: Default::default(), open_error: None, meta: Default::default(), lib_rating: 0,
+            module: Module::Library, shown_module: Module::Library, folder: None, files: vec![], thumbs: Default::default(), thumb_used: Default::default(), thumb_want: Default::default(), thumb_pending: Default::default(), thumb_ready: Default::default(), frame: 0, thumb_gen: Default::default(), load_gen: Default::default(), open_error: None, meta: Default::default(), lib_rating: 0,
             subdirs: vec![], tex_scale: 1.0, thumb_size: 190.0, lib_sel: None, lib_query: String::new(),
             lib_filter: [true, true, true, true, false], stack_bursts: false, bursts: vec![], burst_of: Default::default(), burst_open: Default::default(), bursts_key: None, current: None, photo: None, loading: false, params: Params::default(), prev_params: None,
             rendered: None, render_busy: false, photo_gen: 0, tex: None, before_tex: None, last_rgb: None, hover_rgb: None, shown_w: 0.0, bins: [[0.0; 128]; 3], clip_view: false,
@@ -733,7 +758,7 @@ impl App {
             stock_tab: 0, mixer_tab: 0, open: [true, false, false, false, false, false, false, false, false, false, false, false, false, false], tool: Tool::None,
             zoom: None, curve_chan: 0, curve_grab: None, curve_big: false, samples: vec![], target_mode: 0, target_hit: None, rename_dlg: None, geo_dlg: None, mask_ui: MaskUi::default(), chart: ChartUi::new(), profiles: crate::calib::saved(),
             crop_grab: None, crop_aspect: 0, spot_size: 2.0, heal_clone: false, spot_sel: None, heal_drag: None, view_map: [1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0], photo_wh: [1.0, 1.0],
-            export: ExportOpts::load(), editors: crate::editors::all(), edit_watch: vec![], edit_watch_at: 0.0, export_dialog: None, export_sel: vec![], export_sets: [false; 3], keymap: Keymap::load(), keys_open: false, colour: crate::colour::Settings::load(), printer: None, binding: None, picking_wb: false,
+            export: ExportOpts::load(), editors: crate::editors::all(), edit_watch: vec![], edit_watch_at: 0.0, export_dialog: None, export_sel: vec![], export_sets: [false; 3], keymap: Keymap::load(), keys_open: false, keys_query: String::new(), settings_open: false, colour: crate::colour::Settings::load(), printer: None, binding: None, picking_wb: false,
             thumb_due: false, lens_query: String::new(), lib_multi: vec![], pano_busy: false,
             watch: false, watch_open: true, watch_apply: false, watch_at: 0.0, watch_sizes: Default::default(), wipe: 0.5, wipe_tex: None,
             cull: Default::default(), scan: ScanUi::default(), ai_busy: false, tx, rx, roll: Default::default(), roll_dir: None,
@@ -1261,9 +1286,71 @@ impl App {
     fn convert_if_negative(&mut self) {
         let Some(base) = self.auto_base() else { return };
         if self.module == Module::Negative && !self.params.neg.enabled && negative::orange_mask(base) {
-            self.params.neg.enabled = true;
+            self.auto_negative();
             self.status = "Found an orange film base, so this was converted as a colour negative".into();
         }
+    }
+
+    /// Turn the conversion on for a frame that was found to be a negative. When the roll notes name a film,
+    /// that film is used, so the roll's Film field and the conversion never disagree.
+    pub(super) fn auto_negative(&mut self) {
+        if self.params.neg.enabled {
+            return;
+        }
+        if self.roll_matches_current() && self.roll_stock_usable() {
+            let r = self.roll.clone();
+            crate::roll::apply_stock(&r, &mut self.params);
+        }
+        self.params.neg.enabled = true;
+    }
+
+    /// The open photo is in the open folder, so the folder's roll notes are its own.
+    fn roll_matches_current(&mut self) -> bool {
+        let here = self.current.as_ref().and_then(|c| c.parent().map(Path::to_path_buf));
+        here.is_some() && here == self.folder && self.roll_loaded().is_some()
+    }
+
+    /// The roll's Film names a stock the conversion knows (built in or one of yours).
+    fn roll_stock_usable(&self) -> bool {
+        negative::STOCKS.iter().any(|s| s.id == self.roll.stock) || self.my_stocks.iter().any(|(_, c)| c.name == self.roll.stock.trim())
+    }
+
+    /// A stock was picked for this frame by hand. A roll with no film noted takes it, so the notes stay true.
+    pub(super) fn stock_picked(&mut self) {
+        if !self.roll_matches_current() || !self.roll.stock.trim().is_empty() {
+            return;
+        }
+        let Some(dir) = self.folder.clone() else { return };
+        self.roll.stock = self.params.neg.stock.clone();
+        self.status = match crate::roll::write(&dir, &self.roll) {
+            Ok(()) => format!("Roll notes now say {}", self.roll.stock_name()),
+            Err(e) => format!("Could not save the roll notes: {e}"),
+        };
+    }
+
+    /// When this frame converts as a different film from the one in the roll notes, say so and offer the roll's.
+    pub(super) fn roll_stock_note(&mut self, ui: &mut Ui) {
+        let Some(name) = self.roll_stock_mismatch() else { return };
+        ui.label(RichText::new(format!("The roll notes say {name}.")).size(11.5).color(TEXT2));
+        if ui.button(format!("Use {name}")).on_hover_text("Convert this frame as the film in the roll notes").clicked() {
+            let r = self.roll.clone();
+            crate::roll::apply_stock(&r, &mut self.params);
+        }
+    }
+
+    /// The roll notes' film, when this frame converts as something else.
+    fn roll_stock_mismatch(&mut self) -> Option<String> {
+        if !self.params.neg.enabled || !self.roll_matches_current() || !self.roll_stock_usable() {
+            return None;
+        }
+        let known = negative::STOCKS.iter().any(|s| s.id == self.roll.stock);
+        if known && self.roll.stock == self.params.neg.stock {
+            return None;
+        }
+        if !known && self.my_stocks.iter().any(|(_, c)| c.name == self.roll.stock.trim() && c.neg.stock == self.params.neg.stock) {
+            return None;
+        }
+        Some(self.roll.stock_name())
     }
 
     fn commit(&mut self) {
@@ -1768,7 +1855,8 @@ impl App {
         let Some(all) = self.export_dialog else { return };
         let mut go = false;
         let n = if all { self.print_frames().len() } else { 1 };
-        let title = if !all { "Print".to_string() } else { format!("Print {n} frame{}", if n == 1 { "" } else { "s" }) };
+        // Print here means a file (JPEG, TIFF, PNG), not paper: the title says so, since the Proof menu talks about printers.
+        let title = if !all { "Print to file".to_string() } else { format!("Print {n} frame{} to files", if n == 1 { "" } else { "s" }) };
         let open = dialog(ctx, "print", &title, 320.0, |ui| {
                 ui.spacing_mut().item_spacing.y = 8.0;
                 let o = &mut self.export;
@@ -2702,10 +2790,17 @@ impl App {
                 ui.painter().galley(b.center() - g.size() / 2.0, g, INK);
                 x = b.left() - 14.0;
             }
-            // All five stars, empty ones dim: an unrated frame shows that it is unrated.
-            let (sr, first) = (7.0, x - 4.0 * 7.0 * 2.4 - 7.0);
-            paint_stars(ui.painter(), pos2(first, y), 5, sr, BTN_BORDER);
-            paint_stars(ui.painter(), pos2(first, y), m.rating, sr, ACCENT);
+            if self.cull.compare {
+                // Two photos side by side: each needs its own stars. All five, empty ones dim, so unrated shows.
+                let (sr, first) = (7.0, x - 4.0 * 7.0 * 2.4 - 7.0);
+                paint_stars(ui.painter(), pos2(first, y), 5, sr, BTN_BORDER);
+                paint_stars(ui.painter(), pos2(first, y), m.rating, sr, ACCENT);
+            } else {
+                // One photo: its stars are in the panel, so here is how far through the roll you are.
+                let rated = vis.iter().filter(|f| self.meta.get(*f).is_some_and(|m| m.rating > 0 || m.flag != 0)).count();
+                let line = format!("{} of {} · {rated} rated", i + 1, vis.len());
+                ui.painter().text(pos2(x, y), Align2::RIGHT_CENTER, line, FontId::monospace(11.5), TEXT2);
+            }
             // What the key just did, large on the photo, fading out over a second.
             if *f == sel
                 && let Some((text, t0)) = &self.cull.flash
@@ -2835,11 +2930,14 @@ impl App {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
                 // Shortcuts is a dialog, not a view: a small button at the end of the bar, not a tab.
-                if ui.add(egui::Button::new(RichText::new("?").family(mono500()).size(13.0).color(TEXT2)).min_size(vec2(28.0, 28.0))).on_hover_text(format!("Keyboard shortcuts and screen colour\nRendering: {}", crate::gpu::status())).clicked() {
+                if ui.add(egui::Button::new(RichText::new("?").family(mono500()).size(13.0).color(TEXT2)).min_size(vec2(28.0, 28.0))).on_hover_text("Keyboard shortcuts").clicked() {
                     self.keys_open = true;
                 }
+                if ui.add(egui::Button::new(RichText::new("Settings").size(13.0).color(TEXT2)).min_size(vec2(0.0, 28.0))).on_hover_text(format!("Screen colour\nRendering: {}", crate::gpu::status())).clicked() {
+                    self.settings_open = true;
+                }
                 let develop = !matches!(self.module, Module::Library | Module::Cull);
-                if develop && primary(ui, "Print", self.photo.is_some()).on_hover_text("Print this frame to a file").clicked() {
+                if develop && primary(ui, "Print", self.photo.is_some()).on_hover_text("Print this frame to a file (JPEG, TIFF or PNG). It doesn't send anything to a printer").clicked() {
                     self.export_dialog = Some(false);
                 }
                 // In every view, so a new roll is always one click away.
@@ -2907,9 +3005,9 @@ impl App {
                     let names: Vec<&str> = std::iter::once("Screen").chain(crate::output::PROOF_PAPERS.iter().map(|p| p.0)).collect();
                     let printer_name = self.printer.as_ref().map(|p| p.name.clone());
                     let shown = match (self.proof, &printer_name) {
-                        (0, _) => "Proof: off".to_string(),
-                        (k, Some(n)) if k > papers => format!("Proof: {n}"),
-                        (k, _) => format!("Proof: {}", names[k.min(papers)]),
+                        (0, _) => "Proof off".to_string(),
+                        (k, Some(n)) if k > papers => format!("Proof · {n}"),
+                        (k, _) => format!("Proof · {}", names[k.min(papers)]),
                     };
                     let before = (self.proof, self.colour.perceptual, self.colour.paper);
                     let mut load = false;
@@ -3378,7 +3476,7 @@ impl App {
         self.collections_panel(ui);
         ui.add_space(18.0);
         ui.label(caps("Show rated"));
-        segmented(ui, &mut self.lib_rating, &["All", "1+ stars", "3+", "Picks"]);
+        segmented(ui, &mut self.lib_rating, &["All", "1+ stars", "3+ stars", "Picks"]);
         ui.add_space(18.0);
         ui.label(caps("Status"));
         list_row(ui, "Edited", &self.meta.values().filter(|m| m.edited).count().to_string(), false);
@@ -3433,7 +3531,7 @@ impl App {
                 self.stack_bursts = !self.stack_bursts;
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.add_enabled(!self.files.is_empty(), egui::Button::new("Print all…")).clicked() {
+                if ui.add_enabled(!self.files.is_empty(), egui::Button::new("Print all…")).on_hover_text("Print the selected frames, or every frame shown, to files").clicked() {
                     self.export_sel.clear();
                     self.export_dialog = Some(true);
                 }
@@ -3883,7 +3981,7 @@ impl App {
                 }
             }
         });
-        let resp = ui.add(egui::TextEdit::singleline(&mut self.kw_text).hint_text("Add: street, Lisbon, night").desired_width(f32::INFINITY));
+        let resp = ui.add(egui::TextEdit::singleline(&mut self.kw_text).hint_text("Add keywords, for example street, Lisbon").desired_width(f32::INFINITY));
         let add = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         let mut change: Option<(Vec<String>, Option<String>)> = None;
         if add {
@@ -4074,8 +4172,9 @@ impl App {
                 add(ui).changed()
             }).inner
         };
+        // Hints are examples, not values: dim and italic, so an empty field never reads as filled in.
         fn text<'a>(v: &'a mut String, hint: &'a str) -> impl FnMut(&mut Ui) -> egui::Response + 'a {
-            move |ui: &mut Ui| ui.add(egui::TextEdit::singleline(v).hint_text(hint).desired_width(f32::INFINITY))
+            move |ui: &mut Ui| ui.add(egui::TextEdit::singleline(v).hint_text(RichText::new(hint).italics().color(TEXT3.gamma_multiply(0.8))).desired_width(f32::INFINITY))
         }
         changed |= row(ui, "Roll", &mut text(&mut r.roll, "12"));
         changed |= row(ui, "Camera", &mut text(&mut r.camera, "Nikon FM2"));
@@ -4110,7 +4209,7 @@ impl App {
         if known.is_none() {
             changed |= row(ui, "", &mut text(&mut r.stock, "or type a film name"));
         }
-        changed |= row(ui, "Box speed", &mut |ui: &mut Ui| ui.add(egui::DragValue::new(&mut r.iso).range(0.0..=25600.0).speed(5.0).suffix(" ISO")));
+        changed |= row(ui, "Box speed", &mut |ui: &mut Ui| ui.add(egui::DragValue::new(&mut r.iso).range(0.0..=25600.0).speed(5.0).custom_formatter(|v, _| if v <= 0.0 { "Not noted".into() } else { format!("{v:.0} ISO") }).custom_parser(|t| t.trim().trim_end_matches(|c: char| c.is_alphabetic() || c == ' ').trim().parse().ok())));
         changed |= row(ui, "Shot at", &mut |ui: &mut Ui| {
             let resp = ui.add(egui::DragValue::new(&mut r.ei).range(0.0..=25600.0).speed(5.0).custom_formatter(|v, _| if v <= 0.0 { "box speed".into() } else { format!("{v:.0} EI") }));
             let p = r.push_label();
@@ -4122,7 +4221,7 @@ impl App {
         changed |= row(ui, "Developer", &mut text(&mut r.developer, "D-76 1+1, 9:45"));
         changed |= row(ui, "Date", &mut text(&mut r.date, "YYYY-MM-DD"));
         ui.add_space(2.0);
-        changed |= ui.add(egui::TextEdit::multiline(&mut r.notes).hint_text("Notes for the roll").desired_rows(2).desired_width(f32::INFINITY)).changed();
+        changed |= ui.add(egui::TextEdit::multiline(&mut r.notes).hint_text(RichText::new("Notes for the roll").italics().color(TEXT3.gamma_multiply(0.8))).desired_rows(2).desired_width(f32::INFINITY)).changed();
         // This frame's settings, when one is selected.
         if let Some(f) = self.lib_sel.clone() {
             let key = crate::roll::frame_key(&f);
@@ -4417,7 +4516,7 @@ impl App {
         // While the Mask tool is on, the panel is just the masks, as in Lightroom.
         if self.tool == Tool::Mask {
             let mut done = false;
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            egui::ScrollArea::vertical().id_salt("develop_masks").auto_shrink([false, false]).show(ui, |ui| {
                 egui::Frame::new().inner_margin(egui::Margin::symmetric(16, 12)).show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("Masks").size(14.0).family(semi()).color(TEXT));
@@ -4442,7 +4541,7 @@ impl App {
         let dj = serde_json::to_value(&d).unwrap_or_default();
         let (has_spots, has_masks) = (!p.spots.is_empty(), !p.masks.is_empty() || !p.brushes.is_empty() || !p.grads.is_empty());
         let changed = |keys: &[&str]| keys.iter().any(|k| match *k { "spots" => has_spots, "masks" => has_masks, _ => pj.get(k) != dj.get(k) });
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt("develop_right").auto_shrink([false, false]).show(ui, |ui| {
             section(ui, "Basic", o_basic, changed(&["temp","tint","exposure","contrast","highlights","shadows","whites","blacks","texture","clarity","dehaze","vibrance","saturation"]), |ui| {
                 // The eyedropper sits with "As shot" in the group's header, as Lightroom's does: an action, not a field.
                 ui.horizontal(|ui| {
@@ -4497,7 +4596,7 @@ impl App {
                 slider(ui, "Darks", &mut p.c_da, -100.0, 100.0, 0.0, None);
                 slider(ui, "Shadows", &mut p.c_sh, -100.0, 100.0, 0.0, None);
             });
-            section(ui, "Color mixer", o_mixer, changed(&["hsl"]), |ui| {
+            section(ui, "Colour mixer", o_mixer, changed(&["hsl"]), |ui| {
                 ui.horizontal(|ui| segmented(ui, mixer_tab, &["Hue", "Saturation", "Luminance"]));
                 for (b, name) in ["Red", "Orange", "Yellow", "Green", "Aqua", "Blue", "Purple", "Magenta"].into_iter().enumerate() {
                     let h = HUE_CENTERS[b];
@@ -4510,7 +4609,7 @@ impl App {
                     slider_ex(ui, name, Some(hsv(h, 0.7, 0.9)), &mut p.hsl[b][*mixer_tab], -100.0, 100.0, 0.0, Some(&*g));
                 }
             });
-            section(ui, "Color grading", o_grade, changed(&["grade","g_blend","g_bal"]), |ui| {
+            section(ui, "Colour grading", o_grade, changed(&["grade","g_blend","g_bal"]), |ui| {
                 grading_wheels(ui, p);
                 for (z, name) in ["Shadows", "Midtones", "Highlights", "Global"].into_iter().enumerate() {
                     group(ui, name, None);
@@ -4532,7 +4631,7 @@ impl App {
                 group(ui, "Noise reduction", None);
                 slider(ui, "Luminance", &mut p.nr_lum, 0.0, 100.0, 0.0, None);
                 slider(ui, "Detail", &mut p.nr_det, 0.0, 100.0, d.nr_det, None);
-                slider(ui, "Color", &mut p.nr_col, 0.0, 100.0, d.nr_col, None);
+                slider(ui, "Colour", &mut p.nr_col, 0.0, 100.0, d.nr_col, None);
                 group(ui, "AI denoise", None);
                 if denoise::installed() {
                     slider(ui, "Strength", &mut p.ai_nr, 0.0, 100.0, 0.0, None);
@@ -4591,7 +4690,7 @@ impl App {
                 slider(ui, "Vignetting", &mut p.o_vig, -100.0, 100.0, 0.0, Some(&grey_ramp(0.05, 0.6)));
                 slider(ui, "Defringe", &mut p.o_fringe, 0.0, 20.0, 0.0, None);
             });
-            section(ui, "Transform & crop", o_geo, changed(&["t_vert","t_hor","t_rot","t_scale","flip_h","crop","rot90"]), |ui| {
+            section(ui, "Crop & transform", o_geo, changed(&["t_vert","t_hor","t_rot","t_scale","flip_h","crop","rot90"]), |ui| {
                 // Upright: found from the photo's straight lines, then written into the three sliders below, so
                 // the result stays adjustable by hand.
                 ui.horizontal(|ui| {
@@ -4644,7 +4743,7 @@ impl App {
                 let (cw, ch) = (1.0 - c[0] - c[2], 1.0 - c[1] - c[3]);
                 ui.label(RichText::new(format!("Ratio {:.2} · {:.0}% of the frame. Use Crop in the toolbar to drag the corners.", cw * frame_aspect / ch.max(1e-3), cw * ch * 100.0)).size(11.5).color(TEXT2));
             });
-            section(ui, "Spot removal", o_spot, changed(&["spots"]), |ui| {
+            section(ui, "Heal", o_spot, changed(&["spots"]), |ui| {
                 let mut mode = *heal_clone as usize;
                 segmented(ui, &mut mode, &["Heal", "Clone"]);
                 *heal_clone = mode == 1;
@@ -4695,7 +4794,7 @@ impl App {
                 slider(ui, "Highlight grain", &mut p.gr_hi, 0.0, 100.0, d.gr_hi, None);
             });
             section(ui, "Border", o_border, changed(&["border"]), |ui| {
-                group(ui, "Color", None);
+                group(ui, "Colour", None);
                 let mut c = p.border.white as usize;
                 segmented(ui, &mut c, &["Black", "White"]);
                 p.border.white = c == 1;
@@ -4709,7 +4808,7 @@ impl App {
                 ui.add(egui::TextEdit::singleline(&mut p.border.caption).id(egui::Id::NULL.with("caption")).hint_text("Optional, for example Portra 400 · Lisbon").desired_width(f32::INFINITY).margin(vec2(8.0, 5.0)));
                 ui.label(RichText::new("Width is a share of the long side. Canvas pads the frame out to a fixed shape, such as 4:5 for Instagram posts. A caption adds a band under the photo.").size(11.5).color(TEXT2));
             });
-            section(ui, "Color look (LUT)", o_lut, changed(&["lut","lut_amt"]), |ui| {
+            section(ui, "Colour look (LUT)", o_lut, changed(&["lut","lut_amt"]), |ui| {
                 let name = std::path::Path::new(&p.lut).file_name().map(|n| n.to_string_lossy().to_string());
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(name.as_deref().unwrap_or("None")).size(12.0).color(LABEL));
@@ -5018,7 +5117,7 @@ impl App {
             // One choice at a time, so a segmented control on one row rather than chips.
             ui.scope(|ui| {
                 ui.spacing_mut().button_padding = vec2(8.0, 4.0);
-                segmented(ui, &mut self.stock_tab, &["All", "Color", "B&W", "Cine", "Slide"]);
+                segmented(ui, &mut self.stock_tab, &["All", "Colour", "B&W", "Cine", "Slide"]);
             });
         });
         let y = ui.cursor().top();
@@ -5029,7 +5128,8 @@ impl App {
             let kind_ok = match tab { 1 => s.kind == Kind::Color, 2 => s.kind == Kind::Bw, 3 => s.kind == Kind::Cine, 4 => s.kind == Kind::Slide, _ => true };
             kind_ok && (q.is_empty() || format!("{} {}", s.brand, s.name).to_lowercase().contains(&q))
         };
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        let mut stock_clicked = false;
+        egui::ScrollArea::vertical().id_salt("negative_left").auto_shrink([false, false]).show(ui, |ui| {
             egui::Frame::new().inner_margin(egui::Margin { left: 12, right: 12, top: 4, bottom: 16 }).show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 2.0;
                 // Your own profiles first.
@@ -5117,22 +5217,27 @@ impl App {
                     if resp.clicked() {
                         self.params.neg.stock = s.id.into();
                         self.params.neg.enabled = true;
+                        stock_clicked = true;
                     }
                 }
             });
         });
+        if stock_clicked {
+            self.stock_picked();
+        }
     }
 
     fn negative_right(&mut self, ui: &mut Ui) {
         let auto_base = self.auto_base();
         let profile = self.params.profile.clone();
-        let has_ir = self.photo.as_ref().map(|p| (p.has_ir, p.ir_busy));
-        let ir_clean = &mut self.params.ir_clean;
+        let ir_clean = self.params.ir_clean;
+        let roll_film = self.roll_stock_mismatch();
+        let mut use_roll_film = false;
         let np = &mut self.params.neg;
         let st = negative::stock(&np.stock);
         let mut add_character = false;
-        let mut scan_action = None;
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        let mut open_scan = false;
+        egui::ScrollArea::vertical().id_salt("negative_right").auto_shrink([false, false]).show(ui, |ui| {
             egui::Frame::new().inner_margin(16.0).show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 10.0;
                 ui.horizontal(|ui| {
@@ -5153,6 +5258,12 @@ impl App {
                     ui.label(RichText::new("Convert negative").size(12.0).color(LABEL));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| switch(ui, &mut np.enabled));
                 });
+                if let Some(name) = &roll_film {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(format!("The roll notes say {name}.")).size(11.5).color(TEXT2));
+                        use_roll_film = ui.button(format!("Use {name}")).on_hover_text("Convert this frame as the film in the roll notes").clicked();
+                    });
+                }
                 // Steps 1–3 do nothing until the frame is converted: say so, and grey them out.
                 if !np.enabled {
                     ui.label(RichText::new("Off. Turn on, or pick a stock, to convert this frame.").size(11.5).color(TEXT2));
@@ -5256,74 +5367,26 @@ impl App {
                 }
                 ui.add_space(6.0);
 
+                // Frames, film base from a blank shot, dust and infrared clean all live in Scan, under one set of names.
                 ui.label(caps("5 · Scanning"));
-                ui.columns(2, |c| {
-                    let w = c[0].available_width();
-                    if c[0].add(egui::Button::new("Find frame").min_size(vec2(w, 28.0))).on_hover_text("Crop away the holder and film edge").clicked() {
-                        scan_action = Some(0);
-                    }
-                    if c[1].add(egui::Button::new("Split strip").min_size(vec2(w, 28.0))).on_hover_text("Splits a scan of several frames so each frame becomes its own photo (as virtual copies)").clicked() {
-                        scan_action = Some(1);
-                    }
-                    if c[0].add(egui::Button::new("Find dust").min_size(vec2(w, 28.0))).on_hover_text("Mark specks on the scan for healing").clicked() {
-                        scan_action = Some(2);
-                    }
-                    if c[1].add(egui::Button::new("Base from shot…").min_size(vec2(w, 28.0))).on_hover_text("Use a photo of blank film (no frame) as the film base, for example for the whole roll").clicked() {
-                        scan_action = Some(3);
-                    }
-                });
-                // Infrared cleaning (Digital ICE style) for scans saved with their infrared channel.
-                slider(ui, "Infrared clean", ir_clean, 0.0, 100.0, 0.0, None);
-                let note = match has_ir {
-                    Some((Some(false), _)) => Some("This scan has no infrared channel. Save scans as 64-bit RGBI TIFF (VueScan, SilverFast) to use it."),
-                    Some((_, true)) => Some("Cleaning with the infrared channel…"),
-                    _ if st.kind == Kind::Bw => Some("Silver black-and-white film blocks infrared, so this works on colour film and C-41 black-and-white only."),
-                    _ if *ir_clean <= 0.0 => Some("Removes dust and scratches found in the scan's infrared channel."),
-                    _ => None,
-                };
-                if let Some(n) = note {
-                    ui.label(RichText::new(n).size(11.5).color(TEXT2));
+                ui.label(RichText::new(if ir_clean > 0.0 { "Frames, film base, dust and infrared clean are set in Scan. Infrared clean is on for this frame." } else { "Frames, film base, dust and infrared clean are set in Scan." }).size(11.5).color(TEXT2));
+                if ui.add(egui::Button::new("Edit in Scan").min_size(vec2(ui.available_width(), 28.0))).on_hover_text("Open this frame on Scan's light table").clicked() {
+                    open_scan = true;
                 }
             });
         });
-        match scan_action {
-            Some(0) => self.scan_find_frame(),
-            Some(1) => self.scan_split_strip(),
-            Some(2) => self.find_dust(),
-            Some(3) => self.scan_base_from_shot(),
-            _ => {}
+        if use_roll_film {
+            let r = self.roll.clone();
+            crate::roll::apply_stock(&r, &mut self.params);
+        }
+        if open_scan {
+            self.module = Module::Scan;
+            self.scan.page = 0;
+            self.tool = Tool::None;
         }
         if add_character {
             (self.params.gr_amt, self.params.gr_size, self.params.hal_amt, self.params.gr_hi) = negative::character(st);
         }
-    }
-
-    fn scan_find_frame(&mut self) {
-        let Some(ph) = &self.photo else { return };
-        match scan::auto_crop(&scan::frame(&ph.preview, &self.params), self.params.neg.enabled) {
-            Some(c) => {
-                self.params.crop = c;
-                self.params.neg.levels = None; // re-balance on the picture alone
-                self.status = "Cropped to the frame".into();
-            }
-            None => self.status = "Couldn't find the frame edges".into(),
-        }
-    }
-
-    fn scan_split_strip(&mut self) {
-        let (Some(ph), Some(cur)) = (&self.photo, self.current.clone()) else { return };
-        let frames = scan::split_strip(&scan::frame(&ph.preview, &self.params), self.params.neg.enabled);
-        if frames.len() < 2 {
-            self.status = "Found only one frame. Try Find frame instead".into();
-            return;
-        }
-        let n = frames.len();
-        for c in &frames[1..] {
-            let p = Params { crop: *c, snapshots: vec![], ..self.params.clone() };
-            self.virtual_copy(&cur, &p);
-        }
-        self.params.crop = frames[0];
-        self.status = format!("Split into {n} frames (this one and {} virtual copies)", n - 1);
     }
 
     fn scan_base_from_shot(&mut self) {
@@ -5550,14 +5613,13 @@ impl App {
         self.preset_tex.clear();
     }
 
-    fn keys_window(&mut self, ctx: &egui::Context) {
-        if !self.keys_open {
+    /// Settings that belong to this computer rather than a photo. Screen colour is the only one so far.
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        if !self.settings_open {
             return;
         }
-        // Esc while waiting for a key cancels the binding, not the dialog.
-        let binding = self.binding.is_some();
         let mut screen_changed = false;
-        let open = dialog(ctx, "keys", "Keyboard shortcuts and screen", 380.0, |ui| {
+        let open = dialog(ctx, "settings", "Settings", 380.0, |ui| {
             ui.label(caps("Screen colour"));
             let cur = self.colour.screen.profile.clone();
             let shown = match cur.as_str() {
@@ -5582,13 +5644,40 @@ impl App {
                 }
             });
             ui.label(RichText::new("If colours look too strong on a wide-gamut monitor, choose its profile here. macOS usually manages colour itself, so keep sRGB there unless photos look oversaturated.").size(11.5).color(TEXT2));
-            ui.add_space(10.0);
-            ui.label(caps("Shortcuts"));
+            ui.add_space(4.0);
+        });
+        if screen_changed {
+            self.apply_screen();
+        }
+        if !open {
+            self.settings_open = false;
+        }
+    }
+
+    fn keys_window(&mut self, ctx: &egui::Context) {
+        if !self.keys_open {
+            return;
+        }
+        // Esc while waiting for a key cancels the binding, not the dialog.
+        let binding = self.binding.is_some();
+        let open = dialog(ctx, "keys", "Keyboard shortcuts", 380.0, |ui| {
             ui.label(RichText::new("Click a shortcut, then press the new key (Esc cancels). Undo, copy, paste and Ctrl/Cmd+arrows stay fixed.").size(11.5).color(TEXT2));
-            ui.add_space(6.0);
+            ui.add_space(4.0);
+            ui.add(egui::TextEdit::singleline(&mut self.keys_query).hint_text("Find a shortcut").desired_width(f32::INFINITY));
+            ui.add_space(4.0);
+            let q = self.keys_query.trim().to_lowercase();
             egui::ScrollArea::vertical().max_height(460.0).show(ui, |ui| {
                 egui::Grid::new("keys").num_columns(2).spacing(vec2(16.0, 4.0)).show(ui, |ui| {
                     for (id, name, _) in keys::ACTIONS {
+                        if !q.is_empty() && !name.to_lowercase().contains(&q) {
+                            continue;
+                        }
+                        if q.is_empty()
+                            && let Some((_, g)) = keys::GROUPS.iter().find(|(first, _)| first == id)
+                        {
+                            ui.label(caps(g));
+                            ui.end_row();
+                        }
                         ui.label(RichText::new(*name).size(12.5));
                         let waiting = self.binding == Some(*id);
                         let text = if waiting { "Press a key…".to_string() } else { keys::display(self.keymap.key(id)) };
@@ -5606,9 +5695,6 @@ impl App {
             }
             ui.add_space(4.0);
         });
-        if screen_changed {
-            self.apply_screen();
-        }
         if !open && !(binding && ctx.input(|i| i.key_pressed(egui::Key::Escape))) {
             self.keys_open = false;
             self.binding = None;
@@ -5762,6 +5848,24 @@ impl eframe::App for App {
         self.watch_folder(&ctx);
         self.watch_edits(&ctx);
         self.shortcuts(&ctx);
+        if self.module != self.shown_module {
+            // Work still running ("Printing…") keeps its line; finished messages belong to the tab they came from.
+            if !self.status.ends_with('…') {
+                self.status.clear();
+            }
+            self.shown_module = self.module;
+        }
+        // Only Develop, Negative and Capture render the photo in full, which is where a thumbnail is normally
+        // refreshed. An edit made elsewhere (Scan's light table converting a negative) rebuilds it from the
+        // edits file instead, so every filmstrip shows the same frame.
+        let renders = matches!(self.module, Module::Develop | Module::Negative) || (self.module == Module::Scan && self.scan.page == 1);
+        if self.thumb_due && !renders
+            && let Some(cur) = self.current.clone()
+        {
+            self.thumbs.remove(&cur);
+            self.thumb_pending.remove(&cur);
+            self.thumb_due = false;
+        }
         if let Some(f) = ctx.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf())) {
             self.open_path(&ctx, &f);
         }
@@ -5816,6 +5920,7 @@ impl eframe::App for App {
         self.rename_window(&ctx);
         self.geotag_window(&ctx);
         self.keys_window(&ctx);
+        self.settings_window(&ctx);
         // One history step (and one sidecar write) per caption, not per keystroke.
         if !ctx.input(|i| i.pointer.any_down()) && !ctx.memory(|m| m.has_focus(egui::Id::NULL.with("caption"))) {
             self.commit();

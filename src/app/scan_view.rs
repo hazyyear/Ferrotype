@@ -422,7 +422,7 @@ impl App {
         let ctx = ui.ctx().clone();
         let page = self.scan.page;
         egui::Panel::left("scan_left").exact_size(264.0).resizable(false).frame(pad(PANEL, 16, 16)).show(ui, |ui| {
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            egui::ScrollArea::vertical().id_salt(("scan_left", page)).auto_shrink([false, false]).show(ui, |ui| {
                 // Room for the scroll bar.
                 egui::Frame::new().inner_margin(egui::Margin { right: 10, ..Default::default() }).show(ui, |ui| match page {
                     0 => self.light_table_left(ui),
@@ -440,7 +440,7 @@ impl App {
                 _ => self.roll_footer(ui),
             });
             egui::CentralPanel::default().frame(egui::Frame::new()).show(ui, |ui| {
-                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                egui::ScrollArea::vertical().id_salt(("scan_right", page)).auto_shrink([false, false]).show(ui, |ui| {
                     egui::Frame::new().inner_margin(16.0).show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 10.0;
                         match page {
@@ -470,7 +470,7 @@ impl App {
             let g = scan::frame(&ph.preview, &self.params);
             let neg = negative::orange_mask(scan::film_base(&g));
             if !self.params.neg.enabled && neg {
-                self.params.neg.enabled = true;
+                self.auto_negative();
             }
             // A camera scan shows the holder around the frame: crop to the frame, so the conversion is
             // balanced on the picture alone. Only for frames not cropped yet.
@@ -524,7 +524,7 @@ impl App {
             match self.scan.page {
                 0 => {
                     let can = self.photo.is_some();
-                    if ui.add_enabled(can, egui::Button::new("Find frames")).on_hover_text("Look for the frames on this scan again").clicked() {
+                    if ui.add_enabled(can, egui::Button::new("Find frames")).on_hover_text("Look for the frames on this scan again, forgetting changes").clicked() {
                         self.scan.strip = None;
                     }
                     if let Some(s) = &mut self.scan.strip {
@@ -554,7 +554,7 @@ impl App {
                     ui.add_space(6.0);
                     let any = n > 0;
                     let mut act = None;
-                    for (k, (name, tip)) in [("Rotate", "Turn a quarter clockwise"), ("Flip", "Mirror left to right (emulsion side scanned the wrong way)"), ("Find frame", "Crop away the holder and film edge"), ("Skip", "Leave this frame out of the roll by marking it rejected. Press again to bring it back")].iter().enumerate() {
+                    for (k, (name, tip)) in [("Rotate", "Turn a quarter clockwise"), ("Flip", "Mirror left to right (emulsion side scanned the wrong way)"), ("Find frames", "Crop each selected frame to its edges, without the holder or film rebate"), ("Skip", "Leave this frame out of the roll by marking it rejected. Press again to bring it back")].iter().enumerate() {
                         if ui.add_enabled(any, egui::Button::new(*name)).on_hover_text(*tip).clicked() {
                             act = Some(k);
                         }
@@ -584,6 +584,29 @@ impl App {
         });
     }
 
+    /// The light table with a roll open but no scan picked: one message, one button.
+    fn strip_empty(&mut self, ui: &mut Ui) {
+        ui.vertical_centered(|ui| {
+            ui.add_space((ui.available_height() / 2.0 - 90.0).max(0.0));
+            let (r, _) = ui.allocate_exact_size(vec2(48.0, 48.0), Sense::hover());
+            paint_mark(ui.painter(), r, TEXT2);
+            ui.add_space(10.0);
+            ui.label(RichText::new("Open a strip scan").family(display()).size(26.0).color(BONE).extra_letter_spacing(-0.3));
+            ui.label(RichText::new("Open a scan of a film strip or holder, or click a scan in the strip below. Its frames are found for you.").color(TEXT2));
+            ui.add_space(8.0);
+            if primary(ui, "Open strip scan…", true).clicked() {
+                self.pick_strip_scan(ui.ctx());
+            }
+        });
+    }
+
+    fn pick_strip_scan(&mut self, ctx: &egui::Context) {
+        if let Some(f) = rfd::FileDialog::new().add_filter("Scans", &["tif", "tiff", "dng", "jpg", "jpeg", "png"]).pick_file() {
+            self.scan.strip = None;
+            self.open_path(ctx, &f);
+        }
+    }
+
     fn scan_empty(&mut self, ui: &mut Ui, title: &str, line: &str) {
         ui.vertical_centered(|ui| {
             ui.add_space((ui.available_height() / 2.0 - 100.0).max(0.0));
@@ -605,8 +628,8 @@ impl App {
 
     /// Look for frames on the open scan (again) once it has loaded.
     fn ensure_strip(&mut self, ctx: &egui::Context) {
-        let (Some(ph), Some(cur)) = (&self.photo, &self.current) else { return };
-        if self.scan.strip.as_ref().is_some_and(|s| s.file == *cur && s.generation == self.photo_gen) {
+        let (Some(ph), Some(cur)) = (&self.photo, self.current.clone()) else { return };
+        if self.scan.strip.as_ref().is_some_and(|s| s.file == cur && s.generation == self.photo_gen) {
             return;
         }
         let g = scan::frame(&ph.preview, &self.params);
@@ -618,7 +641,7 @@ impl App {
         let gaps = gap_bases(&g, &crops);
         let tex = ctx.load_texture("scan_strip", to_color_image(&encode(&g)), TextureOptions::LINEAR);
         if neg && !self.params.neg.enabled {
-            self.params.neg.enabled = true;
+            self.auto_negative();
         }
         // Reading the infrared channel means reading the whole TIFF: off the UI thread (it is cached for the clean).
         let (tx, ctx2, f) = (self.scan.tx.clone(), ctx.clone(), cur.clone());
@@ -729,7 +752,7 @@ impl App {
             } else if self.files.is_empty() {
                 self.scan_empty(ui, "No scans yet", "Open the folder your scanner saves to, or drop a strip scan here.");
             } else {
-                ui.centered_and_justified(|ui| ui.label(RichText::new("Pick a strip scan below").color(TEXT3)));
+                self.strip_empty(ui);
             }
             return;
         }
@@ -803,10 +826,16 @@ impl App {
         let found = s.frames.len();
         let base_line = match s.gaps.get(s.gap) {
             Some((k, _)) => format!("film base from the gap between {} and {}", k + 1, k + 2),
-            None => "film base: brightest area (no gap between frames)".into(),
+            None => "film base from the brightest area".into(),
         };
-        let line = format!("{found} frame{} · drag a box to move it · {base_line}", if found == 1 { "" } else { "s" });
-        ui.painter().text(pos2(sr.left(), sr.bottom() + 16.0), Align2::LEFT_CENTER, line, FontId::monospace(11.0), TEXT3);
+        // What was found, as values in mono; what you can do, as a plain sentence on the other side.
+        let line = format!("{found} frame{} · {base_line}", if found == 1 { "" } else { "s" });
+        let left = ui.painter().text(pos2(sr.left(), sr.bottom() + 16.0), Align2::LEFT_CENTER, line, FontId::monospace(11.0), TEXT3);
+        let hint = ui.painter().layout_no_wrap("Drag a box to move it".into(), FontId::proportional(12.0), TEXT3);
+        let right = sr.right().max(left.right() + 24.0 + hint.size().x).min(full.right() - 24.0);
+        if right - hint.size().x > left.right() + 16.0 {
+            ui.painter().galley(pos2(right - hint.size().x, sr.bottom() + 16.0 - hint.size().y / 2.0), hint, TEXT3);
+        }
 
         // The chosen frame, large.
         let area = Rect::from_min_max(pos2(full.left() + 24.0, sr.bottom() + 34.0), pos2(full.right() - 24.0, full.bottom() - 16.0));
@@ -849,11 +878,8 @@ impl App {
         self.scanner_panel(ui);
         ui.add_space(4.0);
         ui.label(caps("Source"));
-        if ui.add(egui::Button::new("Open strip scan…").min_size(vec2(ui.available_width(), 30.0))).clicked()
-            && let Some(f) = rfd::FileDialog::new().add_filter("Scans", &["tif", "tiff", "dng", "jpg", "jpeg", "png"]).pick_file()
-        {
-            self.scan.strip = None;
-            self.open_path(ui.ctx(), &f);
+        if ui.add(egui::Button::new("Open strip scan…").min_size(vec2(ui.available_width(), 30.0))).clicked() {
+            self.pick_strip_scan(ui.ctx());
         }
         self.file_panel(ui);
         ui.add_space(6.0);
@@ -885,10 +911,6 @@ impl App {
                         }
                     }
                 });
-            }
-            let hint = if cfg!(windows) { "Or let ferrotype run the scanner itself" } else { "Preview, pick frames and scan them" };
-            if ui.add(egui::Button::new("Scanner page…").min_size(vec2(ui.available_width(), 28.0))).on_hover_text(hint).clicked() {
-                self.scan.page = 3;
             }
         }
         let apps = self.scan.apps.get_or_insert_with(scanner::apps).clone();
@@ -1010,10 +1032,8 @@ impl App {
     fn light_table_right(&mut self, ui: &mut Ui) {
         let auto_base = self.auto_base();
         let busy = self.scan.busy.clone();
-        let Some(s) = &mut self.scan.strip else {
-            ui.label(RichText::new("Open a scan to see its frames.").color(TEXT3));
-            return;
-        };
+        // Nothing to say until a scan is open: the light table itself says what to do.
+        let Some(s) = &mut self.scan.strip else { return };
         if s.frames.is_empty() {
             return;
         }
@@ -1031,24 +1051,24 @@ impl App {
         });
         ui.add_space(4.0);
         ui.label(caps("1 · Frame"));
-        ui.columns(4, |c| {
+        ui.columns(2, |c| {
             let w = c[0].available_width();
             let fr = &mut s.frames[i];
-            if c[0].add(egui::Button::new("Left").min_size(vec2(w, 28.0))).on_hover_text("Turn left").clicked() {
+            if c[0].add(egui::Button::new("Turn left").min_size(vec2(w, 28.0))).on_hover_text("Turn this frame a quarter to the left").clicked() {
                 fr.turns = (fr.turns + 3) % 4;
             }
-            if c[1].add(egui::Button::new("Right").min_size(vec2(w, 28.0))).on_hover_text("Turn right").clicked() {
+            if c[1].add(egui::Button::new("Turn right").min_size(vec2(w, 28.0))).on_hover_text("Turn this frame a quarter to the right").clicked() {
                 fr.turns = (fr.turns + 1) % 4;
             }
-            if c[2].add(egui::Button::new(RichText::new("Flip").color(if fr.flip { INK } else { TEXT })).fill(if fr.flip { BONE } else { Color32::TRANSPARENT }).min_size(vec2(w, 28.0))).on_hover_text("Scanned emulsion side up, so mirror it").clicked() {
+            if c[0].add(egui::Button::new(RichText::new("Mirror").color(if fr.flip { INK } else { TEXT })).fill(if fr.flip { BONE } else { Color32::TRANSPARENT }).min_size(vec2(w, 28.0))).on_hover_text("Scanned emulsion side up, so mirror it left to right").clicked() {
                 fr.flip = !fr.flip;
             }
-            if c[3].add(egui::Button::new(RichText::new("Skip").color(if fr.skip { INK } else { TEXT })).fill(if fr.skip { BONE } else { Color32::TRANSPARENT }).min_size(vec2(w, 28.0))).on_hover_text("Leave this frame out (blank, fogged, leader)").clicked() {
+            if c[1].add(egui::Button::new(RichText::new("Skip frame").color(if fr.skip { INK } else { TEXT })).fill(if fr.skip { BONE } else { Color32::TRANSPARENT }).min_size(vec2(w, 28.0))).on_hover_text("Leave this frame out of the roll (blank, fogged, leader)").clicked() {
                 fr.skip = !fr.skip;
             }
         });
         ui.horizontal(|ui| {
-            if ui.add_enabled(s.frames.len() > 1, egui::Button::new("Same for all frames")).on_hover_text("Give every frame this frame's turn and flip").clicked() {
+            if ui.add_enabled(s.frames.len() > 1, egui::Button::new("Same for all frames")).on_hover_text("Give every frame this frame's turn and mirror").on_disabled_hover_text("There is only one frame on this scan").clicked() {
                 let (t, f) = (s.frames[i].turns, s.frames[i].flip);
                 for fr in &mut s.frames {
                     (fr.turns, fr.flip) = (t, f);
@@ -1131,8 +1151,7 @@ impl App {
             ui.label(RichText::new("Convert negative").size(12.0).color(LABEL));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| switch(ui, &mut np.enabled));
         });
-        let st = negative::stock(&np.stock);
-        ui.label(RichText::new(format!("{} {} · change it in Negative", st.brand, st.name)).size(12.0).color(TEXT2));
+        let picked_stock = stock_picker(ui, "scan_stock", np);
         let w = (ui.available_width() - 4.0) / 2.0;
         for row in [[(Look::Neutral, "Neutral"), (Look::Frontier, "Frontier")], [(Look::Noritsu, "Noritsu"), (Look::Linear, "Linear")]] {
             ui.horizontal(|ui| {
@@ -1161,6 +1180,10 @@ impl App {
         if find_dust {
             self.strip_find_dust();
         }
+        if picked_stock {
+            self.stock_picked();
+        }
+        self.roll_stock_note(ui);
     }
 
     fn light_table_footer(&mut self, ui: &mut Ui) {
@@ -1176,14 +1199,9 @@ impl App {
             (_, 1) => "Add 1 frame to roll".to_string(),
             (_, n) => format!("Add {n} frames to roll"),
         };
-        let mut add = false;
-        ui.columns(2, |c| {
-            if c[0].add(egui::Button::new("Find again").min_size(vec2(c[0].available_width(), 32.0))).on_hover_text("Forget changes and look for the frames again").clicked() {
-                self.scan.strip = None;
-            }
-            add = c[1].add_enabled(!kept.is_empty() && !done, egui::Button::new(RichText::new(label).color(INK).family(semi())).fill(BONE).stroke(Stroke::NONE).min_size(vec2(c[1].available_width(), 32.0)))
-                .on_hover_text("The first frame stays on this scan. The others become virtual copies, each its own frame in the roll").clicked();
-        });
+        // Looking again is Find frames in the toolbar: one name, one place.
+        let add = ui.add_enabled(!kept.is_empty() && !done, egui::Button::new(RichText::new(label).color(INK).family(semi())).fill(BONE).stroke(Stroke::NONE).min_size(vec2(ui.available_width(), 32.0)))
+            .on_hover_text("The first frame stays on this scan. The others become virtual copies, each its own frame in the roll").clicked();
         if add {
             self.strip_add(kept, key);
         }

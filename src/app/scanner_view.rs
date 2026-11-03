@@ -320,8 +320,12 @@ impl App {
         ui.label(caps("Scanner"));
         let d = &mut self.scan.direct;
         let list = d.devices.clone().unwrap_or_default();
-        if let Some(e) = &d.note {
-            ui.label(RichText::new(e).size(12.0).color(WARN));
+        if let Some(e) = d.note.clone() {
+            // Plain words first; the system's own message is there for a bug report, folded away.
+            ui.label(RichText::new("ferrotype couldn't look for scanners on this computer. The steps below usually fix it.").size(12.5).color(BONE));
+            egui::CollapsingHeader::new(RichText::new("Details").size(11.5).color(TEXT3)).id_salt("scanner_note").show(ui, |ui| {
+                ui.label(RichText::new(e).monospace().size(11.0).color(TEXT3));
+            });
         }
         let full = ui.available_width();
         if d.looking {
