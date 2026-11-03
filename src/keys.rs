@@ -22,6 +22,7 @@ pub const ACTIONS: &[(&str, &str, &str)] = &[
     ("prev", "Previous frame", "ArrowLeft"),
     ("cull", "Culling view", "C"),
     ("compare", "Compare two (culling)", "Shift+C"),
+    ("focus", "Focus check (culling)", "F"),
     ("library", "Library", "G"),
     ("develop", "Develop", "D"),
     ("zoom", "1:1 zoom", "Z"),
@@ -38,8 +39,10 @@ pub const ACTIONS: &[(&str, &str, &str)] = &[
     ("vcopy", "Virtual copy", "Shift+V"),
     ("edit_in", "Edit in another program", "E"),
     ("snapshot", "New snapshot", "Shift+S"),
-    ("focus", "Focus check (culling)", "F"),
 ];
+
+/// Headings for the shortcuts list: each starts a group at the action with this id.
+pub const GROUPS: &[(&str, &str)] = &[("rate0", "Rate and flag"), ("next", "Move around"), ("zoom", "Develop")];
 
 pub struct Keymap {
     map: HashMap<String, String>,

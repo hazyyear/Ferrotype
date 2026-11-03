@@ -277,7 +277,7 @@ pub struct Shot {
     pub shutter: f32,
     pub bias: f32,
     pub taken: String,
-    /// Where it was taken, for exports that ask for it (never read from the camera file).
+    /// Where it was taken, from the camera file's own GPS tags (phones, GPS cameras); exports write it only when asked.
     pub gps: Option<crate::geotag::Location>,
 }
 
@@ -360,11 +360,22 @@ pub fn shot(path: &Path) -> Option<Shot> {
             shutter: r(m.exif.exposure_time),
             bias: m.exif.exposure_bias.map_or(0.0, |b| b.n as f32 / (b.d as f32).max(1.0)),
             taken: m.exif.date_time_original.unwrap_or_default(),
-            gps: None,
+            gps: m.exif.gps.as_ref().and_then(raw_location),
         });
     }
     let exif = crate::load::exif_block(path)?;
     parse_exif(&exif)
+}
+
+/// A RAW file's own GPS position (phones, GPS cameras), as rawler reads it.
+fn raw_location(g: &rawler::exif::ExifGPS) -> Option<crate::geotag::Location> {
+    let v = |r: &rawler::formats::tiff::Rational| r.n as f64 / r.d.max(1) as f64;
+    let dms = |a: &[rawler::formats::tiff::Rational; 3]| v(&a[0]) + v(&a[1]) / 60.0 + v(&a[2]) / 3600.0;
+    let south = g.gps_latitude_ref.as_deref().is_some_and(|r| r.trim_start().starts_with('S'));
+    let west = g.gps_longitude_ref.as_deref().is_some_and(|r| r.trim_start().starts_with('W'));
+    let (lat, lon) = (dms(g.gps_latitude.as_ref()?), dms(g.gps_longitude.as_ref()?));
+    let ele = g.gps_altitude.as_ref().map(|a| if g.gps_altitude_ref == Some(1) { -v(a) } else { v(a) });
+    Some(crate::geotag::Location { lat: if south { -lat } else { lat }, lon: if west { -lon } else { lon }, ele })
 }
 
 /// The few tags we need from a TIFF-structured EXIF block.
@@ -443,6 +454,24 @@ pub fn detect(path: &Path) -> Option<(String, f32, f32, f32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_gps_becomes_a_location() {
+        use rawler::formats::tiff::Rational;
+        let r = |n, d| Rational { n, d };
+        let g = rawler::exif::ExifGPS {
+            gps_latitude_ref: Some("S".into()),
+            gps_latitude: Some([r(33, 1), r(51, 1), r(244224, 10000)]),
+            gps_longitude_ref: Some("E".into()),
+            gps_longitude: Some([r(151, 1), r(12, 1), r(550692, 10000)]),
+            gps_altitude_ref: Some(1),
+            gps_altitude: Some(r(125, 10)),
+            ..Default::default()
+        };
+        let l = raw_location(&g).unwrap();
+        assert!((l.lat + 33.856784).abs() < 1e-6 && (l.lon - 151.215297).abs() < 1e-6 && l.ele == Some(-12.5), "{l:?}");
+        assert!(raw_location(&rawler::exif::ExifGPS::default()).is_none(), "no position without latitude and longitude");
+    }
 
     #[test]
     fn big_endian_exif_reads_camera_and_settings() {
