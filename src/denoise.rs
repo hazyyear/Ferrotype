@@ -263,8 +263,7 @@ fn cache_file(path: &Path) -> Option<PathBuf> {
     let real = crate::load::copy_of(path).unwrap_or_else(|| path.to_path_buf());
     let m = std::fs::metadata(&real).ok()?;
     let key = format!("{}|{}|{:?}", std::fs::canonicalize(&real).unwrap_or(real.clone()).display(), m.len(), m.modified().ok());
-    let h: String = Sha256::digest(key.as_bytes()).iter().take(12).map(|b| format!("{b:02x}")).collect();
-    Some(crate::keys::dirs_cache()?.join("denoise").join(format!("{h}.bin")))
+    Some(crate::keys::dirs_cache()?.join("denoise").join(format!("{}.bin", crate::keys::cache_name(&key))))
 }
 
 /// About 10 photos at 24 MP; the oldest results go first.

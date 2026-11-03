@@ -19,10 +19,6 @@ impl Default for Options {
     }
 }
 
-fn esc(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
-}
-
 /// A folder name from a title: letters, digits and dashes.
 pub fn slug(title: &str) -> String {
     let s: String = title.trim().chars().map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { '-' }).collect();
@@ -49,7 +45,8 @@ fn caption(path: &Path, p: &crate::develop::Params, o: &Options) -> String {
     let shot = crate::export_shot(path);
     let mut parts: Vec<String> = vec![];
     let t = shot.taken.trim();
-    if t.len() >= 10 {
+    // Bytes, not characters: a garbled EXIF date can hold multi-byte replacement characters.
+    if t.len() >= 10 && t.is_ascii() {
         parts.push(t[..10].replace(':', "-"));
     }
     if o.details {
@@ -100,7 +97,7 @@ fn html(title: &str, items: &[(String, String, u32, u32, String)]) -> String {
         let ar = *w as f32 / (*h).max(1) as f32;
         grid += &format!(
             "<a class=\"t\" href=\"{}\" data-i=\"{k}\" data-cap=\"{}\" style=\"flex-grow:{:.3};flex-basis:{:.0}px\"><i style=\"padding-bottom:{:.3}%\"></i><img src=\"{}\" alt=\"{}\" loading=\"lazy\"></a>\n",
-            esc(big), esc(cap), ar, ar * 220.0, 100.0 / ar, esc(small), esc(cap)
+            crate::xmp::escape(big), crate::xmp::escape(cap), ar, ar * 220.0, 100.0 / ar, crate::xmp::escape(small), crate::xmp::escape(cap)
         );
     }
     format!(r#"<!doctype html>
@@ -152,7 +149,7 @@ document.addEventListener('keydown',e=>{{if(at<0)return;if(e.key==='Escape')hide
 </script>
 </body>
 </html>
-"#, t = esc(title), n = items.len(), s = if items.len() == 1 { "" } else { "s" })
+"#, t = crate::xmp::escape(title), n = items.len(), s = if items.len() == 1 { "" } else { "s" })
 }
 
 #[cfg(test)]

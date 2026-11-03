@@ -204,7 +204,8 @@ pub fn move_to_rejects(dest: &Path, files: &[PathBuf]) -> std::io::Result<usize>
                 continue;
             }
             let n = copy.file_name().and_then(|c| c.to_str()).and_then(|c| c.rsplit_once(".copy")).map_or("2", |(_, n)| n).to_string();
-            let target = std::iter::once(n.clone()).chain((2..).map(|k| k.to_string())).map(|k| dest.join(format!("{to_name}.copy{k}"))).find(|p| free(p)).unwrap();
+            // Nothing has moved yet: a name picked for this photo's previous copy still looks free on disk.
+            let target = std::iter::once(n.clone()).chain((2..).map(|k| k.to_string())).map(|k| dest.join(format!("{to_name}.copy{k}"))).find(|p| free(p) && !parts.iter().any(|(_, b)| *b == sidecar(p))).unwrap();
             parts.push((sidecar(&copy), sidecar(&target)));
         }
         let mut any = false;
@@ -574,7 +575,7 @@ ferrotype export [--out DIR] [--tif|--png|--hdr] [--size PX] [--quality Q] [--ne
                                 render files with their saved edits (headless); --lens adds the lens profile;
                                 --name uses {name} {n} {date} {roll} {stock} {camera} {lens};
                                 --meta writes camera, lens, roll and stock into the JPEG; --gps adds the location;
-                                a FOLDER is exported with its subfolders, keeping the folder tree
+                                a FOLDER is exported with its subfolders, keeping the folder tree (rejects left out)
 ferrotype rename --name PATTERN [--roll N] [--dry-run] FILES...
                                 rename photos and their edits from a pattern (tokens as for export)
 ferrotype rename --undo FOLDER  put back the names from the last rename in FOLDER
@@ -646,7 +647,8 @@ fn cli_export(args: &[String]) -> Result<(), String> {
     let jobs: Vec<(PathBuf, PathBuf)> = files.iter().flat_map(|f| {
         if f.is_dir() {
             let top = PathBuf::from(f.file_name().unwrap_or_default());
-            photos_under(f).into_iter().map(|(rel, p)| (out.join(&top).join(rel), p)).collect()
+            // Like Print all in the app: frames marked rejected stay out of a folder's export.
+            photos_under(f).into_iter().filter(|(_, p)| read_params(p).is_none_or(|q| q.flag >= 0)).map(|(rel, p)| (out.join(&top).join(rel), p)).collect()
         } else {
             vec![(out.clone(), f.clone())]
         }
@@ -768,6 +770,25 @@ mod tests {
         assert_eq!(left, [dir.join("keep.tif"), dir.join("keep.tif.copy2")]);
         // A folder export of the tree sees the frames too.
         assert_eq!(photos_under(&dir).len(), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rejects_never_give_two_copies_one_name() {
+        let dir = std::env::temp_dir().join(format!("ferrotype-rejn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dest = dir.join("_rejects");
+        std::fs::create_dir_all(&dest).unwrap();
+        // A frame left behind when its photo was dragged back out of _rejects by hand.
+        write_params(&dest.join("a.tif.copy2"), &Params { rating: 1, ..Default::default() }).unwrap();
+        std::fs::write(dir.join("a.tif"), "a").unwrap();
+        for k in [2, 3] {
+            write_params(&dir.join(format!("a.tif.copy{k}")), &Params { rating: k, ..Default::default() }).unwrap();
+        }
+        assert_eq!(move_to_rejects(&dest, &[dir.join("a.tif")]).unwrap(), 1);
+        let mut ratings: Vec<u8> = (2..=4).filter_map(|k| read_params(&dest.join(format!("a.tif.copy{k}"))).map(|p| p.rating)).collect();
+        ratings.sort();
+        assert_eq!(ratings, [1, 2, 3], "every frame's edits survive");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

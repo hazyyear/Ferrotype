@@ -67,9 +67,8 @@ pub fn detected() -> Vec<Editor> {
         for base in [std::env::var_os("ProgramFiles"), std::env::var_os("LOCALAPPDATA").map(|l| PathBuf::from(l).join("Programs").into_os_string())].into_iter().flatten() {
             let base = PathBuf::from(base);
             for g in versions(&base, "GIMP") {
-                for exe in versions(&g.join("bin"), "gimp-").into_iter().rev().filter(|p| p.extension().is_some_and(|e| e == "exe") && !p.to_string_lossy().contains("console")) {
+                if let Some(exe) = versions(&g.join("bin"), "gimp-").into_iter().rev().find(|p| p.extension().is_some_and(|e| e == "exe") && !p.to_string_lossy().contains("console")) {
                     add("GIMP", exe);
-                    break;
                 }
             }
             for ps in versions(&base.join("Adobe"), "Adobe Photoshop").into_iter().rev() {

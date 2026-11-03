@@ -235,8 +235,8 @@ enum Msg {
     Geo(Result<GeoDlg, String>),
     /// A batch rename finished: what moved where.
     Renamed(Result<Vec<(PathBuf, PathBuf)>, String>),
-    /// Settings synced to these frames (with their new summaries).
-    Synced(Vec<(PathBuf, Meta)>),
+    /// Settings synced to these frames (with their new summaries), and the change itself, for the open photo.
+    Synced(Vec<(PathBuf, Meta)>, Arc<dyn Fn(&Params) -> Params + Send + Sync>),
 }
 
 /// A drag with the heal tool: painting a new stroke, or moving a spot's source (with the grab offset).
@@ -618,7 +618,6 @@ fn cover_uv(tex: &TextureHandle, aspect: f32) -> Rect {
 
 /// Rendered thumbnails are kept in the user cache folder, keyed by the photo and its edits, so reopening a folder is instant.
 fn thumb_cache(f: &Path) -> Option<PathBuf> {
-    use sha2::{Digest, Sha256};
     let modified = |p: &Path| std::fs::metadata(p).ok().and_then(|m| m.modified().ok());
     // `v2`: embedded colour profiles are read since; older thumbnails of tagged JPEGs (Display P3) are stale.
     let mut key = format!("v2|{}|{:?}|{:?}", f.display(), modified(load::copy_of(f).as_deref().unwrap_or(f)), modified(&crate::sidecar(f)));
@@ -627,8 +626,7 @@ fn thumb_cache(f: &Path) -> Option<PathBuf> {
         let data = f.parent().and_then(crate::roll::read).map(|r| r.scan_data).unwrap_or_default();
         key += &format!("|scan2|{data}");
     }
-    let h: String = Sha256::digest(key.as_bytes()).iter().take(12).map(|b| format!("{b:02x}")).collect();
-    Some(crate::keys::dirs_cache()?.join("thumbs").join(format!("{h}.jpg")))
+    Some(crate::keys::dirs_cache()?.join("thumbs").join(format!("{}.jpg", crate::keys::cache_name(&key))))
 }
 
 /// Where the picture is sharp: the strongest edges (Laplacian of luma), marked green on a transparent layer.
@@ -1138,8 +1136,16 @@ impl App {
                         self.finish_chart_profile(name, fit);
                     }
                 }
-                Msg::Synced(done) => {
+                Msg::Synced(done, f) => {
                     self.status = format!("Synced to {} frame{}", done.len(), if done.len() == 1 { "" } else { "s" });
+                    // A frame opened while the sync ran: its file may hold the sync without the edits made on
+                    // screen since, or the reverse. Applying the change to what's on screen keeps both.
+                    if let Some(cur) = self.current.clone()
+                        && done.iter().any(|(p, _)| *p == cur)
+                    {
+                        self.params = f(&self.params);
+                        self.commit();
+                    }
                     // Only what the sync changed: a rating, flag or label set while it ran is newer than the
                     // thread's copy, and Move rejects reads this list.
                     for (p, m) in done {
@@ -1703,18 +1709,19 @@ impl App {
 
     /// Apply `f` to every other photo's saved settings in the folder.
     /// On a thread: a cloud or network folder of a thousand frames is thousands of slow file operations.
-    fn sync_folder(&mut self, f: impl Fn(&Params) -> Params + Send + 'static) {
+    fn sync_folder(&mut self, f: impl Fn(&Params) -> Params + Send + Sync + 'static) {
         self.commit();
         let cur = self.current.clone();
         let files: Vec<PathBuf> = self.files.iter().filter(|p| Some(*p) != cur.as_ref()).cloned().collect();
         let tx = self.tx.clone();
         self.status = format!("Syncing {} frames…", files.len());
+        let f = Arc::new(f);
         std::thread::spawn(move || {
             let done: Vec<(PathBuf, Meta)> = files.into_iter().filter_map(|p| {
                 let q = f(&read_params(&p).unwrap_or_default());
                 write_params(&p, &q).ok().map(|()| (p, Meta::of(&q)))
             }).collect();
-            let _ = tx.send(Msg::Synced(done));
+            let _ = tx.send(Msg::Synced(done, f));
         });
     }
 
