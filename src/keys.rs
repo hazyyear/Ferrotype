@@ -72,6 +72,12 @@ pub fn dirs_cache() -> Option<std::path::PathBuf> {
     Some(base.join("ferrotype"))
 }
 
+/// A cache file's name for `key`: the first 12 bytes of its SHA-256, in hex.
+pub fn cache_name(key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(key.as_bytes()).iter().take(12).map(|b| format!("{b:02x}")).collect()
+}
+
 /// Delete the least recently used files in `dir` until it holds at most `max_bytes`.
 pub fn trim_cache(dir: &std::path::Path, max_bytes: u64) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };

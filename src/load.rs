@@ -43,6 +43,9 @@ pub fn sort_photos(files: &mut [std::path::PathBuf]) {
     });
 }
 
+/// Largest picture `load_other` decodes, as f32: 6 GB, room for a 500 MP scan or our biggest panorama (150 MP).
+const MAX_DECODE_BYTES: u64 = 6 << 30;
+
 /// Full-quality decode, linear light.
 pub fn load(path: &Path) -> Result<Rgb32FImage, String> {
     let real = copy_of(path);
@@ -75,9 +78,15 @@ fn load_other(path: &Path, linearize: bool) -> Result<Rgb32FImage, String> {
     }
     jxl_hook();
     let mut r = ImageReader::open(path).map_err(|e| e.to_string())?.with_guessed_format().map_err(|e| e.to_string())?;
-    // The default 512 MB cap refuses our own panoramas and HDR merges.
+    // The default 512 MB cap refuses our own panoramas and HDR merges, so the size is checked here instead: with
+    // no check, a damaged file whose header claims 60,000 × 60,000 px aborted the whole app reserving 21 GB.
     r.no_limits();
     let mut dec = r.into_decoder().map_err(|e| e.to_string())?;
+    let (w, h) = dec.dimensions();
+    // What it takes once decoded and turned into f32 RGB (12 bytes a pixel), the larger of the two.
+    if w as u64 * h as u64 * dec.color_type().bytes_per_pixel().max(12) as u64 > MAX_DECODE_BYTES {
+        return Err(format!("{w} × {h} px is too big to open"));
+    }
     let orient = dec.orientation().unwrap_or(Orientation::NoTransforms);
     let icc = dec.icc_profile().ok().flatten();
     let mut img = DynamicImage::from_decoder(dec).map_err(|e| e.to_string())?;
@@ -142,7 +151,29 @@ pub fn load_quick_toned(path: &Path, size: u32) -> Result<(Rgb32FImage, bool), S
         linearize_srgb(&mut out, false);
         return Ok((out, true));
     }
-    Ok((fit(&load(path)?, size), false))
+    Ok((quick_full(path, size)?, false))
+}
+
+/// The last full-size decode that `quick_full` made small: (file, its modified time, long edge, picture).
+type Quick = Option<(std::path::PathBuf, Option<std::time::SystemTime>, u32, std::sync::Arc<Rgb32FImage>)>;
+static QUICK: std::sync::Mutex<Quick> = std::sync::Mutex::new(None);
+
+/// A small copy of a photo that has no preview (TIFF scans, PNG…), from a full-size decode. Thumbnails and batch
+/// jobs run on every core: one full decode at a time keeps memory to one scan (a 300 MP strip is about 3.5 GB as
+/// f32), and the frames of one strip (virtual copies) share a single decode instead of one each.
+fn quick_full(path: &Path, size: u32) -> Result<Rgb32FImage, String> {
+    let mut last = QUICK.lock().unwrap_or_else(|e| e.into_inner());
+    let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    if let Some((p, m, s, img)) = last.as_ref()
+        && p == path
+        && *m == modified
+        && *s >= size
+    {
+        return Ok(fit(img, size));
+    }
+    let small = std::sync::Arc::new(fit(&load(path)?, size));
+    *last = Some((path.to_path_buf(), modified, size, small.clone()));
+    Ok(std::sync::Arc::unwrap_or_clone(small))
 }
 
 /// The camera's own tone curve for a RAW, matched from the JPEG it embedded: pairs of (linear RAW brightness,
@@ -342,6 +373,36 @@ pub fn raw_stats(path: &Path) -> Option<RawStats> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_file_claiming_a_huge_size_is_an_error_not_a_crash() {
+        // A real 1 × 1 PNG with its header changed to 100,000 × 100,000 (and the header's checksum fixed).
+        let mut png = vec![];
+        image::RgbImage::new(1, 1).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        png[16..24].copy_from_slice(&[0, 1, 0x86, 0xA0, 0, 1, 0x86, 0xA0]);
+        let mut crc = flate2::Crc::new();
+        crc.update(&png[12..29]);
+        png[29..33].copy_from_slice(&crc.sum().to_be_bytes());
+        let f = std::env::temp_dir().join(format!("ferrotype-huge-{}.png", std::process::id()));
+        std::fs::write(&f, &png).unwrap();
+        assert!(load(&f).is_err_and(|e| e.contains("too big")));
+        assert!(load_quick(&f, 320).is_err());
+        std::fs::remove_file(&f).unwrap();
+    }
+
+    #[test]
+    fn frames_of_one_scan_get_the_same_picture() {
+        let dir = std::env::temp_dir().join(format!("ferrotype-quick-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let strip = dir.join("strip.png");
+        image::RgbImage::from_fn(900, 300, |x, _| image::Rgb([(x % 256) as u8, 80, 40])).save(&strip).unwrap();
+        let a = load_quick(&strip, 360).unwrap();
+        // Its virtual copies get the same picture from that decode, at the same or a smaller size.
+        let b = load_quick(&dir.join("strip.png.copy2"), 360).unwrap();
+        assert_eq!(a.as_raw(), b.as_raw());
+        assert_eq!(load_quick(&dir.join("strip.png.copy3"), 120).unwrap().width(), 120);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn shrink_matches_the_image_crate() {

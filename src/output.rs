@@ -350,10 +350,6 @@ pub fn exif_segment(shot: &Shot, description: &str) -> Vec<u8> {
     segment(0xE1, &body)
 }
 
-fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
-}
-
 /// The same details as an XMP packet, plus keywords: what TIFF and PNG exports carry (and what Lightroom, Bridge
 /// and exiftool read from them).
 pub fn xmp_packet(shot: &Shot, description: &str, keywords: &[String]) -> String {
@@ -396,20 +392,20 @@ pub fn xmp_packet(shot: &Shot, description: &str, keywords: &[String]) -> String
     let mut x = String::from("<?xpacket begin=\"\u{feff}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n");
     x += "<rdf:Description rdf:about=\"\" xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:tiff=\"http://ns.adobe.com/tiff/1.0/\" xmlns:exif=\"http://ns.adobe.com/exif/1.0/\" xmlns:exifEX=\"http://cipa.jp/exif/1.0/\" xmlns:aux=\"http://ns.adobe.com/exif/1.0/aux/\"";
     for (k, v) in &attrs {
-        x += &format!("\n  {k}=\"{}\"", xml_escape(v));
+        x += &format!("\n  {k}=\"{}\"", crate::xmp::escape(v));
     }
     x += ">\n";
     if shot.iso > 0.0 {
         x += &format!("<exif:ISOSpeedRatings><rdf:Seq><rdf:li>{}</rdf:li></rdf:Seq></exif:ISOSpeedRatings>\n", shot.iso.round());
     }
     if !description.trim().is_empty() {
-        x += &format!("<dc:description><rdf:Alt><rdf:li xml:lang=\"x-default\">{}</rdf:li></rdf:Alt></dc:description>\n", xml_escape(description.trim()));
+        x += &format!("<dc:description><rdf:Alt><rdf:li xml:lang=\"x-default\">{}</rdf:li></rdf:Alt></dc:description>\n", crate::xmp::escape(description.trim()));
     }
     let kws: Vec<&String> = keywords.iter().filter(|k| !k.trim().is_empty()).collect();
     if !kws.is_empty() {
         x += "<dc:subject><rdf:Bag>";
         for k in kws {
-            x += &format!("<rdf:li>{}</rdf:li>", xml_escape(k.trim()));
+            x += &format!("<rdf:li>{}</rdf:li>", crate::xmp::escape(k.trim()));
         }
         x += "</rdf:Bag></dc:subject>\n";
     }

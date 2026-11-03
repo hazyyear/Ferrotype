@@ -32,8 +32,18 @@ fn curve(x: &str, name: &str) -> Vec<[f32; 2]> {
     if pts.len() == 2 && pts[0] == [0.0, 0.0] && pts[1] == [1.0, 1.0] { vec![] } else { pts }
 }
 
+/// `x` without its `<crs:Look>` block: the profile's own name and settings live there (`crs:Name="Adobe Color"`),
+/// and they are not the photo's or the preset's.
+fn without_look(x: &str) -> std::borrow::Cow<'_, str> {
+    match (x.find("<crs:Look>"), x.find("</crs:Look>")) {
+        (Some(a), Some(b)) if b > a => format!("{}{}", &x[..a], &x[b + "</crs:Look>".len()..]).into(),
+        _ => x.into(),
+    }
+}
+
 /// Settings from Lightroom XMP text, and the preset's name when it has one.
 pub fn parse(x: &str) -> (Option<String>, Params) {
+    let x = &*without_look(x);
     let mut p = Params::default();
     let set = |v: &mut f32, name: &str| {
         if let Some(n) = num(x, name) {
@@ -166,7 +176,7 @@ fn unescape(s: &str) -> String {
     s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&")
 }
 
-fn escape(s: &str) -> String {
+pub(crate) fn escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
@@ -273,6 +283,7 @@ mod tests {
             crs:ColorGradeShadowHue="210" crs:ColorGradeShadowSat="15" crs:HasCrop="True" crs:CropLeft="0.1" crs:CropRight="0.9"
             crs:CropTop="0" crs:CropBottom="1" crs:ConvertToGrayscale="False">
             <crs:Name><rdf:Alt><rdf:li xml:lang="x-default">Moody blue</rdf:li></rdf:Alt></crs:Name>
+            <crs:Look><rdf:Description crs:Name="Adobe Color" crs:Amount="1" crs:Exposure2012="-2.00"/></crs:Look>
             <crs:ToneCurvePV2012><rdf:Seq><rdf:li>0, 20</rdf:li><rdf:li>128, 128</rdf:li><rdf:li>255, 240</rdf:li></rdf:Seq></crs:ToneCurvePV2012>
             </rdf:Description></rdf:RDF></x:xmpmeta>"#;
         let (name, p) = parse(x);
