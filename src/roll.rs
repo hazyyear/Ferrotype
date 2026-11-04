@@ -127,6 +127,7 @@ pub fn read(dir: &Path) -> Option<Roll> {
 /// Save the roll notes; an empty roll removes the file.
 pub fn write(dir: &Path, r: &Roll) -> Result<(), String> {
     let path = path_in(dir);
+    crate::keep_if_damaged::<Roll>(&path).map_err(|e| e.to_string())?;
     if r.is_empty() {
         return match std::fs::remove_file(&path) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
@@ -270,6 +271,20 @@ mod tests {
         assert!(r.summary().contains("at 1600 (+2 push)"), "{}", r.summary());
         write(&dir, &Roll::default()).unwrap();
         assert!(read(&dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn damaged_notes_are_kept_not_replaced() {
+        let dir = std::env::temp_dir().join(format!("ferro-roll-damaged-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(path_in(&dir), r#"{ "roll": "12", "notes": "hand-edited", }"#).unwrap();
+        assert!(read(&dir).is_none());
+        write(&dir, &Roll { camera: "FM2".into(), ..Default::default() }).unwrap();
+        let kept = std::fs::read_to_string(dir.join(format!("{FILE}.damaged"))).unwrap();
+        assert!(kept.contains("hand-edited"));
+        assert_eq!(read(&dir).unwrap().camera, "FM2");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

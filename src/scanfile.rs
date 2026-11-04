@@ -239,13 +239,8 @@ fn unspecified_extra_samples<R: Read + Seek>(r: &mut R) -> std::io::Result<Vec<(
     Ok(out)
 }
 
-/// Every sample of one page, as stored (chunky or planar), as f32 0..1: (width, height, samples, interleaved data).
-pub fn read_samples(path: &Path, page: usize) -> Option<(u32, u32, usize, Vec<f32>)> {
-    let (w, h, s, v) = read_u16(path, page)?;
-    Some((w, h, s, v.iter().map(|&x| x as f32 / 65535.0).collect()))
-}
-
-/// `read_samples` as 16-bit values (half the memory of f32): a full-resolution scan can be billions of samples.
+/// Every sample of one page, as stored (chunky or planar), as 16-bit values: (width, height, samples, interleaved
+/// data). Kept 16-bit rather than f32 because a full-resolution scan can be billions of samples.
 pub fn read_u16(path: &Path, page: usize) -> Option<(u32, u32, usize, Vec<u16>)> {
     let mut dec = open(path)?;
     if page > 0 {
@@ -390,9 +385,10 @@ mod tests {
         let i = info(&p).unwrap();
         assert_eq!((i.colours, i.extra, i.bits, i.icc, i.dpi), (3, 1, 16, false, 3200.0));
         assert!(i.looks_linear(), "untagged VueScan raw is linear");
-        let (w, h, s, d) = read_samples(&p, 0).unwrap();
+        let (w, h, s, d) = read_u16(&p, 0).unwrap();
+        let v = |i: usize| d[i] as f32 / 65535.0;
         assert_eq!((w, h, s), (16, 8, 4));
-        assert!((d[3] - 0.8).abs() < 1e-3 && (d[5 * 4 + 3] - 0.05).abs() < 1e-3);
+        assert!((v(3) - 0.8).abs() < 1e-3 && (v(5 * 4 + 3) - 0.05).abs() < 1e-3);
         let ir = crate::scan::ir_channel(&p).expect("infrared found");
         assert!((ir.data[5] - 0.05).abs() < 1e-3);
     }
@@ -424,9 +420,8 @@ mod tests {
         assert_eq!(info(&p).unwrap().pages, 3);
         let files = split_pages(&p).unwrap();
         assert_eq!(files.len(), 3);
-        let (_, _, s, d) = read_samples(&files[2], 0).unwrap();
-        assert_eq!(s, 3);
-        assert!((d[0] - 3000.0 / 65535.0).abs() < 1e-4);
+        let (_, _, s, d) = read_u16(&files[2], 0).unwrap();
+        assert_eq!((s, d[0]), (3, 3000));
         assert_eq!(info(&files[2]).unwrap().software, "EPSON Scan 2");
         // Splitting again never replaces a file: the second set gets new names.
         let before = std::fs::read(&files[0]).unwrap();

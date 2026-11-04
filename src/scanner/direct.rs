@@ -362,8 +362,8 @@ mod tests {
         let info = crate::scanfile::info(&saved[1]).unwrap();
         assert_eq!((info.bits, info.colours, info.extra, info.dpi), (16, 3, 0, 300.0));
         assert!(info.software.contains("direct USB") && info.model.contains("V8"), "{info:?}");
-        let (_, _, _, d) = crate::scanfile::read_samples(&saved[1], 0).unwrap();
-        assert!((d[0] - 0x8080 as f32 / 65535.0).abs() < 1e-3);
+        let (_, _, _, d) = crate::scanfile::read_u16(&saved[1], 0).unwrap();
+        assert_eq!(d[0], 0x8080);
         // No work files left behind.
         let left: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name()).collect();
         assert_eq!(left.len(), 2, "{left:?}");

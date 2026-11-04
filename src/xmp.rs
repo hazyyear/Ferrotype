@@ -5,15 +5,7 @@ use crate::develop::Params;
 
 /// A setting in attribute form (`crs:Name="v"`) or element form (`<crs:Name>v</crs:Name>`).
 fn get(x: &str, name: &str) -> Option<String> {
-    let a = format!("crs:{name}=\"");
-    if let Some(i) = x.find(&a) {
-        let r = &x[i + a.len()..];
-        return Some(r[..r.find('"')?].to_string());
-    }
-    let o = format!("<crs:{name}>");
-    let i = x.find(&o)?;
-    let r = &x[i + o.len()..];
-    Some(r[..r.find('<')?].trim().to_string())
+    std_get(x, &format!("crs:{name}"))
 }
 
 fn num(x: &str, name: &str) -> Option<f32> {

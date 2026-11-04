@@ -963,7 +963,12 @@ impl App {
                 }
                 let params = read_params(f);
                 let meta = params.as_ref().map(Meta::of);
-                let cached = thumb_cache(f).and_then(|c| image::open(c).ok()).map(|i| {
+                let cached = thumb_cache(f).and_then(|c| {
+                    let i = image::open(&c).ok()?;
+                    // A hit counts as a use, so start-up trimming drops thumbnails nobody looks at, not old ones.
+                    let _ = std::fs::File::options().append(true).open(&c).and_then(|f| f.set_modified(std::time::SystemTime::now()));
+                    Some(i)
+                }).map(|i| {
                     let i = i.to_rgb8();
                     ColorImage::from_rgba_unmultiplied([i.width() as usize, i.height() as usize], &crate::colour::for_screen(i.as_raw()))
                 });
@@ -1397,10 +1402,13 @@ impl App {
                     Ok(moved) => {
                         let photos = moved.iter().filter(|(a, _)| load::is_supported(a)).count();
                         self.status = format!("Renamed {photos} photos. Right-click a photo to undo.");
-                        let map = |p: &mut Option<PathBuf>| if let Some(new) = p.as_ref().and_then(|c| moved.iter().find(|(a, _)| a == c)).map(|(_, b)| b.clone()) { *p = Some(new) };
+                        // A virtual copy moves only as its sidecar: `moved_to` finds its new name too.
+                        let map = |p: &mut Option<PathBuf>| if let Some(new) = p.as_deref().and_then(|c| crate::rename::moved_to(&moved, c)) { *p = Some(new) };
                         map(&mut self.current);
                         map(&mut self.lib_sel);
                         self.lib_multi.clear();
+                        // The roll notes on disk now use the new frame names: read them again.
+                        self.roll_dir = None;
                         if let Some(d) = self.folder.clone() {
                             self.open_path(ctx, &d);
                         }

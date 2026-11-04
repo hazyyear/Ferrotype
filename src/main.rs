@@ -220,6 +220,19 @@ pub fn move_to_rejects(dest: &Path, files: &[PathBuf]) -> std::io::Result<usize>
     Ok(moved)
 }
 
+/// Before a settings file (roll notes, collections) is saved over: if what is there now can't be read as `T`, keep
+/// it as `<name>.damaged` for repair by hand, as sidecars are, instead of replacing it with what the app shows.
+pub fn keep_if_damaged<T: serde::de::DeserializeOwned>(path: &Path) -> std::io::Result<()> {
+    match std::fs::read_to_string(path) {
+        Ok(t) if serde_json::from_str::<T>(&t).is_err() => {
+            let mut keep = path.as_os_str().to_owned();
+            keep.push(".damaged");
+            std::fs::rename(path, keep)
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Write to a temp file beside `path`, then rename over `path`, so a crash or full disk never leaves a half-written file.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     // A temp name of its own per write: the sync thread and a rating click can save the same sidecar at once.
