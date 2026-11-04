@@ -171,6 +171,7 @@ pub fn save(c: &[Collection]) -> Result<(), String> {
     if let Some(d) = f.parent() {
         std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
     }
+    crate::keep_if_damaged::<Vec<Collection>>(&f).map_err(|e| e.to_string())?;
     crate::write_atomic(&f, serde_json::to_string_pretty(c).unwrap_or_default().as_bytes()).map_err(|e| e.to_string())
 }
 

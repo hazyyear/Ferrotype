@@ -261,12 +261,14 @@ fn read_ir(path: &Path) -> Option<Ir> {
     if info.extra == 0 {
         return None;
     }
-    let (w, h, samples, px) = crate::scanfile::read_samples(path, 0)?;
+    // 16-bit, and only the infrared turned into f32: the whole scan as f32 next to it took three times the memory.
+    let (w, h, samples, px) = crate::scanfile::read_u16(path, 0)?;
     let at = info.colours as usize;
     if at >= samples {
         return None;
     }
-    let data: Vec<f32> = px.chunks_exact(samples).map(|c| c[at]).collect();
+    let data: Vec<f32> = px.chunks_exact(samples).map(|c| c[at] as f32 / 65535.0).collect();
+    drop(px);
     if data.len() != (w * h) as usize {
         return None;
     }
