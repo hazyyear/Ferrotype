@@ -141,6 +141,11 @@ struct CullState {
     soft_below: Option<f32>,
     /// Bursts waiting for their scores before the sharpest of each is picked.
     pick_groups: Option<Vec<Vec<PathBuf>>>,
+    /// The bursts last used by Pick the sharpest, so the panel can say where a frame ranks in its burst.
+    groups: Vec<Vec<PathBuf>>,
+    /// Flags as they were before the last Pick the sharpest, so one undo puts them all back.
+    /// Cleared by any other flag or rating change.
+    burst_undo: Option<Vec<(PathBuf, i8)>>,
 }
 
 /// The soft-frame threshold until you set one.
@@ -410,6 +415,8 @@ pub struct App {
     /// The scope image on screen, and whether a newer render is waiting to replace it.
     scope_tex: Option<(usize, TextureHandle)>,
     scope_dirty: bool,
+    /// Double-click a scope to make it taller (and again to shrink it).
+    scope_tall: bool,
     /// Negative's darkroom views on the preview: 0 off, 1 test strip, 2 ring-around.
     darkroom: u8,
     clip_view: bool,
@@ -772,6 +779,16 @@ fn stock_picker(ui: &mut Ui, id: &str, np: &mut negative::NegParams) -> bool {
 }
 
 /// A paper grade as printed on the filter: whole grades plainly, half grades with ½.
+/// Plain words for a paper grade, so the help line needs no standards numbers.
+fn grade_words(g: f32) -> &'static str {
+    if g < 1.25 { "is soft, for contrasty negatives" } else if g < 2.75 { "is normal contrast" } else { "is hard, for flat negatives" }
+}
+
+fn ordinal(n: usize) -> String {
+    let suffix = match (n % 10, n % 100) { (_, 11..=13) => "th", (1, _) => "st", (2, _) => "nd", (3, _) => "rd", _ => "th" };
+    format!("{n}{suffix}")
+}
+
 fn fmt_grade(g: f32) -> String {
     let whole = g.floor() as i32;
     if g - whole as f32 >= 0.25 { format!("{whole}\u{bd}") } else { whole.to_string() }
@@ -835,7 +852,7 @@ impl App {
             module: Module::Library, shown_module: Module::Library, folder: None, files: vec![], thumbs: Default::default(), thumb_used: Default::default(), thumb_want: Default::default(), thumb_pending: Default::default(), thumb_ready: Default::default(), frame: 0, thumb_gen: Default::default(), load_gen: Default::default(), open_error: None, meta: Default::default(), lib_rating: 0,
             subdirs: vec![], tex_scale: 1.0, thumb_size: 190.0, lib_sel: None, lib_query: String::new(),
             lib_filter: [true, true, true, true, false], stack_bursts: false, bursts: vec![], burst_of: Default::default(), burst_open: Default::default(), bursts_key: None, current: None, photo: None, loading: false, params: Params::default(), prev_params: None,
-            rendered: None, render_busy: false, photo_gen: 0, tex: None, before_tex: None, last_rgb: None, hover_rgb: None, shown_w: 0.0, bins: [[0.0; 128]; 3], scope: 0, scopes: Default::default(), scope_tex: None, scope_dirty: false, darkroom: 0, clip_view: false,
+            rendered: None, render_busy: false, photo_gen: 0, tex: None, before_tex: None, last_rgb: None, hover_rgb: None, shown_w: 0.0, bins: [[0.0; 128]; 3], scope: 0, scopes: Default::default(), scope_tex: None, scope_dirty: false, scope_tall: false, darkroom: 0, clip_view: false,
             history: vec![Params::default()], hist_pos: 0, copied: None, view: View::After, holding_before: false, picking_base: false,
             status: String::new(), presets, preset_tex: vec![], last_preset: None, preset_mix: None, preset_amt: 100.0, preset_name: String::new(), stock_query: String::new(), my_stocks: negative::custom_stocks(), my_stock_name: String::new(), proof: 0,
             stock_tab: 0, mixer_tab: 0, open: [true, false, false, false, false, false, false, false, false, false, false, false, false, false], tool: Tool::None,
@@ -1255,6 +1272,7 @@ impl App {
                     }
                 }
                 Msg::PickBursts(groups) => {
+                    self.cull.groups = groups.clone();
                     // Frames that failed to read before are left out: nothing would be sent for them, and the pick would wait forever.
                     let need: Vec<PathBuf> = groups.iter().flatten().filter(|f| !self.cull.sharp.contains_key(*f) && !self.cull.unscored.contains(*f)).cloned().collect();
                     self.cull.pick_groups = Some(groups);
@@ -2717,6 +2735,7 @@ impl App {
 
     /// Set the rating and/or flag of a photo. The open photo changes through its settings (so undo covers it).
     fn rate(&mut self, f: &Path, rating: Option<u8>, flag: Option<i8>, label: Option<u8>) {
+        self.cull.burst_undo = None;
         if self.module == Module::Cull {
             let text = match (rating, flag, label) {
                 (Some(0), ..) => "No stars".to_string(),
@@ -2881,6 +2900,7 @@ impl App {
             return;
         }
         let (mut picked, mut rejected) = (0, 0);
+        let mut undo: Vec<(PathBuf, i8)> = vec![];
         for g in &groups {
             // Flags and stars as saved: `meta` only holds photos whose thumbnails have loaded.
             let state: std::collections::HashMap<PathBuf, (i8, u8)> = g.iter().map(|f| {
@@ -2888,12 +2908,44 @@ impl App {
                 (f.clone(), m.map_or((0, 0), |m| (m.flag, m.rating)))
             }).collect();
             for (f, flag) in crate::sharp::plan(g, &self.cull.sharp, |f| state[f]) {
+                undo.push((f.clone(), state[&f].0));
                 self.rate(&f, None, Some(flag), None);
                 if flag > 0 { picked += 1 } else { rejected += 1 }
             }
         }
-        self.cull.flash = Some((format!("Picked {picked}"), std::time::Instant::now()));
-        self.status = format!("{} burst{}: picked {picked} sharpest, marked {rejected} as rejects. Nothing is deleted; press U on a frame to clear its flag.", groups.len(), if groups.len() == 1 { "" } else { "s" });
+        self.cull.flash = Some((format!("Picked {picked} \u{b7} rejected {rejected}"), std::time::Instant::now()));
+        self.status = format!("{} burst{}: picked {picked} sharpest, marked {rejected} as rejects. Nothing is deleted; Ctrl+Z puts every flag back.", groups.len(), if groups.len() == 1 { "" } else { "s" });
+        self.cull.burst_undo = (!undo.is_empty()).then_some(undo);
+    }
+
+    /// Put back the flags the last Pick the sharpest changed, in one step.
+    fn undo_bursts(&mut self) {
+        let Some(undo) = self.cull.burst_undo.take() else { return };
+        for (f, flag) in &undo {
+            self.rate(f, None, Some(*flag), None);
+        }
+        self.cull.flash = Some(("Burst picks undone".into(), std::time::Instant::now()));
+        self.status = format!("Put back the flags on {} frame{}", undo.len(), if undo.len() == 1 { "" } else { "s" });
+    }
+
+    /// Where a frame ranks for sharpness: in its burst when it's in one, else against the scored frames shown.
+    fn sharp_rank(&self, f: &PathBuf) -> Option<String> {
+        let v = *self.cull.sharp.get(f)?;
+        let burst = self.burst_of.get(f).and_then(|k| self.bursts.get(*k)).or_else(|| self.cull.groups.iter().find(|g| g.contains(f)));
+        if let Some(g) = burst {
+            let scored: Vec<u8> = g.iter().filter_map(|x| self.cull.sharp.get(x).copied()).collect();
+            if scored.len() >= 2 {
+                let rank = scored.iter().filter(|s| **s > v).count() + 1;
+                return Some(if rank == 1 { format!("Sharpest of {} in burst", scored.len()) } else { format!("{} of {} in burst", ordinal(rank), scored.len()) });
+            }
+        }
+        let vis = self.lib_visible();
+        let scored: Vec<u8> = vis.iter().filter_map(|x| self.cull.sharp.get(x).copied()).collect();
+        if scored.len() < 3 {
+            return None;
+        }
+        let (n, below) = (scored.len(), scored.iter().filter(|s| **s < v).count());
+        Some(if below + 1 == n { format!("Sharpest of the {n} shown") } else if below == 0 && scored.iter().any(|s| *s > v) { format!("Softest of the {n} shown") } else { format!("Sharper than {}% of the {n} shown", below * 100 / (n - 1)) })
     }
 
     fn cull_view(&mut self, ui: &mut Ui) {
@@ -2958,7 +3010,8 @@ impl App {
             let nr = ui.painter().text(pos2(r.left(), y), Align2::LEFT_CENTER, name, FontId::proportional(12.5), if m.flag < 0 { TEXT3 } else { TEXT });
             if let Some(v) = self.cull.sharp.get(f) {
                 let soft = self.cull.skip_soft && (*v as f32) < self.cull.soft_below();
-                ui.painter().text(pos2(nr.right() + 12.0, y), Align2::LEFT_CENTER, format!("sharpness {v}"), FontId::monospace(11.5), if soft { WARN } else { TEXT2 });
+                // No colour for soft: the word says it (and reads for colour-blind users too).
+                ui.painter().text(pos2(nr.right() + 12.0, y), Align2::LEFT_CENTER, if soft { format!("sharpness {v} \u{b7} soft") } else { format!("sharpness {v}") }, FontId::monospace(11.5), if soft { TEXT3 } else { TEXT2 });
             }
             let mut x = r.right();
             if m.label > 0 {
@@ -2970,7 +3023,7 @@ impl App {
                 let t = if m.flag > 0 { "Pick" } else { "Reject" };
                 let g = ui.painter().layout_no_wrap(t.into(), FontId::new(12.5, semi()), INK);
                 let b = Rect::from_min_max(pos2(x - g.size().x - 16.0, y - 11.0), pos2(x, y + 11.0));
-                ui.painter().rect_filled(b, 3.0, if m.flag > 0 { BONE } else { hex(0xE5484D) });
+                ui.painter().rect_filled(b, 3.0, if m.flag > 0 { BONE } else { REJECT });
                 ui.painter().galley(b.center() - g.size() / 2.0, g, INK);
                 x = b.left() - 14.0;
             }
@@ -3015,25 +3068,40 @@ impl App {
     /// Cull's sharpness tools: this frame's score, skipping soft frames, and picking the sharpest of each burst.
     fn sharpness_block(&mut self, ui: &mut Ui) {
         ui.label(caps("Sharpness"));
-        let score = self.lib_sel.as_ref().and_then(|f| self.cull.sharp.get(f)).copied();
+        let sel = self.lib_sel.clone();
+        let score = sel.as_ref().and_then(|f| self.cull.sharp.get(f)).copied();
+        // Lead with where the frame ranks; the raw score only means something next to others.
+        let rank = sel.as_ref().and_then(|f| self.sharp_rank(f));
         ui.horizontal(|ui| {
-            ui.label(RichText::new("This frame").size(12.5));
+            ui.label(RichText::new(rank.unwrap_or_else(|| if score.is_some() { "This frame".into() } else { "Not scored yet".into() })).size(12.5));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(RichText::new(score.map(|v| format!("{v} / 100")).unwrap_or("\u{2014}".into())).monospace().size(12.0).color(TEXT2));
+                ui.label(RichText::new(score.map(|v| v.to_string()).unwrap_or("\u{2014}".into())).monospace().size(11.5).color(TEXT3))
+                    .on_hover_text("Edge strength for the picture's contrast, 0–100. Compare frames of the same scene, not across scenes.");
             });
         });
-        // A thin bar: how this frame compares with the threshold.
-        let (bar, _) = ui.allocate_exact_size(vec2(ui.available_width(), 6.0), Sense::hover());
+        // The bar shows this frame's score. With Skip soft frames on, its mark is the threshold: drag it.
+        let skip = self.cull.skip_soft;
+        let (hit, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 18.0), if skip { Sense::click_and_drag() } else { Sense::hover() });
+        let bar = Rect::from_center_size(hit.center(), vec2(hit.width(), 6.0));
         ui.painter().rect_filled(bar, 3.0, hex(0x3A3A40));
         if let Some(v) = score {
             let x = bar.left() + bar.width() * v as f32 / 100.0;
-            ui.painter().rect_filled(Rect::from_min_max(bar.min, pos2(x, bar.bottom())), 3.0, if self.cull.skip_soft && (v as f32) < self.cull.soft_below() { WARN } else { BONE });
+            let soft = skip && (v as f32) < self.cull.soft_below();
+            ui.painter().rect_filled(Rect::from_min_max(bar.min, pos2(x, bar.bottom())), 3.0, if soft { TEXT3 } else { BONE });
         }
-        if self.cull.skip_soft {
+        if skip {
+            if (resp.dragged() || resp.clicked()) && let Some(p) = resp.interact_pointer_pos() {
+                self.cull.soft_below = Some(((p.x - bar.left()) / bar.width() * 100.0).clamp(0.0, 100.0).round());
+            }
             let t = bar.left() + bar.width() * self.cull.soft_below() / 100.0;
-            ui.painter().line_segment([pos2(t, bar.top() - 3.0), pos2(t, bar.bottom() + 3.0)], Stroke::new(1.5, TEXT));
+            let hot = resp.hovered() || resp.dragged();
+            ui.painter().line_segment([pos2(t, hit.top()), pos2(t, hit.bottom())], Stroke::new(if hot { 2.5 } else { 1.5 }, TEXT));
+            ui.painter().circle_filled(pos2(t, hit.top() + 2.0), if hot { 4.5 } else { 3.5 }, TEXT);
+            if hot {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+            }
         }
-        ui.add_space(6.0);
+        ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.label(RichText::new("Skip soft frames").size(12.5));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| switch(ui, &mut self.cull.skip_soft));
@@ -3042,19 +3110,16 @@ impl App {
         if self.cull.skip_soft {
             // Every frame, so a folder opened later is scored too; frames already scored or tried are skipped.
             self.score_frames(ui.ctx(), vis.clone());
-            let mut below = self.cull.soft_below();
-            slider(ui, "Below", &mut below, 0.0, 100.0, SOFT_BELOW, None);
-            self.cull.soft_below = Some(below);
             let scored = vis.iter().filter(|f| self.cull.sharp.contains_key(*f)).count();
             let soft = vis.iter().filter(|f| self.cull.sharp.get(*f).is_some_and(|v| (*v as f32) < self.cull.soft_below())).count();
             let line = if scored < vis.len() && !self.cull.scoring.is_empty() {
                 format!("Scoring {scored} of {}…", vis.len())
             } else {
-                format!("Arrow keys step over {soft} soft frame{} of {}.", if soft == 1 { "" } else { "s" }, vis.len())
+                format!("Skips below {:.0}: arrow keys step over {soft} soft frame{} of {}. Drag the mark to change it.", self.cull.soft_below(), if soft == 1 { "" } else { "s" }, vis.len())
             };
             ui.label(RichText::new(line).size(11.0).color(TEXT3));
         } else {
-            ui.label(RichText::new("Arrow keys step over frames scored below a threshold you set.").size(11.0).color(TEXT3));
+            ui.label(RichText::new("Arrow keys step over frames scored below a mark you set on the bar.").size(11.0).color(TEXT3));
         }
         ui.add_space(6.0);
         let busy = self.cull.pick_groups.is_some();
@@ -3063,6 +3128,9 @@ impl App {
             .clicked()
         {
             self.pick_sharpest(ui.ctx());
+        }
+        if self.cull.burst_undo.is_some() && ui.add(egui::Button::new("Undo burst picks").min_size(vec2(ui.available_width(), 28.0))).on_hover_text("Put back every flag the last run changed (Ctrl+Z)").clicked() {
+            self.undo_bursts();
         }
         ui.add_space(14.0);
     }
@@ -3096,7 +3164,7 @@ impl App {
                 for (i, (flag, name, key)) in [(1i8, "Pick", &pick_key), (-1, "Reject", &reject_key)].into_iter().enumerate() {
                     let on = m.flag == flag;
                     let b = egui::Button::new(RichText::new(format!("{name}   {key}")).color(if on { INK } else { TEXT }))
-                        .fill(if on { if flag > 0 { BONE } else { hex(0xE5484D) } } else { Color32::TRANSPARENT })
+                        .fill(if on { if flag > 0 { BONE } else { REJECT } } else { Color32::TRANSPARENT })
                         .stroke(Stroke::new(1.0, if on { Color32::TRANSPARENT } else { BTN_BORDER }))
                         .min_size(vec2(c[i].available_width(), 32.0));
                     if c[i].add(b).clicked() {
@@ -3139,13 +3207,19 @@ impl App {
         ui.add_space(14.0);
         self.sharpness_block(ui);
         ui.label(RichText::new(format!("{nav} next / previous. Press ? for every key.")).size(11.5).color(TEXT3));
-        ui.add_space(14.0);
         let rejects = self.meta.values().filter(|m| m.flag < 0).count();
-        // Only offered when there is something to move.
-        if rejects > 0 && ui.add(egui::Button::new(format!("Move {rejects} reject{} to _rejects", if rejects == 1 { "" } else { "s" })).min_size(vec2(ui.available_width(), 32.0)))
-            .on_hover_text("Moves rejected photos and their settings into a _rejects folder here. Nothing is deleted.").clicked()
-        {
-            self.move_rejects(ui.ctx());
+        // Only offered when there is something to move. It moves files on disk, so it gets its own section
+        // at the foot of the panel, away from the flag-only actions.
+        if rejects > 0 {
+            ui.add_space(22.0);
+            ui.separator();
+            ui.add_space(8.0);
+            ui.label(caps("Files"));
+            ui.label(RichText::new(format!("Moves {rejects} rejected file{} and their settings into a _rejects folder next to this roll. Nothing is deleted.", if rejects == 1 { "" } else { "s" })).size(11.0).color(TEXT3));
+            ui.add_space(4.0);
+            if ui.add(egui::Button::new(format!("Move {rejects} reject{} to _rejects", if rejects == 1 { "" } else { "s" })).min_size(vec2(ui.available_width(), 32.0))).clicked() {
+                self.move_rejects(ui.ctx());
+            }
         }
     }
 
@@ -3205,7 +3279,9 @@ impl App {
             // Mockup order: Negative | Split | Positive in the Negative module.
             let (labels, order): (&[&str], &[View]) = if neg { (&["Positive", "Negative", "Split"], &[View::After, View::Before, View::Split]) } else { (&["After", "Before", "Split", "2-up"], &[View::After, View::Before, View::Wipe, View::Split]) };
             let mut i = order.iter().position(|v| *v == self.view).unwrap_or(0);
-            segmented(ui, &mut i, labels);
+            // A darkroom view replaces the canvas, so the view buttons do nothing while one is open.
+            let darkroom = self.darkroom_view();
+            ui.add_enabled_ui(darkroom == 0, |ui| segmented(ui, &mut i, labels));
             self.view = order[i];
             // Groups: views | tools ... zoom & paper. Copy, paste and reset live under the settings panel.
             let divider = |ui: &mut Ui| {
@@ -3214,6 +3290,24 @@ impl App {
                 ui.painter().vline(r.center().x, r.y_range(), Stroke::new(1.0, BORDER));
                 ui.add_space(4.0);
             };
+            if neg {
+                // Choose by eye: next to the views, since they take over the canvas.
+                let np = &self.params.neg;
+                let can = np.enabled && negative::stock(&np.stock).kind != Kind::Slide && self.photo.is_some();
+                divider(ui);
+                ui.add_enabled_ui(can, |ui| {
+                    for (v, name, tip) in [(1u8, "Test strip", "Five bands of print time, \u{bd} stop apart. Click the one that looks right; the next strip centres on it."),
+                                           (2u8, "Ring-around", "The frame with more of each colour, lighter and darker around it. Click the one that looks right; the next ring centres on it.")] {
+                        if ghost(ui, name, darkroom == v).on_hover_text(tip).on_disabled_hover_text("Turn on Convert negative first").clicked() {
+                            self.darkroom = if self.darkroom == v { 0 } else { v };
+                            self.view = View::After;
+                        }
+                    }
+                    if darkroom > 0 && ghost(ui, "Done", false).on_hover_text("Close the darkroom view (Esc)").clicked() {
+                        self.darkroom = 0;
+                    }
+                });
+            }
             if !neg {
                 divider(ui);
                 for (t, name, tip) in [(Tool::Crop, "Crop", "Drag the corners, or drag inside to move"), (Tool::Heal, "Heal", "Click a spot to heal it. Right-click a circle to remove it"),
@@ -3563,8 +3657,13 @@ impl App {
         }
         let Some((_, tex)) = &self.scope_tex else { return };
         let w = ui.available_width();
-        let size = if self.scope == 3 { vec2(w, w.min(200.0)) } else { vec2(w, 112.0) };
-        let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
+        let tall = self.scope_tall;
+        let size = if self.scope == 3 { vec2(w, w.min(if tall { w } else { 200.0 })) } else { vec2(w, if tall { 240.0 } else { 112.0 }) };
+        let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+        if resp.double_clicked() {
+            self.scope_tall = !self.scope_tall;
+        }
+        let more = if tall { "Double-click to make it smaller." } else { "Double-click to make it taller." };
         let p = ui.painter_at(rect);
         p.rect_filled(rect, 3.0, hex(0x101012));
         let grid = Stroke::new(1.0, hex(0x2A2A2E));
@@ -3583,6 +3682,7 @@ impl App {
             p.line_segment([pos2(c.x, sq.top() + 6.0), pos2(c.x, sq.bottom() - 6.0)], grid);
             let (dx, dy) = crate::scopes::skin_dir();
             p.line_segment([c, c + vec2(dx, dy) * side * 0.46], Stroke::new(1.0, hex(0x6A5A4C)));
+            note(c + vec2(dx, dy) * side * 0.46 + vec2(dx, dy).normalized() * 14.0, "skin", Align2::CENTER_CENTER);
             p.image(tex.id(), sq, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
             for (name, t) in crate::scopes::TARGETS {
                 let (x, y) = crate::scopes::vec_pos(t);
@@ -3591,7 +3691,7 @@ impl App {
                 let out = (q - c).normalized() * 12.0;
                 note(q + out, name, Align2::CENTER_CENTER);
             }
-            resp.on_hover_text("Colour spread: the further from the centre, the more saturated. The line up and to the left is where skin tones sit, whatever the skin.");
+            resp.on_hover_text(format!("Colour spread: the further from the centre, the more saturated. Boxes mark red (R), yellow (Yl), green (G), cyan (Cy), blue (B) and magenta (Mg). The skin line is where skin tones sit, whatever the skin. {more}"));
         } else {
             // Level lines at 0, 25, 50, 75 and 100%.
             for k in 0..5 {
@@ -3606,12 +3706,13 @@ impl App {
             }
             p.image(tex.id(), rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
             note(rect.left_top() + vec2(3.0, 2.0), "100", Align2::LEFT_TOP);
+            note(pos2(rect.left() + 3.0, rect.center().y - 2.0), "50", Align2::LEFT_BOTTOM);
             note(rect.left_bottom() + vec2(3.0, -2.0), "0", Align2::LEFT_BOTTOM);
-            resp.on_hover_text(if self.scope == 1 {
+            resp.on_hover_text(format!("{} {more}", if self.scope == 1 {
                 "Brightness across the photo, left to right as in the picture. Top is white, bottom is black."
             } else {
                 "Red, green and blue levels side by side, each left to right as in the picture. Equal heights mean neutral."
-            });
+            }));
         }
     }
 
@@ -3640,13 +3741,22 @@ impl App {
                 Rect::from_min_size(pos2(r.left() + c * (w + g) * sx, r.top() + row * (h + g) * sy), vec2(w * sx, h * sy))
             }
         };
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.darkroom = 0;
+            return;
+        }
+        // The middle one is the print as it is now, so say what that is.
+        let now = self.params.neg.print_exp;
+        let as_is = if now == 0.0 { "As is".to_string() } else { format!("As is \u{b7} {}{:.1}", if now > 0.0 { "+" } else { "\u{2212}" }, now.abs()) };
         let label = |i: usize| -> String {
             if view == 1 {
-                ["\u{2212}1 stop", "\u{2212}\u{bd} stop", "As is", "+\u{bd} stop", "+1 stop"][i].to_string()
+                // Darkroom stops run the other way from Develop's Exposure, so say which way each band goes.
+                ["\u{2212}1 stop \u{b7} lighter", "\u{2212}\u{bd} stop \u{b7} lighter", "", "+\u{bd} stop \u{b7} darker", "+1 stop \u{b7} darker"][i].to_string()
             } else {
                 negative::RING[i].to_string()
             }
         };
+        let label = |i: usize| -> String { if (view == 1 && i == 2) || (view == 2 && i == 4) { as_is.clone() } else { label(i) } };
         let hovered = resp.hover_pos().and_then(|p| (0..n).find(|i| cell(*i).contains(p)));
         let p = ui.painter_at(r);
         for i in 0..n {
@@ -3663,7 +3773,7 @@ impl App {
             }
         }
         {
-            let g = p.layout_no_wrap((if view == 1 { "Click the band that looks right" } else { "Click the version that looks right" }).into(), FontId::new(11.0, semi()), TEXT);
+            let g = p.layout_no_wrap((if view == 1 { "Click the band that looks right \u{b7} Esc when done" } else { "Click the version that looks right \u{b7} Esc when done" }).into(), FontId::new(11.0, semi()), TEXT);
             let b = Rect::from_min_size(r.min + vec2(10.0, 10.0), g.size() + vec2(16.0, 6.0));
             p.rect_filled(b, 4.0, Color32::from_rgba_unmultiplied(20, 20, 22, 215));
             p.galley(b.min + vec2(8.0, 3.0), g, TEXT);
@@ -3676,11 +3786,11 @@ impl App {
         {
             let np = &self.params.neg;
             self.params.neg = if view == 1 { negative::strip_variant(np, i) } else { negative::ring_variant(np, i) };
-            self.darkroom = 0;
+            // Stay open: the next strip or ring centres on the choice, like making another test strip.
             let e = self.params.neg.print_exp;
             let exposure_changed = view == 1 || i == 1 || i == 7;
             self.status = if exposure_changed {
-                format!("Print exposure now {}{:.1} stop{}", if e > 0.0 { "+" } else { "" }, e, if e.abs() == 1.0 { "" } else { "s" })
+                format!("Print time now {}{:.1} stop{}", if e > 0.0 { "+" } else { "" }, e, if e.abs() == 1.0 { "" } else { "s" })
             } else {
                 format!("{} applied", label(i))
             };
@@ -5719,20 +5829,14 @@ impl App {
                 add_character = ui.button(format!("Add {}'s grain and halation", st.name)).on_hover_text("Sets Grain and Halation in Develop's Effects").clicked();
                 ui.add_space(6.0);
 
-                ui.label(caps("3 · Print"));
-                // Darkroom controls: a paper grade, the enlarger exposure, and two ways to choose by eye.
+                ui.label(caps("3 · Paper"));
+                // Darkroom controls: a paper grade and the enlarger time. ("Print" stays the export button's word.)
                 slider(ui, "Paper grade", &mut np.grade, 0.0, 5.0, negative::NEUTRAL_GRADE, None);
                 np.grade = (np.grade * 2.0).round() / 2.0;
-                slider(ui, "Exposure", &mut np.print_exp, -3.0, 3.0, 0.0, None);
-                ui.label(RichText::new(format!("Grade {} prints like a multigrade filter (ISO R {:.0}). Exposure is in stops: more light, darker print.", fmt_grade(np.grade), negative::iso_r(np.grade))).size(11.5).color(TEXT2));
-                ui.add_space(4.0);
-                let mut view = self.darkroom as usize;
-                ui.label(RichText::new("Choose by eye").size(12.0).color(LABEL));
-                segmented(ui, &mut view, &["Off", "Test strip", "Ring-around"]);
-                self.darkroom = view as u8;
-                if self.darkroom > 0 {
-                    ui.label(RichText::new(if self.darkroom == 1 { "Five bands, \u{bd} stop apart. Click the one that looks right." } else { "The frame in the middle, with more of each colour, lighter and darker around it. Click the one that looks right." }).size(11.5).color(TEXT2));
-                }
+                // "Print time", not "Exposure": more time is a darker print, the other way from Develop's Exposure.
+                slider(ui, "Print time", &mut np.print_exp, -3.0, 3.0, 0.0, None);
+                ui.label(RichText::new(format!("Grade {} {}. Print time is in stops: more time, darker print. Try a test strip or ring-around above the photo.", fmt_grade(np.grade), grade_words(np.grade))).size(11.5).color(TEXT2))
+                    .on_hover_text(format!("Paper range ISO R {:.0}", negative::iso_r(np.grade)));
                 ui.add_space(6.0);
 
                 ui.label(caps("4 · Balance"));
@@ -5956,7 +6060,8 @@ impl App {
              i.key_pressed(egui::Key::ArrowLeft) && cmd, i.key_pressed(egui::Key::ArrowRight) && cmd,
              cmd && i.key_pressed(egui::Key::C), cmd && i.key_pressed(egui::Key::V))
         });
-        if undo { self.undo(-1); }
+        // Right after Pick the sharpest, in Cull, undo puts back all of its flags at once.
+        if undo { if self.module == Module::Cull && self.cull.burst_undo.is_some() { self.undo_bursts() } else { self.undo(-1) } }
         if redo { self.undo(1); }
         if prev { if browsing { self.step_selection(-1) } else { self.step(ctx, -1) } }
         if next { if browsing { self.step_selection(1) } else { self.step(ctx, 1) } }
