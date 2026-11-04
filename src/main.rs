@@ -28,6 +28,8 @@ mod bursts;
 mod editors;
 mod geotag;
 mod gallery;
+mod scopes;
+mod sharp;
 
 use develop::Params;
 use image::{DynamicImage, Rgb32FImage, codecs::jpeg::JpegEncoder};
