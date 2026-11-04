@@ -112,6 +112,7 @@ struct CullImg {
 struct CullData {
     img: ColorImage,
     focus: ColorImage,
+    sharp: u8,
     bins: [[f32; 128]; 3],
     clipped: [f32; 3],
     raw: bool,
@@ -130,6 +131,16 @@ struct CullState {
     flash: Option<(String, std::time::Instant)>,
     /// Frames that could not be read: shown as such, never retried every frame.
     failed: std::collections::HashSet<PathBuf>,
+    /// Sharpness scores (0–100) found so far, from culling or a background scan of the folder.
+    sharp: std::collections::HashMap<PathBuf, u8>,
+    /// Frames being scored in the background, and frames that couldn't be.
+    scoring: std::collections::HashSet<PathBuf>,
+    unscored: std::collections::HashSet<PathBuf>,
+    /// Arrow keys step over frames scoring below `soft_below`.
+    skip_soft: bool,
+    soft_below: f32,
+    /// Bursts waiting for their scores before the sharpest of each is picked.
+    pick_groups: Option<Vec<Vec<PathBuf>>>,
 }
 
 /// Full decodes run one at a time: holding an arrow key would otherwise start one per frame passed, each
@@ -229,6 +240,10 @@ enum Msg {
     Stacked(Result<PathBuf, String>),
     /// Burst and duplicate groups found for a folder (its generation and photo count).
     Bursts((usize, usize), Vec<Vec<PathBuf>>),
+    /// A frame's sharpness score from the background scan (None: it couldn't be read).
+    Sharp(PathBuf, Option<u8>),
+    /// Bursts found for Pick the sharpest of each burst.
+    PickBursts(Vec<Vec<PathBuf>>),
     /// An edit copy was written and its program started (the copy and the program's name).
     EditOut(Result<(PathBuf, String), String>),
     /// A GPX track read, with the photos' capture times, ready for the geotag window.
@@ -278,7 +293,7 @@ struct Opened {
 
 /// Settings, clipping view, draft, proof, mask overlay, and which source image (the cleaned or denoised one
 /// replaces it in place, so a render of the old one must not count).
-type RenderKey = (Params, bool, bool, usize, Option<usize>, usize);
+type RenderKey = (Params, bool, bool, usize, Option<usize>, usize, u8);
 
 /// What the render thread hands back for the preview.
 struct RenderOut {
@@ -289,6 +304,7 @@ struct RenderOut {
     image: ColorImage,
     srgb: ColorImage,
     bins: [[f32; 128]; 3],
+    scopes: crate::scopes::Scopes,
     view_map: [f32; 8],
     photo_wh: [f32; 2],
     tex_scale: f32,
@@ -379,6 +395,14 @@ pub struct App {
     hover_rgb: Option<[u8; 3]>,
     shown_w: f32,
     bins: [[f32; 128]; 3],
+    /// Above the histogram: 0 histogram, 1 waveform, 2 RGB parade, 3 vectorscope.
+    scope: usize,
+    scopes: crate::scopes::Scopes,
+    /// The scope image on screen, and whether a newer render is waiting to replace it.
+    scope_tex: Option<(usize, TextureHandle)>,
+    scope_dirty: bool,
+    /// Negative's darkroom views on the preview: 0 off, 1 test strip, 2 ring-around.
+    darkroom: u8,
     clip_view: bool,
     history: Vec<Params>,
     hist_pos: usize,
@@ -535,6 +559,7 @@ fn render_preview(src: &Rgb32FImage, full_w: u32, shown: &Params, overlay: Optio
     let (cw, ch, ox, oy, _) = develop::border_layout(w, h, &shown.border);
     let (fw, fh, fox, foy) = develop::frame_of(shown, w as usize, h as usize);
     let bins = histogram_bins(&out);
+    let scopes = crate::scopes::build(&out);
     let mut out = out;
     // The selected mask in red, like Lightroom's overlay.
     if let Some(m) = overlay.and_then(|i| shown.masks.get(i)) {
@@ -575,15 +600,60 @@ fn render_preview(src: &Rgb32FImage, full_w: u32, shown: &Params, overlay: Optio
     }
     RenderOut {
         generation: 0,
-        key: (Params::default(), false, false, 0, None, 0),
+        key: (Params::default(), false, false, 0, None, 0, 0),
         image: to_color_image(&out),
         srgb: srgb_color_image(&out),
         bins,
+        scopes,
         view_map: [cw as f32, ch as f32, ox as f32, oy as f32, fw, fh, fox, foy],
         photo_wh: [w as f32, h as f32],
         tex_scale,
     }
 }
+
+/// Negative's darkroom views on the preview: a test strip (five bands of print exposure, 1 stop apart at the
+/// ends) or a ring-around (a 3×3 grid of filtration and exposure changes around the frame as it is). Each part
+/// renders from a smaller copy, so the whole view costs about as much as one normal render.
+fn render_darkroom(src: &Rgb32FImage, full_w: u32, shown: &Params, view: u8) -> RenderOut {
+    let p = Params { border: Default::default(), ..shown.clone() };
+    let long = src.width().max(src.height());
+    let (out, tex_scale) = if view == 1 {
+        let small = load::fit(src, (long / 2).max(64));
+        let ts = small.width() as f32 / full_w as f32;
+        let bands: Vec<Rgb32FImage> = (0..5).map(|b| develop::render(&small, &Params { neg: negative::strip_variant(&p.neg, b), ..p.clone() }, ts)).collect();
+        let (w, h) = bands[0].dimensions();
+        (Rgb32FImage::from_fn(w, h, |x, y| *bands[(x as usize * 5 / w as usize).min(4)].get_pixel(x, y)), ts)
+    } else {
+        let small = load::fit(src, (long / 3).max(48));
+        let ts = small.width() as f32 / full_w as f32;
+        let cells: Vec<Rgb32FImage> = (0..9).map(|c| develop::render(&small, &Params { neg: negative::ring_variant(&p.neg, c), ..p.clone() }, ts)).collect();
+        let (w, h) = cells[0].dimensions();
+        let g = RING_GAP;
+        let mut out = Rgb32FImage::from_pixel(3 * w + 2 * g, 3 * h + 2 * g, image::Rgb([0.08, 0.08, 0.086]));
+        for (c, img) in cells.iter().enumerate() {
+            let (ox, oy) = ((c as u32 % 3) * (w + g), (c as u32 / 3) * (h + g));
+            for (x, y, px) in img.enumerate_pixels() {
+                out.put_pixel(ox + x, oy + y, *px);
+            }
+        }
+        (out, ts)
+    };
+    let (w, h) = out.dimensions();
+    RenderOut {
+        generation: 0,
+        key: (Params::default(), false, false, 0, None, 0, 0),
+        image: to_color_image(&out),
+        srgb: srgb_color_image(&out),
+        bins: histogram_bins(&out),
+        scopes: crate::scopes::build(&out),
+        view_map: [w as f32, h as f32, 0.0, 0.0, w as f32, h as f32, 0.0, 0.0],
+        photo_wh: [w as f32, h as f32],
+        tex_scale,
+    }
+}
+
+/// Pixels between ring-around cells.
+const RING_GAP: u32 = 6;
 
 /// An sRGB-encoded picture as 8-bit sRGB pixels (for colour readouts).
 fn srgb_color_image(img: &Rgb32FImage) -> ColorImage {
@@ -692,6 +762,12 @@ fn stock_picker(ui: &mut Ui, id: &str, np: &mut negative::NegParams) -> bool {
     picked_one
 }
 
+/// A paper grade as printed on the filter: whole grades plainly, half grades with ½.
+fn fmt_grade(g: f32) -> String {
+    let whole = g.floor() as i32;
+    if g - whole as f32 >= 0.25 { format!("{whole}\u{bd}") } else { whole.to_string() }
+}
+
 fn kind_label(k: Kind) -> &'static str {
     match k { Kind::Color => "C-41 colour negative", Kind::Cine => "ECN-2 motion picture", Kind::Bw => "Black & white", Kind::Slide => "E-6 slide, no inversion" }
 }
@@ -750,7 +826,7 @@ impl App {
             module: Module::Library, shown_module: Module::Library, folder: None, files: vec![], thumbs: Default::default(), thumb_used: Default::default(), thumb_want: Default::default(), thumb_pending: Default::default(), thumb_ready: Default::default(), frame: 0, thumb_gen: Default::default(), load_gen: Default::default(), open_error: None, meta: Default::default(), lib_rating: 0,
             subdirs: vec![], tex_scale: 1.0, thumb_size: 190.0, lib_sel: None, lib_query: String::new(),
             lib_filter: [true, true, true, true, false], stack_bursts: false, bursts: vec![], burst_of: Default::default(), burst_open: Default::default(), bursts_key: None, current: None, photo: None, loading: false, params: Params::default(), prev_params: None,
-            rendered: None, render_busy: false, photo_gen: 0, tex: None, before_tex: None, last_rgb: None, hover_rgb: None, shown_w: 0.0, bins: [[0.0; 128]; 3], clip_view: false,
+            rendered: None, render_busy: false, photo_gen: 0, tex: None, before_tex: None, last_rgb: None, hover_rgb: None, shown_w: 0.0, bins: [[0.0; 128]; 3], scope: 0, scopes: Default::default(), scope_tex: None, scope_dirty: false, darkroom: 0, clip_view: false,
             history: vec![Params::default()], hist_pos: 0, copied: None, view: View::After, holding_before: false, picking_base: false,
             status: String::new(), presets, preset_tex: vec![], last_preset: None, preset_mix: None, preset_amt: 100.0, preset_name: String::new(), stock_query: String::new(), my_stocks: negative::custom_stocks(), my_stock_name: String::new(), proof: 0,
             stock_tab: 0, mixer_tab: 0, open: [true, false, false, false, false, false, false, false, false, false, false, false, false, false], tool: Tool::None,
@@ -1154,6 +1230,30 @@ impl App {
                         e.neg = m.neg;
                     }
                 }
+                Msg::Sharp(p, v) => {
+                    self.cull.scoring.remove(&p);
+                    match v {
+                        Some(v) => {
+                            self.cull.sharp.insert(p, v);
+                        }
+                        None => {
+                            self.cull.unscored.insert(p);
+                        }
+                    }
+                    if self.cull.scoring.is_empty() && self.cull.pick_groups.is_some() {
+                        self.pick_sharpest_now();
+                    }
+                }
+                Msg::PickBursts(groups) => {
+                    let need: Vec<PathBuf> = groups.iter().flatten().filter(|f| !self.cull.sharp.contains_key(*f)).cloned().collect();
+                    self.cull.pick_groups = Some(groups);
+                    if need.is_empty() && self.cull.scoring.is_empty() {
+                        self.pick_sharpest_now();
+                    } else {
+                        self.status = format!("Scoring {} frames for sharpness…", need.len());
+                        self.score_frames(ctx, need);
+                    }
+                }
                 Msg::Cull(p, d, skipped) => {
                     self.cull.pending.remove(&p);
                     if d.is_none() && !skipped {
@@ -1163,6 +1263,7 @@ impl App {
                         let name = p.display().to_string();
                         let tex = ctx.load_texture(format!("cull {name}"), d.img, TextureOptions::LINEAR);
                         let focus = ctx.load_texture(format!("focus {name}"), d.focus, TextureOptions::LINEAR);
+                        self.cull.sharp.insert(p.clone(), d.sharp);
                         self.cull.cache.insert(p, CullImg { tex, focus, bins: d.bins, clipped: d.clipped, raw: d.raw });
                     }
                 }
@@ -1418,7 +1519,8 @@ impl App {
         // Cropping and placing a chart show the whole frame, without the border, with the crop drawn on top.
         let shown = if matches!(self.tool, Tool::Crop | Tool::Chart) { Params { crop: [0.0; 4], border: Default::default(), ..self.params.clone() } } else { self.params.clone() };
         let overlay = (self.tool == Tool::Mask && self.mask_ui.overlay && self.mask_ui.sel < shown.masks.len()).then_some(self.mask_ui.sel);
-        let key = (shown.clone(), self.clip_view, draft, self.proof, overlay, Arc::as_ptr(&photo.preview) as usize);
+        let darkroom = self.darkroom_view();
+        let key = (shown.clone(), self.clip_view, draft, self.proof, overlay, Arc::as_ptr(&photo.preview) as usize, darkroom);
         if self.rendered.as_ref() == Some(&key) {
             return;
         }
@@ -1433,7 +1535,10 @@ impl App {
         let (proof, clip_view, generation, tx, ctx2) = (self.proof, self.clip_view, self.photo_gen, self.tx.clone(), ctx.clone());
         let printer = self.printer.clone();
         std::thread::spawn(move || {
-            let out = render_preview(&src, full_w, &shown, overlay, clip_view, proof, printer);
+            let out = match darkroom {
+                0 => render_preview(&src, full_w, &shown, overlay, clip_view, proof, printer),
+                v => render_darkroom(&src, full_w, &shown, v),
+            };
             let _ = tx.send(Msg::Rendered(Box::new(RenderOut { generation, key, ..out })));
             ctx2.request_repaint();
         });
@@ -1446,13 +1551,16 @@ impl App {
         self.view_map = r.view_map;
         self.photo_wh = r.photo_wh;
         self.bins = r.bins;
+        self.scopes = r.scopes;
+        self.scope_dirty = true;
         match &mut self.tex {
             Some(t) => t.set(r.image.clone(), TextureOptions::LINEAR),
             None => self.tex = Some(ctx.load_texture("preview", r.image.clone(), TextureOptions::LINEAR)),
         }
         self.last_rgb = Some(r.srgb);
+        let darkroom = r.key.6;
         self.rendered = Some(r.key);
-        if self.thumb_due && !draft && !matches!(self.tool, Tool::Crop | Tool::Chart) && overlay.is_none() {
+        if self.thumb_due && !draft && darkroom == 0 && !matches!(self.tool, Tool::Crop | Tool::Chart) && overlay.is_none() {
             self.refresh_thumb();
         }
     }
@@ -2716,11 +2824,69 @@ impl App {
                         (histogram_bins(&out), c)
                     }
                 };
-                Some(CullData { focus: focus_map(&out), img: to_color_image(&out), bins, clipped, raw: raw.is_some() })
+                Some(CullData { focus: focus_map(&out), sharp: crate::sharp::score(&img), img: to_color_image(&out), bins, clipped, raw: raw.is_some() })
             })();
             let _ = tx.send(Msg::Cull(f, data, false));
             ctx2.request_repaint();
         });
+    }
+
+    /// Score frames for sharpness in the background (the fast embedded preview of each), a few at a time.
+    fn score_frames(&mut self, ctx: &egui::Context, files: Vec<PathBuf>) {
+        let files: Vec<PathBuf> = files.into_iter().filter(|f| !self.cull.sharp.contains_key(f) && !self.cull.unscored.contains(f) && self.cull.scoring.insert(f.clone())).collect();
+        if files.is_empty() {
+            return;
+        }
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            crate::sharp::score_files(&files, &|f, v| {
+                let _ = tx.send(Msg::Sharp(f, v));
+                ctx.request_repaint();
+            });
+        });
+    }
+
+    /// Pick the sharpest of each burst: find the bursts, score their frames, then flag (see `pick_sharpest_now`).
+    fn pick_sharpest(&mut self, ctx: &egui::Context) {
+        let key = (self.thumb_gen.load(std::sync::atomic::Ordering::Relaxed), self.files.len());
+        if self.bursts_key == Some(key) && !self.bursts.is_empty() {
+            let _ = self.tx.send(Msg::PickBursts(self.bursts.clone()));
+            return;
+        }
+        self.status = "Looking for bursts…".into();
+        let (files, tx, ctx) = (self.files.clone(), self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(Msg::PickBursts(crate::bursts::find(&files)));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Flag the sharpest frame of each burst as a pick and the others as rejects. Frames already rated, picked
+    /// or rejected keep what they have.
+    fn pick_sharpest_now(&mut self) {
+        let Some(groups) = self.cull.pick_groups.take() else { return };
+        if groups.is_empty() {
+            self.status = "No bursts found in this folder".into();
+            return;
+        }
+        let (mut picked, mut rejected) = (0, 0);
+        for g in &groups {
+            let Some(best) = crate::sharp::sharpest(g, &self.cull.sharp).cloned() else { continue };
+            let untouched = |s: &Self, f: &PathBuf| s.meta.get(f).is_none_or(|m| m.flag == 0 && m.rating == 0);
+            if self.meta.get(&best).is_none_or(|m| m.flag == 0) {
+                self.rate(&best, None, Some(1), None);
+                picked += 1;
+            }
+            let rest: Vec<PathBuf> = g.iter().filter(|f| **f != best && self.cull.sharp.contains_key(*f)).cloned().collect();
+            for f in &rest {
+                if untouched(self, f) {
+                    self.rate(f, None, Some(-1), None);
+                    rejected += 1;
+                }
+            }
+        }
+        self.cull.flash = Some((format!("Picked {picked}"), std::time::Instant::now()));
+        self.status = format!("{} burst{}: picked {picked} sharpest, marked {rejected} as rejects. Nothing is deleted; press U on a frame to clear its flag.", groups.len(), if groups.len() == 1 { "" } else { "s" });
     }
 
     fn cull_view(&mut self, ui: &mut Ui) {
@@ -2782,7 +2948,11 @@ impl App {
             let m = self.meta.get(f).copied().unwrap_or_default();
             let y = r.bottom() + 16.0;
             let name = f.file_name().unwrap_or_default().to_string_lossy().to_string();
-            ui.painter().text(pos2(r.left(), y), Align2::LEFT_CENTER, name, FontId::proportional(12.5), if m.flag < 0 { TEXT3 } else { TEXT });
+            let nr = ui.painter().text(pos2(r.left(), y), Align2::LEFT_CENTER, name, FontId::proportional(12.5), if m.flag < 0 { TEXT3 } else { TEXT });
+            if let Some(v) = self.cull.sharp.get(f) {
+                let soft = self.cull.skip_soft && (*v as f32) < self.cull.soft_below;
+                ui.painter().text(pos2(nr.right() + 12.0, y), Align2::LEFT_CENTER, format!("sharpness {v}"), FontId::monospace(11.5), if soft { WARN } else { TEXT2 });
+            }
             let mut x = r.right();
             if m.label > 0 {
                 ui.painter().circle_filled(pos2(x - 6.0, y), 6.0, LABEL_COLORS[(m.label - 1).min(4) as usize]);
@@ -2833,6 +3003,64 @@ impl App {
             }
         }
         ui.allocate_rect(avail, Sense::hover());
+    }
+
+    /// Cull's sharpness tools: this frame's score, skipping soft frames, and picking the sharpest of each burst.
+    fn sharpness_block(&mut self, ui: &mut Ui) {
+        if self.cull.soft_below <= 0.0 {
+            self.cull.soft_below = 35.0;
+        }
+        ui.label(caps("Sharpness"));
+        let score = self.lib_sel.as_ref().and_then(|f| self.cull.sharp.get(f)).copied();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("This frame").size(12.5));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(RichText::new(score.map(|v| format!("{v} / 100")).unwrap_or("\u{2014}".into())).monospace().size(12.0).color(TEXT2));
+            });
+        });
+        // A thin bar: how this frame compares with the threshold.
+        let (bar, _) = ui.allocate_exact_size(vec2(ui.available_width(), 6.0), Sense::hover());
+        ui.painter().rect_filled(bar, 3.0, hex(0x3A3A40));
+        if let Some(v) = score {
+            let x = bar.left() + bar.width() * v as f32 / 100.0;
+            ui.painter().rect_filled(Rect::from_min_max(bar.min, pos2(x, bar.bottom())), 3.0, if self.cull.skip_soft && (v as f32) < self.cull.soft_below { WARN } else { BONE });
+        }
+        if self.cull.skip_soft {
+            let t = bar.left() + bar.width() * self.cull.soft_below / 100.0;
+            ui.painter().line_segment([pos2(t, bar.top() - 3.0), pos2(t, bar.bottom() + 3.0)], Stroke::new(1.5, TEXT));
+        }
+        ui.add_space(6.0);
+        let was = self.cull.skip_soft;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Skip soft frames").size(12.5));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| switch(ui, &mut self.cull.skip_soft));
+        });
+        let vis = self.lib_visible();
+        if self.cull.skip_soft {
+            if !was {
+                self.score_frames(ui.ctx(), vis.clone());
+            }
+            slider(ui, "Below", &mut self.cull.soft_below, 0.0, 100.0, 35.0, None);
+            let scored = vis.iter().filter(|f| self.cull.sharp.contains_key(*f)).count();
+            let soft = vis.iter().filter(|f| self.cull.sharp.get(*f).is_some_and(|v| (*v as f32) < self.cull.soft_below)).count();
+            let line = if scored < vis.len() && !self.cull.scoring.is_empty() {
+                format!("Scoring {scored} of {}…", vis.len())
+            } else {
+                format!("Arrow keys step over {soft} soft frame{} of {}.", if soft == 1 { "" } else { "s" }, vis.len())
+            };
+            ui.label(RichText::new(line).size(11.0).color(TEXT3));
+        } else {
+            ui.label(RichText::new("Arrow keys step over frames scored below a threshold you set.").size(11.0).color(TEXT3));
+        }
+        ui.add_space(6.0);
+        let busy = self.cull.pick_groups.is_some();
+        if ui.add_enabled(!busy, egui::Button::new(if busy { "Scoring bursts\u{2026}" } else { "Pick the sharpest of each burst" }).min_size(vec2(ui.available_width(), 32.0)))
+            .on_hover_text("Finds bursts and near-duplicates, picks the sharpest frame of each and marks the others as rejects. Frames you already rated or flagged are left alone, and nothing is deleted.")
+            .clicked()
+        {
+            self.pick_sharpest(ui.ctx());
+        }
+        ui.add_space(14.0);
     }
 
     fn cull_panel(&mut self, ui: &mut Ui) {
@@ -2905,6 +3133,7 @@ impl App {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| switch(ui, &mut self.cull.compare));
         });
         ui.add_space(14.0);
+        self.sharpness_block(ui);
         ui.label(RichText::new(format!("{nav} next / previous. Press ? for every key.")).size(11.5).color(TEXT3));
         ui.add_space(14.0);
         let rejects = self.meta.values().filter(|m| m.flag < 0).count();
@@ -3052,6 +3281,7 @@ impl App {
                 }
                 if let Some(t) = &self.tex
                     && self.photo.is_some()
+                    && self.darkroom_view() == 0
                 {
                     let pct = self.shown_w / (t.size()[0] as f32 / self.tex_scale) * 100.0 * ui.ctx().pixels_per_point();
                     let label = match &self.zoom { Some(z) if z.from_fit.is_none() => format!("{:.0}%", z.scale * 100.0), Some(_) => "…".into(), None => format!("Fit {pct:.0}%") };
@@ -3233,7 +3463,7 @@ impl App {
                 // Hold on the image to compare with the original (released = back to the edit).
                 let tool = if neg { Tool::None } else { self.tool };
                 let picking = self.picking_base || self.picking_wb;
-                self.holding_before = tool == Tool::None && !picking && resp.is_pointer_button_down_on();
+                self.holding_before = tool == Tool::None && !picking && self.darkroom_view() == 0 && resp.is_pointer_button_down_on();
                 if tool == Tool::None
                     && !picking
                     && resp.double_clicked()
@@ -3271,7 +3501,12 @@ impl App {
                         Tool::Target => self.target_tool(ui, &resp, r),
                         Tool::None | Tool::Sample => {}
                     }
-                    self.sample_marks(ui, &resp, r, tool == Tool::Sample);
+                    if self.darkroom_view() == 0 {
+                        self.sample_marks(ui, &resp, r, tool == Tool::Sample);
+                    }
+                }
+                if neg && !show_before && self.darkroom_view() > 0 {
+                    self.darkroom_overlay(ui, &resp, r);
                 }
                 self.hover_rgb = resp.hover_pos().and_then(|p| {
                     let ci = self.last_rgb.as_ref()?;
@@ -3304,6 +3539,149 @@ impl App {
         }
     }
 
+    /// The waveform, parade or vectorscope, with a light graticule drawn over it.
+    fn scope_view(&mut self, ui: &mut Ui) {
+        let img = match self.scope {
+            1 => &self.scopes.wave,
+            2 => &self.scopes.parade,
+            _ => &self.scopes.vector,
+        };
+        if self.scope_dirty || self.scope_tex.as_ref().is_none_or(|(m, _)| *m != self.scope) {
+            match &mut self.scope_tex {
+                Some((m, t)) => {
+                    t.set(img.clone(), TextureOptions::LINEAR);
+                    *m = self.scope;
+                }
+                None => self.scope_tex = Some((self.scope, ui.ctx().load_texture("scope", img.clone(), TextureOptions::LINEAR))),
+            }
+            self.scope_dirty = false;
+        }
+        let Some((_, tex)) = &self.scope_tex else { return };
+        let w = ui.available_width();
+        let size = if self.scope == 3 { vec2(w, w.min(200.0)) } else { vec2(w, 112.0) };
+        let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
+        let p = ui.painter_at(rect);
+        p.rect_filled(rect, 3.0, hex(0x101012));
+        let grid = Stroke::new(1.0, hex(0x2A2A2E));
+        let note = |pos: Pos2, t: &str, a: Align2| {
+            p.text(pos, a, t, FontId::monospace(9.5), TEXT3);
+        };
+        if self.scope == 3 {
+            // Square scope, centred: a ring at full saturation, colour targets and the skin-tone line.
+            let side = rect.height();
+            let sq = Rect::from_center_size(rect.center(), vec2(side, side));
+            let n = crate::scopes::VEC_N as f32;
+            let at = |x: f32, y: f32| pos2(sq.left() + x / n * side, sq.top() + y / n * side);
+            let c = sq.center();
+            p.circle_stroke(c, side * 0.46, grid);
+            p.line_segment([pos2(sq.left() + 6.0, c.y), pos2(sq.right() - 6.0, c.y)], grid);
+            p.line_segment([pos2(c.x, sq.top() + 6.0), pos2(c.x, sq.bottom() - 6.0)], grid);
+            let (dx, dy) = crate::scopes::skin_dir();
+            p.line_segment([c, c + vec2(dx, dy) * side * 0.46], Stroke::new(1.0, hex(0x6A5A4C)));
+            p.image(tex.id(), sq, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+            for (name, t) in crate::scopes::TARGETS {
+                let (x, y) = crate::scopes::vec_pos(t);
+                let q = at(x, y);
+                p.rect_stroke(Rect::from_center_size(q, vec2(9.0, 9.0)), 1.0, Stroke::new(1.0, hex(0x56565C)), egui::StrokeKind::Middle);
+                let out = (q - c).normalized() * 12.0;
+                note(q + out, name, Align2::CENTER_CENTER);
+            }
+            resp.on_hover_text("Colour spread: the further from the centre, the more saturated. The line up and to the left is where skin tones sit, whatever the skin.");
+        } else {
+            // Level lines at 0, 25, 50, 75 and 100%.
+            for k in 0..5 {
+                let y = rect.bottom() - rect.height() * k as f32 / 4.0;
+                p.line_segment([pos2(rect.left(), y), pos2(rect.right(), y)], grid);
+            }
+            if self.scope == 2 {
+                for k in 1..3 {
+                    let x = rect.left() + rect.width() * k as f32 / 3.0;
+                    p.line_segment([pos2(x, rect.top()), pos2(x, rect.bottom())], grid);
+                }
+            }
+            p.image(tex.id(), rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+            note(rect.left_top() + vec2(3.0, 2.0), "100", Align2::LEFT_TOP);
+            note(rect.left_bottom() + vec2(3.0, -2.0), "0", Align2::LEFT_BOTTOM);
+            resp.on_hover_text(if self.scope == 1 {
+                "Brightness across the photo, left to right as in the picture. Top is white, bottom is black."
+            } else {
+                "Red, green and blue levels side by side, each left to right as in the picture. Equal heights mean neutral."
+            });
+        }
+    }
+
+    /// The darkroom view the preview shows now: only in Negative, on a converted negative, when not picking.
+    fn darkroom_view(&self) -> u8 {
+        let np = &self.params.neg;
+        let slide = negative::stock(&np.stock).kind == Kind::Slide;
+        if self.module == Module::Negative && np.enabled && !slide && !self.picking_base && self.photo.is_some() { self.darkroom } else { 0 }
+    }
+
+    /// Labels on the test strip bands or ring-around cells; a click uses that version.
+    fn darkroom_overlay(&mut self, ui: &mut Ui, resp: &egui::Response, r: Rect) {
+        let view = self.darkroom_view();
+        let n = if view == 1 { 5 } else { 9 };
+        // The ring's cells sit between thin gaps: place them from the rendered size so labels line up.
+        let [cw, ch] = self.photo_wh;
+        let cell = |i: usize| -> Rect {
+            if view == 1 {
+                let w = r.width() / 5.0;
+                Rect::from_min_size(pos2(r.left() + w * i as f32, r.top()), vec2(w, r.height()))
+            } else {
+                let g = RING_GAP as f32;
+                let (sx, sy) = (r.width() / cw.max(1.0), r.height() / ch.max(1.0));
+                let (w, h) = ((cw - 2.0 * g) / 3.0, (ch - 2.0 * g) / 3.0);
+                let (c, row) = ((i % 3) as f32, (i / 3) as f32);
+                Rect::from_min_size(pos2(r.left() + c * (w + g) * sx, r.top() + row * (h + g) * sy), vec2(w * sx, h * sy))
+            }
+        };
+        let label = |i: usize| -> String {
+            if view == 1 {
+                ["\u{2212}1 stop", "\u{2212}\u{bd} stop", "As is", "+\u{bd} stop", "+1 stop"][i].to_string()
+            } else {
+                negative::RING[i].to_string()
+            }
+        };
+        let hovered = resp.hover_pos().and_then(|p| (0..n).find(|i| cell(*i).contains(p)));
+        let p = ui.painter_at(r);
+        for i in 0..n {
+            let c = cell(i);
+            let g = p.layout_no_wrap(label(i), FontId::new(12.0, semi()), BONE);
+            let b = Rect::from_min_size(c.left_bottom() + vec2(8.0, -8.0 - g.size().y - 8.0), g.size() + vec2(14.0, 8.0));
+            p.rect_filled(b, 4.0, Color32::from_rgba_unmultiplied(20, 20, 22, 210));
+            p.galley(b.min + vec2(7.0, 4.0), g, BONE);
+            if view == 1 && i > 0 {
+                p.line_segment([c.left_top(), c.left_bottom()], Stroke::new(1.0, Color32::from_rgba_unmultiplied(20, 20, 22, 160)));
+            }
+            if hovered == Some(i) {
+                p.rect_stroke(c.shrink(1.0), 2.0, Stroke::new(2.0, BONE), egui::StrokeKind::Inside);
+            }
+        }
+        {
+            let g = p.layout_no_wrap((if view == 1 { "Click the band that looks right" } else { "Click the version that looks right" }).into(), FontId::new(11.0, semi()), TEXT);
+            let b = Rect::from_min_size(r.min + vec2(10.0, 10.0), g.size() + vec2(16.0, 6.0));
+            p.rect_filled(b, 4.0, Color32::from_rgba_unmultiplied(20, 20, 22, 215));
+            p.galley(b.min + vec2(8.0, 3.0), g, TEXT);
+        }
+        if hovered.is_some() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if resp.clicked()
+            && let Some(i) = hovered
+        {
+            let np = &self.params.neg;
+            self.params.neg = if view == 1 { negative::strip_variant(np, i) } else { negative::ring_variant(np, i) };
+            self.darkroom = 0;
+            let e = self.params.neg.print_exp;
+            let exposure_changed = view == 1 || i == 1 || i == 7;
+            self.status = if exposure_changed {
+                format!("Print exposure now {}{:.1} stop{}", if e > 0.0 { "+" } else { "" }, e, if e.abs() == 1.0 { "" } else { "s" })
+            } else {
+                format!("{} applied", label(i))
+            };
+        }
+    }
+
     /// Eyedropper for the film base: average a small patch of the (un-inverted) scan.
     fn pick_base(&mut self, u: f32, v: f32) {
         let Some(photo) = &self.photo else { return };
@@ -3329,9 +3707,17 @@ impl App {
     }
 
     fn histogram_block(&mut self, ui: &mut Ui) {
-        ui.label(caps("Histogram"));
+        let before = self.scope;
+        segmented(ui, &mut self.scope, &["Histogram", "Waveform", "Parade", "Vector"]);
+        if self.scope != before {
+            self.scope_dirty = true;
+        }
         ui.add_space(4.0);
-        histogram(ui, &self.bins);
+        if self.scope == 0 {
+            histogram(ui, &self.bins);
+        } else {
+            self.scope_view(ui);
+        }
         // Pinned sample points: live readouts from the rendered photo.
         let mut remove = None;
         for (k, f) in self.samples.iter().enumerate() {
@@ -5328,7 +5714,25 @@ impl App {
                 add_character = ui.button(format!("Add {}'s grain and halation", st.name)).on_hover_text("Sets Grain and Halation in Develop's Effects").clicked();
                 ui.add_space(6.0);
 
-                ui.label(caps("3 · Balance"));
+                ui.label(caps("3 · Print"));
+                // Darkroom controls: a paper grade, the enlarger exposure, and two ways to choose by eye.
+                slider(ui, "Paper grade", &mut np.grade, 0.0, 5.0, negative::NEUTRAL_GRADE, None);
+                np.grade = (np.grade * 2.0).round() / 2.0;
+                slider(ui, "Exposure", &mut np.print_exp, -3.0, 3.0, 0.0, None);
+                ui.label(RichText::new(format!("Grade {} prints like a multigrade filter (ISO R {:.0}). Exposure is in stops: more light, darker print.", fmt_grade(np.grade), negative::iso_r(np.grade))).size(11.5).color(TEXT2));
+                ui.add_space(4.0);
+                let mut view = self.darkroom as usize;
+                ui.label(RichText::new("Choose by eye").size(12.0).color(LABEL));
+                segmented(ui, &mut view, &["Off", "Test strip", "Ring-around"]);
+                if view as u8 != self.darkroom {
+                    self.darkroom = view as u8;
+                }
+                if self.darkroom > 0 {
+                    ui.label(RichText::new(if self.darkroom == 1 { "Five bands, \u{bd} stop apart. Click the one that looks right." } else { "The frame in the middle, with more of each colour, lighter and darker around it. Click the one that looks right." }).size(11.5).color(TEXT2));
+                }
+                ui.add_space(6.0);
+
+                ui.label(caps("4 · Balance"));
                 let d = negative::NegParams::default();
                 // Balance shifts one print channel; tracks show that shift on mid grey (×3 so the hue reads).
                 let shift = |ch: usize, sign: f32| move |t: f32| { let mut c = [0.5f32; 3]; c[ch] += sign * t / 100.0 * 0.3; enc(c) };
@@ -5341,7 +5745,7 @@ impl App {
                 slider(ui, "Highlight roll-off", &mut np.shoulder, 0.0, 100.0, d.shoulder, None);
                 ui.add_space(6.0);
 
-                ui.label(caps("4 · Roll"));
+                ui.label(caps("5 · Roll"));
                 let mut locked = np.levels.is_some();
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Lock balance across roll").size(12.0));
@@ -5375,7 +5779,7 @@ impl App {
                 ui.add_space(6.0);
 
                 // Frames, film base from a blank shot, dust and infrared clean all live in Scan, under one set of names.
-                ui.label(caps("5 · Scanning"));
+                ui.label(caps("6 · Scanning"));
                 ui.label(RichText::new(if ir_clean > 0.0 { "Frames, film base, dust and infrared clean are set in Scan. Infrared clean is on for this frame." } else { "Frames, film base, dust and infrared clean are set in Scan." }).size(11.5).color(TEXT2));
                 if ui.add(egui::Button::new("Edit in Scan").min_size(vec2(ui.available_width(), 28.0))).on_hover_text("Open this frame on Scan's light table").clicked() {
                     open_scan = true;
@@ -5563,7 +5967,23 @@ impl App {
         if vis.is_empty() {
             return;
         }
-        let i = self.lib_sel.as_ref().and_then(|s| vis.iter().position(|f| f == s)).map_or(0, |i| (i as isize + d).clamp(0, vis.len() as isize - 1) as usize);
+        let cur = self.lib_sel.as_ref().and_then(|s| vis.iter().position(|f| f == s));
+        if self.module == Module::Cull && self.cull.skip_soft
+            && let Some(c) = cur
+        {
+            // The next frame that isn't known to be soft; stay put when there is none that way.
+            let mut j = c as isize + d;
+            while (0..vis.len() as isize).contains(&j) {
+                let f = &vis[j as usize];
+                if self.cull.sharp.get(f).is_none_or(|v| *v as f32 >= self.cull.soft_below) {
+                    self.lib_sel = Some(f.clone());
+                    return;
+                }
+                j += d;
+            }
+            return;
+        }
+        let i = cur.map_or(0, |i| (i as isize + d).clamp(0, vis.len() as isize - 1) as usize);
         self.lib_sel = Some(vis[i].clone());
     }
 
