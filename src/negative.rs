@@ -151,12 +151,63 @@ pub struct NegParams {
     pub yb: f32,
     pub toe: f32,
     pub shoulder: f32,
+    /// Paper grade, 0 (soft) to 5 (hard) in half grades, like multigrade filters. Grade 2 is the plain conversion.
+    pub grade: f32,
+    /// Print exposure in stops: more light under the enlarger makes a darker print.
+    pub print_exp: f32,
 }
 
 impl Default for NegParams {
     fn default() -> Self {
-        Self { enabled: false, stock: "portra400".into(), look: Look::Neutral, base: None, levels: None, density: 0.0, contrast: 0.0, cy: 0.0, mg: 0.0, yb: 0.0, toe: 40.0, shoulder: 55.0 }
+        Self { enabled: false, stock: "portra400".into(), look: Look::Neutral, base: None, levels: None, density: 0.0, contrast: 0.0, cy: 0.0, mg: 0.0, yb: 0.0, toe: 40.0, shoulder: 55.0, grade: NEUTRAL_GRADE, print_exp: 0.0 }
     }
+}
+
+/// The grade that leaves the conversion as it is.
+pub const NEUTRAL_GRADE: f32 = 2.0;
+
+/// A paper's exposure range (ISO R) for a grade: about R 170 for grade 0 down to R 60 for grade 5, the
+/// span multigrade papers give.
+pub fn iso_r(grade: f32) -> f32 {
+    170.0 - 22.0 * grade.clamp(0.0, 5.0)
+}
+
+/// Contrast factor of a grade against the neutral one: a shorter paper range prints the same negative harder.
+pub fn grade_factor(grade: f32) -> f32 {
+    iso_r(NEUTRAL_GRADE) / iso_r(grade)
+}
+
+/// Step sizes for the darkroom views: a test strip band, and one ring-around step on the filter sliders.
+pub const STRIP_STOPS: f32 = 0.5;
+pub const RING_STEP: f32 = 40.0;
+
+/// The test strip: five bands from -1 to +1 stop around the print exposure.
+pub fn strip_variant(np: &NegParams, band: usize) -> NegParams {
+    NegParams { print_exp: np.print_exp + (band as f32 - 2.0) * STRIP_STOPS, ..np.clone() }
+}
+
+/// Ring-around cells, row by row in a 3×3 grid, with the frame as it is in the middle. The six colours
+/// go round in colour-wheel order; lighter above, darker below.
+pub const RING: [&str; 9] = ["More red", "Lighter", "More yellow", "More magenta", "As is", "More green", "More blue", "Darker", "More cyan"];
+
+pub fn ring_variant(np: &NegParams, cell: usize) -> NegParams {
+    let s = RING_STEP;
+    let mut q = np.clone();
+    match cell {
+        0 => q.cy += s,
+        1 => q.print_exp -= STRIP_STOPS,
+        2 => q.yb -= s,
+        3 => q.mg -= s,
+        5 => q.mg += s,
+        6 => q.yb += s,
+        7 => q.print_exp += STRIP_STOPS,
+        8 => q.cy -= s,
+        _ => {}
+    }
+    for v in [&mut q.cy, &mut q.mg, &mut q.yb] {
+        *v = v.clamp(-100.0, 100.0);
+    }
+    q
 }
 
 /// A film stock profile of your own: a starting stock plus your tweaks, saved as a small `.ferrostock` file
@@ -292,15 +343,17 @@ pub fn convert(img: &mut Rgb32FImage, np: &NegParams) {
         Look::Noritsu => (0.96, 0.0, 1.02, true),   // Noritsu: neutral, softer colour
         Look::Linear => (0.9, 0.0, 0.85, false),    // flat, for heavy grading later
     };
-    let gamma = st.contrast * look_con * (1.0 + np.contrast / 100.0 * 0.5);
+    let gamma = st.contrast * look_con * (1.0 + np.contrast / 100.0 * 0.5) * grade_factor(np.grade);
     let sat = if mono { 0.0 } else { st.sat * look_sat };
     let warm = st.warm + look_warm;
     let bal = [np.cy / 100.0 * 0.1 + warm, np.mg / 100.0 * 0.1 + st.green, np.yb / 100.0 * 0.1 - warm];
     let dens = np.density / 100.0 * 0.3;
+    // A stop is 0.3 density of light: as a share of this frame's density range, per channel.
+    let expo = levels.map(|l| np.print_exp * std::f32::consts::LOG10_2 / (l[1] - l[0]).max(0.05));
     crate::develop::px3_mut(img).par_iter_mut().for_each(|px| {
         let d = densities(px, base, mono);
         let mut n = [0, 1, 2].map(|c| (d[c] - levels[c][0]) / (levels[c][1] - levels[c][0]));
-        n = [0, 1, 2].map(|c| (0.5 + (n[c] - 0.5 - dens) * gamma) + bal[c]);
+        n = [0, 1, 2].map(|c| (0.5 + (n[c] - 0.5 - dens - expo[c]) * gamma) + bal[c]);
         let m = (n[0] + n[1] + n[2]) / 3.0;
         n = n.map(|v| m + (v - m) * sat);
         n = n.map(|v| if curve { roll_off(v, np.toe, np.shoulder) } else { v.clamp(0.0, 1.0) });
@@ -331,6 +384,41 @@ mod tests {
         assert!(dark.iter().all(|v| *v < 0.02), "film base becomes black: {dark:?}");
         assert!(light.iter().all(|v| *v > 0.8), "dense area becomes white: {light:?}");
         assert!((mid[0] - mid[2]).abs() < 0.03, "orange mask removed, mids neutral: {mid:?}");
+    }
+
+    #[test]
+    fn neutral_grade_and_zero_exposure_change_nothing() {
+        let np = NegParams { enabled: true, stock: "generic_c41".into(), ..Default::default() };
+        let mut a = fake_negative();
+        convert(&mut a, &np);
+        let mut b = fake_negative();
+        convert(&mut b, &NegParams { grade: NEUTRAL_GRADE, print_exp: 0.0, ..np.clone() });
+        assert_eq!(a.as_raw(), b.as_raw());
+        // Old sidecars without the fields read as grade 2, no exposure change.
+        let old: NegParams = serde_json::from_str(r#"{"enabled":true,"stock":"generic_c41"}"#).unwrap();
+        assert_eq!(old.grade, NEUTRAL_GRADE);
+        assert_eq!(old.print_exp, 0.0);
+    }
+
+    #[test]
+    fn harder_grade_adds_contrast_and_exposure_darkens() {
+        let np = NegParams { enabled: true, stock: "generic_c41".into(), ..Default::default() };
+        let spread = |q: &NegParams| {
+            let mut img = fake_negative();
+            convert(&mut img, q);
+            img.get_pixel(44, 0).0[1] - img.get_pixel(20, 0).0[1]
+        };
+        assert!(spread(&NegParams { grade: 4.0, ..np.clone() }) > spread(&np) + 0.02);
+        assert!(spread(&NegParams { grade: 0.0, ..np.clone() }) < spread(&np) - 0.02);
+        let mid = |q: &NegParams| {
+            let mut img = fake_negative();
+            convert(&mut img, q);
+            img.get_pixel(32, 0).0[1]
+        };
+        assert!(mid(&NegParams { print_exp: 1.0, ..np.clone() }) < mid(&np) - 0.03, "more light, darker print");
+        assert!(mid(&strip_variant(&np, 0)) > mid(&np), "the first test strip band is the lightest");
+        assert!(mid(&ring_variant(&np, 7)) < mid(&np), "Darker is darker");
+        assert!(ring_variant(&np, 0).cy > np.cy && ring_variant(&np, 4) == np);
     }
 
     #[test]
