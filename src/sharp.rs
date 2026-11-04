@@ -60,6 +60,17 @@ pub fn sharpest<'a>(group: &'a [PathBuf], scores: &std::collections::HashMap<Pat
     })
 }
 
+/// What Pick the sharpest does to one burst, as (frame, flag) to set: the sharpest frame you haven't rejected
+/// becomes a pick, and the other scored frames with no flag and no stars become rejects. `state` gives each
+/// frame's saved (flag, stars).
+pub fn plan(group: &[PathBuf], scores: &std::collections::HashMap<PathBuf, u8>, state: impl Fn(&PathBuf) -> (i8, u8)) -> Vec<(PathBuf, i8)> {
+    let open: Vec<PathBuf> = group.iter().filter(|f| state(f).0 >= 0).cloned().collect();
+    let Some(best) = sharpest(&open, scores) else { return vec![] };
+    let mut out: Vec<(PathBuf, i8)> = if state(best).0 == 0 { vec![(best.clone(), 1)] } else { vec![] };
+    out.extend(group.iter().filter(|f| *f != best && scores.contains_key(*f) && state(f) == (0, 0)).map(|f| (f.clone(), -1)));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,6 +117,20 @@ mod tests {
         let s: std::collections::HashMap<PathBuf, u8> = [("a", 40), ("b", 72), ("c", 72)].iter().map(|(k, v)| (PathBuf::from(k), *v)).collect();
         assert_eq!(sharpest(&g, &s), Some(&PathBuf::from("b")));
         assert_eq!(sharpest(&g[3..], &s), None);
+    }
+
+    #[test]
+    fn plan_keeps_what_you_already_chose() {
+        let g: Vec<PathBuf> = ["a", "b", "c", "d"].iter().map(PathBuf::from).collect();
+        let s: std::collections::HashMap<PathBuf, u8> = [("a", 40), ("b", 90), ("c", 60), ("d", 20)].iter().map(|(k, v)| (PathBuf::from(k), *v)).collect();
+        let p = |f: &str| PathBuf::from(f);
+        // Nothing chosen yet: the sharpest is picked, the rest rejected.
+        let none = plan(&g, &s, |_| (0, 0));
+        assert_eq!(none, vec![(p("b"), 1), (p("a"), -1), (p("c"), -1), (p("d"), -1)]);
+        // You rejected the sharpest and starred one, and picked another: the next sharpest is kept, and the
+        // starred and picked frames are left alone.
+        let chosen = plan(&g, &s, |f| match f.to_str() { Some("b") => (-1, 0), Some("a") => (0, 3), Some("d") => (1, 0), _ => (0, 0) });
+        assert_eq!(chosen, vec![(p("c"), 1)]);
     }
 }
 

@@ -136,11 +136,20 @@ struct CullState {
     /// Frames being scored in the background, and frames that couldn't be.
     scoring: std::collections::HashSet<PathBuf>,
     unscored: std::collections::HashSet<PathBuf>,
-    /// Arrow keys step over frames scoring below `soft_below`.
+    /// Arrow keys step over frames scoring below `soft_below` (unset: `SOFT_BELOW`).
     skip_soft: bool,
-    soft_below: f32,
+    soft_below: Option<f32>,
     /// Bursts waiting for their scores before the sharpest of each is picked.
     pick_groups: Option<Vec<Vec<PathBuf>>>,
+}
+
+/// The soft-frame threshold until you set one.
+const SOFT_BELOW: f32 = 35.0;
+
+impl CullState {
+    fn soft_below(&self) -> f32 {
+        self.soft_below.unwrap_or(SOFT_BELOW)
+    }
 }
 
 /// Full decodes run one at a time: holding an arrow key would otherwise start one per frame passed, each
@@ -853,6 +862,7 @@ impl App {
         // Ratings and edit marks arrive with each thumbnail: reading every sidecar here froze the window on cloud folders.
         self.meta.clear();
         self.cull.failed.clear();
+        self.cull.unscored.clear();
         // Stop watching edit copies left behind in other folders.
         self.edit_watch.retain(|(f, _)| f.parent() == Some(dir.as_path()));
         self.show_files(ctx, files, Some(dir));
@@ -1245,7 +1255,8 @@ impl App {
                     }
                 }
                 Msg::PickBursts(groups) => {
-                    let need: Vec<PathBuf> = groups.iter().flatten().filter(|f| !self.cull.sharp.contains_key(*f)).cloned().collect();
+                    // Frames that failed to read before are left out: nothing would be sent for them, and the pick would wait forever.
+                    let need: Vec<PathBuf> = groups.iter().flatten().filter(|f| !self.cull.sharp.contains_key(*f) && !self.cull.unscored.contains(*f)).cloned().collect();
                     self.cull.pick_groups = Some(groups);
                     if need.is_empty() && self.cull.scoring.is_empty() {
                         self.pick_sharpest_now();
@@ -2871,18 +2882,14 @@ impl App {
         }
         let (mut picked, mut rejected) = (0, 0);
         for g in &groups {
-            let Some(best) = crate::sharp::sharpest(g, &self.cull.sharp).cloned() else { continue };
-            let untouched = |s: &Self, f: &PathBuf| s.meta.get(f).is_none_or(|m| m.flag == 0 && m.rating == 0);
-            if self.meta.get(&best).is_none_or(|m| m.flag == 0) {
-                self.rate(&best, None, Some(1), None);
-                picked += 1;
-            }
-            let rest: Vec<PathBuf> = g.iter().filter(|f| **f != best && self.cull.sharp.contains_key(*f)).cloned().collect();
-            for f in &rest {
-                if untouched(self, f) {
-                    self.rate(f, None, Some(-1), None);
-                    rejected += 1;
-                }
+            // Flags and stars as saved: `meta` only holds photos whose thumbnails have loaded.
+            let state: std::collections::HashMap<PathBuf, (i8, u8)> = g.iter().map(|f| {
+                let m = if self.current.as_ref() == Some(f) { Some(Meta::of(&self.params)) } else { self.meta.get(f).copied().or_else(|| read_params(f).map(|p| Meta::of(&p))) };
+                (f.clone(), m.map_or((0, 0), |m| (m.flag, m.rating)))
+            }).collect();
+            for (f, flag) in crate::sharp::plan(g, &self.cull.sharp, |f| state[f]) {
+                self.rate(&f, None, Some(flag), None);
+                if flag > 0 { picked += 1 } else { rejected += 1 }
             }
         }
         self.cull.flash = Some((format!("Picked {picked}"), std::time::Instant::now()));
@@ -2950,7 +2957,7 @@ impl App {
             let name = f.file_name().unwrap_or_default().to_string_lossy().to_string();
             let nr = ui.painter().text(pos2(r.left(), y), Align2::LEFT_CENTER, name, FontId::proportional(12.5), if m.flag < 0 { TEXT3 } else { TEXT });
             if let Some(v) = self.cull.sharp.get(f) {
-                let soft = self.cull.skip_soft && (*v as f32) < self.cull.soft_below;
+                let soft = self.cull.skip_soft && (*v as f32) < self.cull.soft_below();
                 ui.painter().text(pos2(nr.right() + 12.0, y), Align2::LEFT_CENTER, format!("sharpness {v}"), FontId::monospace(11.5), if soft { WARN } else { TEXT2 });
             }
             let mut x = r.right();
@@ -3007,9 +3014,6 @@ impl App {
 
     /// Cull's sharpness tools: this frame's score, skipping soft frames, and picking the sharpest of each burst.
     fn sharpness_block(&mut self, ui: &mut Ui) {
-        if self.cull.soft_below <= 0.0 {
-            self.cull.soft_below = 35.0;
-        }
         ui.label(caps("Sharpness"));
         let score = self.lib_sel.as_ref().and_then(|f| self.cull.sharp.get(f)).copied();
         ui.horizontal(|ui| {
@@ -3023,26 +3027,26 @@ impl App {
         ui.painter().rect_filled(bar, 3.0, hex(0x3A3A40));
         if let Some(v) = score {
             let x = bar.left() + bar.width() * v as f32 / 100.0;
-            ui.painter().rect_filled(Rect::from_min_max(bar.min, pos2(x, bar.bottom())), 3.0, if self.cull.skip_soft && (v as f32) < self.cull.soft_below { WARN } else { BONE });
+            ui.painter().rect_filled(Rect::from_min_max(bar.min, pos2(x, bar.bottom())), 3.0, if self.cull.skip_soft && (v as f32) < self.cull.soft_below() { WARN } else { BONE });
         }
         if self.cull.skip_soft {
-            let t = bar.left() + bar.width() * self.cull.soft_below / 100.0;
+            let t = bar.left() + bar.width() * self.cull.soft_below() / 100.0;
             ui.painter().line_segment([pos2(t, bar.top() - 3.0), pos2(t, bar.bottom() + 3.0)], Stroke::new(1.5, TEXT));
         }
         ui.add_space(6.0);
-        let was = self.cull.skip_soft;
         ui.horizontal(|ui| {
             ui.label(RichText::new("Skip soft frames").size(12.5));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| switch(ui, &mut self.cull.skip_soft));
         });
         let vis = self.lib_visible();
         if self.cull.skip_soft {
-            if !was {
-                self.score_frames(ui.ctx(), vis.clone());
-            }
-            slider(ui, "Below", &mut self.cull.soft_below, 0.0, 100.0, 35.0, None);
+            // Every frame, so a folder opened later is scored too; frames already scored or tried are skipped.
+            self.score_frames(ui.ctx(), vis.clone());
+            let mut below = self.cull.soft_below();
+            slider(ui, "Below", &mut below, 0.0, 100.0, SOFT_BELOW, None);
+            self.cull.soft_below = Some(below);
             let scored = vis.iter().filter(|f| self.cull.sharp.contains_key(*f)).count();
-            let soft = vis.iter().filter(|f| self.cull.sharp.get(*f).is_some_and(|v| (*v as f32) < self.cull.soft_below)).count();
+            let soft = vis.iter().filter(|f| self.cull.sharp.get(*f).is_some_and(|v| (*v as f32) < self.cull.soft_below())).count();
             let line = if scored < vis.len() && !self.cull.scoring.is_empty() {
                 format!("Scoring {scored} of {}…", vis.len())
             } else {
@@ -3505,7 +3509,8 @@ impl App {
                         self.sample_marks(ui, &resp, r, tool == Tool::Sample);
                     }
                 }
-                if neg && !show_before && self.darkroom_view() > 0 {
+                // Only once the darkroom render is on screen: before that, a click would choose a version not yet seen.
+                if neg && !show_before && self.darkroom_view() > 0 && self.rendered.as_ref().is_some_and(|k| k.6 == self.darkroom_view()) {
                     self.darkroom_overlay(ui, &resp, r);
                 }
                 self.hover_rgb = resp.hover_pos().and_then(|p| {
@@ -5724,9 +5729,7 @@ impl App {
                 let mut view = self.darkroom as usize;
                 ui.label(RichText::new("Choose by eye").size(12.0).color(LABEL));
                 segmented(ui, &mut view, &["Off", "Test strip", "Ring-around"]);
-                if view as u8 != self.darkroom {
-                    self.darkroom = view as u8;
-                }
+                self.darkroom = view as u8;
                 if self.darkroom > 0 {
                     ui.label(RichText::new(if self.darkroom == 1 { "Five bands, \u{bd} stop apart. Click the one that looks right." } else { "The frame in the middle, with more of each colour, lighter and darker around it. Click the one that looks right." }).size(11.5).color(TEXT2));
                 }
@@ -5975,7 +5978,7 @@ impl App {
             let mut j = c as isize + d;
             while (0..vis.len() as isize).contains(&j) {
                 let f = &vis[j as usize];
-                if self.cull.sharp.get(f).is_none_or(|v| *v as f32 >= self.cull.soft_below) {
+                if self.cull.sharp.get(f).is_none_or(|v| *v as f32 >= self.cull.soft_below()) {
                     self.lib_sel = Some(f.clone());
                     return;
                 }
