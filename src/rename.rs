@@ -60,8 +60,9 @@ pub fn plan(files: &[PathBuf], pattern: &str, roll: &str) -> Vec<(PathBuf, PathB
                     out.push((path.clone(), dir.join(format!("{new_name}.{rest}"))));
                 }
             }
-            let xmp = m.with_extension("xmp");
-            if !xmp_done && xmp.exists() && xmp != *m {
+            // Only a RAW owns `IMG_1.xmp` (see `xmp_path`): renaming the JPEG of a pair must leave the RAW's alone.
+            let xmp = crate::xmp_path(m);
+            if !xmp_done && !xmp.as_os_str().is_empty() && xmp.exists() {
                 out.push((xmp, dir.join(format!("{new_stem}.xmp"))));
                 xmp_done = true;
             }
@@ -104,16 +105,19 @@ fn renamed(name: &str, from: &str, to: &str) -> Option<String> {
     (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).then(|| format!("{to}.copy{n}"))
 }
 
+/// Where photo `f` (or a virtual copy of it, `A.NEF.copy2`, which moves only as its sidecar) went in `plan`.
+pub fn moved_to(plan: &[(PathBuf, PathBuf)], f: &Path) -> Option<PathBuf> {
+    let name = f.file_name()?.to_str()?;
+    plan.iter().filter(|(a, _)| a.parent() == f.parent()).find_map(|(a, b)| {
+        let n = renamed(name, a.file_name()?.to_str()?, b.file_name()?.to_str()?)?;
+        Some(f.with_file_name(n))
+    })
+}
+
 /// What other files know a photo by its name follows the rename: the roll's frame notes and hand-picked
 /// collections. Best effort: the photos have already moved, and a note that can't be saved is only a note.
 fn follow(plan: &[(PathBuf, PathBuf)]) {
-    let new_path = |f: &Path| -> Option<PathBuf> {
-        let name = f.file_name()?.to_str()?;
-        plan.iter().filter(|(a, _)| a.parent() == f.parent()).find_map(|(a, b)| {
-            let n = renamed(name, a.file_name()?.to_str()?, b.file_name()?.to_str()?)?;
-            Some(f.with_file_name(n))
-        })
-    };
+    let new_path = |f: &Path| moved_to(plan, f);
     let dirs: std::collections::BTreeSet<&Path> = plan.iter().filter_map(|(a, _)| a.parent()).collect();
     for dir in dirs {
         let Some(mut r) = crate::roll::read(dir) else { continue };
@@ -251,6 +255,23 @@ mod tests {
         assert_eq!(keys(&dir), vec![("other.tif".into(), 4.0), ("roll-001.tif".into(), 2.8), ("roll-001.tif.copy2".into(), 8.0)]);
         undo(&dir).unwrap();
         assert_eq!(keys(&dir), vec![("other.tif".into(), 4.0), ("scan.tif".into(), 2.8), ("scan.tif.copy2".into(), 8.0)]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn renaming_the_jpeg_of_a_pair_leaves_the_raw_xmp() {
+        let dir = std::env::temp_dir().join(format!("ferrotype-rename4-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in ["IMG_1.NEF", "IMG_1.JPG", "IMG_1.xmp"] {
+            std::fs::write(dir.join(f), f).unwrap();
+        }
+        let plan = plan(&[dir.join("IMG_1.JPG")], "trip-{n}", "");
+        apply(&plan).unwrap();
+        assert!(dir.join("trip-001.JPG").exists() && dir.join("IMG_1.xmp").exists() && !dir.join("trip-001.xmp").exists());
+        // The open virtual copy of a renamed photo follows it too.
+        let copy = moved_to(&[(dir.join("A.NEF"), dir.join("B.NEF"))], &dir.join("A.NEF.copy3"));
+        assert_eq!(copy, Some(dir.join("B.NEF.copy3")));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

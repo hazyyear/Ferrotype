@@ -28,6 +28,8 @@ mod bursts;
 mod editors;
 mod geotag;
 mod gallery;
+mod scopes;
+mod sharp;
 
 use develop::Params;
 use image::{DynamicImage, Rgb32FImage, codecs::jpeg::JpegEncoder};
@@ -216,6 +218,19 @@ pub fn move_to_rejects(dest: &Path, files: &[PathBuf]) -> std::io::Result<usize>
         moved += any as usize;
     }
     Ok(moved)
+}
+
+/// Before a settings file (roll notes, collections) is saved over: if what is there now can't be read as `T`, keep
+/// it as `<name>.damaged` for repair by hand, as sidecars are, instead of replacing it with what the app shows.
+pub fn keep_if_damaged<T: serde::de::DeserializeOwned>(path: &Path) -> std::io::Result<()> {
+    match std::fs::read_to_string(path) {
+        Ok(t) if serde_json::from_str::<T>(&t).is_err() => {
+            let mut keep = path.as_os_str().to_owned();
+            keep.push(".damaged");
+            std::fs::rename(path, keep)
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Write to a temp file beside `path`, then rename over `path`, so a crash or full disk never leaves a half-written file.

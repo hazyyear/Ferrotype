@@ -22,6 +22,8 @@ pub const LABEL: Color32 = TEXT2;
 /// Kept as a name for "emphasis"; in this brand it is bone, never a hue.
 pub const ACCENT: Color32 = BONE;
 /// Warnings and errors only: the one hue in the interface, so a problem never reads as ordinary help text.
+/// A rejected frame: the brand has no accent colour, so reject is ink on dim, next to pick's ink on bone.
+pub const REJECT: Color32 = TEXT3;
 pub const WARN: Color32 = hex(0xE0A458);
 /// Secondary text on a bone (selected) surface.
 pub const ON_BONE: Color32 = hex(0x5A5752);
