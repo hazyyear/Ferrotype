@@ -56,6 +56,8 @@ pub fn parse(b: &[u8]) -> Result<Dcp, String> {
     for i in 0..n {
         let e = ifd + 2 + 12 * i;
         let (tag, typ, count) = (u16_at(e).ok_or("bad entry")?, u16_at(e + 2).ok_or("bad entry")?, u32_at(e + 4).ok_or("bad entry")? as usize);
+        // No value is longer than the file: a damaged count can't make the readers below loop for billions.
+        let count = count.min(b.len());
         let size = match typ { 1 | 2 | 6 | 7 => 1, 3 | 8 => 2, 4 | 9 | 11 => 4, 5 | 10 | 12 => 8, _ => 1 } * count;
         let at = if size <= 4 { e + 8 } else { u32_at(e + 8).ok_or("bad entry")? as usize };
         tags.insert(tag, (typ, count, at));
@@ -72,7 +74,8 @@ pub fn parse(b: &[u8]) -> Result<Dcp, String> {
     let table = |dims: u16, data: &[u16], enc: u16| -> Option<HsvTable> {
         let d = longs(dims);
         let (h, s, v) = (*d.first()? as usize, *d.get(1)? as usize, (*d.get(2).unwrap_or(&1) as usize).max(1));
-        if h == 0 || s < 2 || h * s * v > 1 << 20 {
+        // Checked, so damaged sizes can't wrap round to a small number and pass.
+        if h == 0 || s < 2 || h.checked_mul(s)?.checked_mul(v)? > 1 << 20 {
             return None;
         }
         // The last of the listed tags that holds a whole table (for the hue/sat map: the D65 one, when there are two).
@@ -349,6 +352,19 @@ mod tests {
             b.extend(f.to_bits().to_le_bytes());
         }
         b
+    }
+
+    #[test]
+    fn a_damaged_profile_is_refused_quickly() {
+        let mut b = sample();
+        // Table sizes of 4 billion each, and a value count of 4 billion: no hang, no crash, just no table.
+        for k in 0..3 {
+            b[58 + 4 * k..62 + 4 * k].copy_from_slice(&u32::MAX.to_le_bytes());
+        }
+        b[38..42].copy_from_slice(&u32::MAX.to_le_bytes());
+        let t = std::time::Instant::now();
+        assert!(parse(&b).is_err());
+        assert!(t.elapsed().as_secs_f32() < 1.0);
     }
 
     #[test]

@@ -37,6 +37,7 @@ impl ImportOpts {
     pub fn save(&self) {
         if let Some(p) = Self::path() {
             let _ = std::fs::create_dir_all(p.parent().unwrap_or(&p));
+            let _ = crate::keep_if_damaged::<ImportOpts>(&p);
             let _ = crate::write_atomic(&p, serde_json::to_string_pretty(self).unwrap_or_default().as_bytes());
         }
     }
@@ -52,6 +53,8 @@ pub struct Job {
     pub to: PathBuf,
     /// Already imported before (left out when `skip_known`).
     pub known: bool,
+    /// What the import history remembers it by (name, size, time taken).
+    pub key: String,
 }
 
 /// Memory cards and cameras that are plugged in: drives or volumes with a DCIM folder.
@@ -170,7 +173,10 @@ pub fn plan_cached(src: &Path, o: &ImportOpts, shots: &mut std::collections::Has
                 let there = existing.entry(dir.clone()).or_insert_with(|| {
                     std::fs::read_dir(&dir).into_iter().flatten().flatten().map(|e| (e.path().file_stem().unwrap_or_default().to_string_lossy().to_string(), e.path())).collect()
                 });
-                while taken.contains(&dir.join(&s2)) || there.iter().any(|(st, p)| *st == s2 && !same_file(p, &f)) {
+                // This very photo already there (imported before) keeps its name, even with its .xmp beside it;
+                // any other file of that name, a sidecar included, means a new name.
+                let mine = |s2: &str| there.iter().any(|(st, p)| st == s2 && same_file(p, &f));
+                while taken.contains(&dir.join(&s2)) || (!mine(&s2) && there.iter().any(|(st, _)| *st == s2)) {
                     i += 1;
                     s2 = format!("{s}-{i}");
                 }
@@ -180,7 +186,8 @@ pub fn plan_cached(src: &Path, o: &ImportOpts, shots: &mut std::collections::Has
             }
         };
         let to = dir.join(format!("{stem}.{ext}"));
-        jobs.push(Job { known: known.contains(&key(&f, &shot)) || same_file(&to, &f), from: f, to });
+        let k = key(&f, &shot);
+        jobs.push(Job { known: known.contains(&k) || same_file(&to, &f), from: f, to, key: k });
     }
     jobs
 }
@@ -243,7 +250,7 @@ pub fn run(jobs: &[Job], o: &ImportOpts, progress: &dyn Fn(usize, usize)) -> (Ve
                         errs.push(format!("backup: {e}"));
                     }
                 }
-                hist.insert(key(&j.from, &crate::lens::shot(&j.from).unwrap_or_default()));
+                hist.insert(j.key.clone());
                 done.push(j.to.clone());
             }
             Err(e) => errs.push(e),
@@ -252,6 +259,8 @@ pub fn run(jobs: &[Job], o: &ImportOpts, progress: &dyn Fn(usize, usize)) -> (Ve
     progress(todo.len(), todo.len());
     if let Some(p) = history_path().filter(|_| !cfg!(test)) {
         let _ = std::fs::create_dir_all(p.parent().unwrap_or(&p));
+        // A damaged list is kept as .damaged, not replaced by this import's photos alone.
+        let _ = crate::keep_if_damaged::<std::collections::HashSet<String>>(&p);
         let _ = crate::write_atomic(&p, serde_json::to_string(&hist).unwrap_or_default().as_bytes());
     }
     (done, errs)
@@ -291,6 +300,26 @@ mod tests {
         // The same card again: everything is there already.
         let again = plan(&dir.join("card"), &ImportOpts { name: String::new(), ..o.clone() });
         assert!(again.iter().all(|j| j.to.file_stem().is_some_and(|s| s.to_string_lossy().starts_with("IMG_"))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_photo_with_its_xmp_beside_it_counts_as_imported() {
+        let dir = std::env::temp_dir().join(format!("ft-import-xmp-{}", std::process::id()));
+        let card = dir.join("card");
+        std::fs::create_dir_all(&card).unwrap();
+        image::RgbImage::new(8, 8).save(card.join("IMG_2.jpg")).unwrap();
+        let o = ImportOpts { dest: dir.join("photos").display().to_string(), folders: String::new(), name: String::new(), backup: String::new(), skip_known: true };
+        let (done, errs) = run(&plan(&card, &o), &o, &|_, _| {});
+        assert!(errs.is_empty() && done.len() == 1, "{errs:?}");
+        // Rating it later writes IMG_2.xmp next to it. The same card again must not make an IMG_2-2.jpg.
+        std::fs::write(dir.join("photos").join("IMG_2.xmp"), "<x/>").unwrap();
+        let again = plan(&card, &o);
+        assert_eq!(again[0].to, dir.join("photos").join("IMG_2.jpg"));
+        assert!(again[0].known);
+        // A different photo of the same name still gets a new one.
+        image::RgbImage::new(16, 16).save(card.join("IMG_2.jpg")).unwrap();
+        assert_eq!(plan(&card, &o)[0].to, dir.join("photos").join("IMG_2-2.jpg"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -267,6 +267,7 @@ impl Rights {
     pub fn save(&self) -> Result<(), String> {
         let p = Self::path().ok_or("no settings folder")?;
         let _ = std::fs::create_dir_all(p.parent().unwrap_or(&p));
+        crate::keep_if_damaged::<Rights>(&p).map_err(|e| e.to_string())?;
         crate::write_atomic(&p, serde_json::to_string_pretty(self).unwrap_or_default().as_bytes()).map_err(|e| e.to_string())
     }
 
@@ -312,12 +313,13 @@ pub fn sharpen_for_output(img: &mut Rgb32FImage, kind: u8, amt: u8, dpi: f32) {
     if w < 3 || h < 3 {
         return;
     }
-    // Sharpen brightness only, so edges don't pick up colour fringes.
+    // Sharpen brightness only, so edges don't pick up colour fringes. Not clipped here: a wide-gamut export
+    // still holds colours outside sRGB (as values below 0 or above 1) until it is converted to its space.
     let y: Vec<f32> = img.pixels().map(|p| crate::develop::luma(p.0)).collect();
     let b = gauss(&y, w, h, sigma);
     for (i, px) in img.pixels_mut().enumerate() {
         let d = (y[i] - b[i]) * a;
-        px.0 = px.0.map(|v| (v + d).clamp(0.0, 1.0));
+        px.0 = px.0.map(|v| v + d);
     }
 }
 
@@ -673,6 +675,10 @@ mod tests {
         sharpen_for_output(&mut img, 1, 1, 300.0);
         assert!(img.get_pixel(15, 4).0[0] < 0.3 && img.get_pixel(16, 4).0[0] > 0.6, "{:?} {:?}", img.get_pixel(15, 4), img.get_pixel(16, 4));
         assert!((img.get_pixel(2, 4).0[0] - 0.3).abs() < 1e-4, "flat areas are left alone");
+        // A colour outside sRGB (a negative channel, as a wide-gamut render holds it) survives sharpening.
+        let mut wide = Rgb32FImage::from_pixel(16, 16, image::Rgb([0.9, -0.2, 0.1]));
+        sharpen_for_output(&mut wide, 1, 2, 300.0);
+        assert!(wide.get_pixel(8, 8).0[1] < -0.19, "{:?}", wide.get_pixel(8, 8));
     }
 
     #[test]

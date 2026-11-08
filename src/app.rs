@@ -1930,8 +1930,8 @@ impl App {
     }
 
     fn open_import(&mut self) {
-        let src = crate::import::cards().first().map(|c| c.display().to_string()).unwrap_or_default();
-        self.import_dlg = Some(ImportDlg { src, opts: crate::import::ImportOpts::load(), plan: None, shots: Default::default(), planning: None, seen: Default::default(), changed: 0.0 });
+        // The source is filled in with the first card found, when the window first looks.
+        self.import_dlg = Some(ImportDlg { src: String::new(), opts: crate::import::ImportOpts::load(), plan: None, shots: Default::default(), planning: None, seen: Default::default(), changed: 0.0, cards: (f64::NEG_INFINITY, vec![]) });
     }
 
     /// Import from a card: where from, where to, folders and names, a backup copy, then copy on a thread.
@@ -1945,6 +1945,16 @@ impl App {
             d.seen = want.clone();
             d.changed = now;
         }
+        // Cards come and go: look every two seconds, not every frame (on Windows that probes every drive
+        // letter, and an empty card reader or a sleeping network drive can take a while to answer).
+        if now - d.cards.0 > 2.0 {
+            let first = d.cards.0 == f64::NEG_INFINITY;
+            d.cards = (now, crate::import::cards());
+            if first && d.src.is_empty() && let Some(c) = d.cards.1.first() {
+                d.src = c.display().to_string();
+            }
+        }
+        ctx.request_repaint_after(std::time::Duration::from_secs(2));
         if let Some((k, rx)) = &d.planning
             && let Ok(jobs) = rx.try_recv()
         {
@@ -1983,7 +1993,7 @@ impl App {
                     d.src = f.display().to_string();
                 }
             });
-            let cards = crate::import::cards();
+            let cards = d.cards.1.clone();
             if !cards.is_empty() {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("Cards").size(12.0).color(LABEL));
@@ -6930,6 +6940,8 @@ struct ImportDlg {
     /// The source and settings last seen, and when they changed, so planning waits for typing to pause.
     seen: (String, crate::import::ImportOpts),
     changed: f64,
+    /// Cards plugged in, and when that was last looked at.
+    cards: (f64, Vec<PathBuf>),
 }
 
 /// How far to turn the photo (degrees, positive = clockwise on screen) so the line a→b becomes level, or upright

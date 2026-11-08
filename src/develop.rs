@@ -348,7 +348,7 @@ pub const PASTE_GROUPS: [(&str, &[&str], bool); 19] = [
     ("Calibration", &["cal_sh", "cal"], true),
     ("Border", &["border"], true),
     ("Masks", &["masks", "grads", "brushes"], true),
-    ("Transform", &["t_vert", "t_hor", "t_rot", "t_scale", "flip_h", "guides"], false),
+    ("Transform", &["t_vert", "t_hor", "t_rot", "t_scale", "flip_h"], false),
     ("Crop", &["crop"], false),
     ("Heal spots and red eye", &["spots"], false),
     ("Negative conversion", &["neg"], false),

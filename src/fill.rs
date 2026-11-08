@@ -206,6 +206,29 @@ pub fn fill(img: &mut Rgb32FImage, pts: &[[f32; 2]], r: f32, seed: u32) {
     if w < 4 * HALF || h < 4 * HALF {
         return;
     }
+    // Every render runs the spots again (a slider moved after the heal, say): a fill of the same picture
+    // area comes back from a small cache instead of running PatchMatch again (tens of ms per fill).
+    let row = |y: i32| (((y * iw + bx0) * 3) as usize, (w * 3) as usize);
+    let key = {
+        use std::hash::{Hash, Hasher};
+        let mut hs = std::collections::hash_map::DefaultHasher::new();
+        (iw, ih, bx0, by0, bx1, by1, seed, r.to_bits()).hash(&mut hs);
+        pts.iter().for_each(|q| (q[0].to_bits(), q[1].to_bits()).hash(&mut hs));
+        let raw: &[f32] = img;
+        for y in by0..by1 {
+            let (o, n) = row(y);
+            raw[o..o + n].iter().for_each(|v| v.to_bits().hash(&mut hs));
+        }
+        hs.finish()
+    };
+    if let Some(done) = cache(key, None) {
+        let raw: &mut [f32] = img;
+        for (k, y) in (by0..by1).enumerate() {
+            let (o, n) = row(y);
+            raw[o..o + n].copy_from_slice(&done[k * n..(k + 1) * n]);
+        }
+        return;
+    }
     let src = px3(img.as_raw());
     let near = |x: f32, y: f32| pts.iter().zip(pts.iter().skip(1).chain(std::iter::once(&pts[pts.len() - 1]))).map(|(a, b)| {
         let (ex, ey) = (b[0] - a[0], b[1] - a[1]);
@@ -284,6 +307,26 @@ pub fn fill(img: &mut Rgb32FImage, pts: &[[f32; 2]], r: f32, seed: u32) {
             }
         }
     }
+    let raw: &[f32] = img;
+    let done: Vec<f32> = (by0..by1).flat_map(|y| { let (o, n) = row(y); raw[o..o + n].to_vec() }).collect();
+    cache(key, Some(done));
+}
+
+/// Recent fills by the hash of what went in: look one up (`put` None) or keep one. Holds about 32 MB at most.
+fn cache(key: u64, put: Option<Vec<f32>>) -> Option<std::sync::Arc<Vec<f32>>> {
+    use std::sync::{Arc, Mutex};
+    static RECENT: Mutex<Vec<(u64, Arc<Vec<f32>>)>> = Mutex::new(Vec::new());
+    let mut c = RECENT.lock().unwrap_or_else(|e| e.into_inner());
+    match put {
+        None => c.iter().find(|e| e.0 == key).map(|e| e.1.clone()),
+        Some(v) => {
+            c.retain(|e| e.0 != key);
+            c.insert(0, (key, Arc::new(v)));
+            let mut total = 0;
+            c.retain(|e| { total += e.1.len(); total <= 8_000_000 });
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -308,5 +351,21 @@ mod tests {
         }
         // Grey left in place would be off by ~0.35 everywhere; matched stripes are close.
         assert!(err / 81.0 < 0.15, "mean error {}", err / 81.0);
+    }
+
+    #[test]
+    fn the_same_fill_again_comes_from_the_cache() {
+        let make = || Rgb32FImage::from_fn(200, 160, |x, y| image::Rgb([((x * 7 + y * 3) % 40) as f32 / 40.0, (y % 9) as f32 / 9.0, 0.3]));
+        let (mut a, mut b) = (make(), make());
+        fill(&mut a, &[[100.0, 60.0], [100.0, 110.0]], 8.0, 3);
+        let t = std::time::Instant::now();
+        fill(&mut b, &[[100.0, 60.0], [100.0, 110.0]], 8.0, 3);
+        assert_eq!(a.as_raw(), b.as_raw(), "same picture, same fill");
+        // A different picture underneath is filled afresh, not taken from the cache.
+        let mut c = make();
+        c.put_pixel(100, 30, image::Rgb([1.0, 0.0, 0.0]));
+        fill(&mut c, &[[100.0, 60.0], [100.0, 110.0]], 8.0, 3);
+        assert_eq!(c.get_pixel(100, 30).0, [1.0, 0.0, 0.0]);
+        assert!(t.elapsed().as_secs() < 5);
     }
 }

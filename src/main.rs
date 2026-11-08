@@ -319,6 +319,7 @@ impl ExportPreset {
     pub fn save_all(list: &[ExportPreset]) -> Result<(), String> {
         let p = Self::path().ok_or("no settings folder")?;
         let _ = std::fs::create_dir_all(p.parent().unwrap_or(&p));
+        keep_if_damaged::<Vec<ExportPreset>>(&p).map_err(|e| e.to_string())?;
         write_atomic(&p, serde_json::to_string_pretty(list).unwrap_or_default().as_bytes()).map_err(|e| e.to_string())
     }
 
@@ -454,7 +455,8 @@ pub fn export_embed(p: &Params, o: &ExportOpts, src: &Path) -> output::Embed {
         if !rights.caption.is_empty() {
             desc = [rights.caption.clone(), desc].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ");
         }
-        let kws: &[String] = if o.meta || o.copyright { &p.keywords } else { &[] };
+        // Keywords are photo details: only with Details on, never because your copyright is on.
+        let kws: &[String] = if o.meta { &p.keywords } else { &[] };
         e.exif = output::exif_tiff_with(&shot, &desc, &rights);
         e.xmp = output::xmp_packet_with(&shot, &desc, kws, &rights);
     }
@@ -892,6 +894,29 @@ mod tests {
         assert_eq!(by_short.dimensions(), (300, 200));
         let by_mp = render_export(&full, &p, &ExportOpts { megapixels: 0.06, ..Default::default() });
         assert_eq!(by_mp.dimensions(), (300, 200));
+    }
+
+    #[test]
+    fn keywords_need_details_on_not_just_copyright() {
+        let p = Params { keywords: vec!["grandma".into()], title: "Harbour".into(), ..Default::default() };
+        let src = Path::new("/nowhere/IMG_1.jpg");
+        let off = export_embed(&p, &ExportOpts { meta: false, copyright: true, ..Default::default() }, src);
+        assert!(off.xmp.contains("Harbour"), "the title rides on the copyright switch");
+        assert!(!off.xmp.contains("grandma"), "keywords stay out with Details off");
+        let on = export_embed(&p, &ExportOpts { meta: true, copyright: true, ..Default::default() }, src);
+        assert!(on.xmp.contains("grandma"));
+    }
+
+    #[test]
+    fn a_damaged_settings_file_is_kept_not_replaced() {
+        let dir = std::env::temp_dir().join(format!("ferrotype-damaged-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("export-presets.json");
+        std::fs::write(&f, "[{\"name\": \"Lab prints\", oops").unwrap();
+        keep_if_damaged::<Vec<ExportPreset>>(&f).unwrap();
+        assert!(!f.exists());
+        assert!(dir.join("export-presets.json.damaged").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
