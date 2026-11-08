@@ -33,6 +33,7 @@ pub fn entry_in(path: &Path, p: &Params, roll: Option<&crate::roll::Roll>) -> En
     }
     let mut words = vec![path.file_name().unwrap_or_default().to_string_lossy().to_string()];
     words.extend(p.keywords.iter().cloned());
+    words.extend([&p.title, &p.caption].iter().flat_map(|t| t.split_whitespace().map(String::from)));
     words.extend([shot.make.clone(), shot.model.clone(), shot.lens.clone()]);
     if let Some((r, f)) = roll.map(|r| (r, r.frame(path))) {
         words.extend([r.roll.clone(), r.stock_name(), r.developer.clone(), r.notes.clone(), f.note.clone()]);

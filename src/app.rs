@@ -248,6 +248,8 @@ enum Msg {
     Zoomed(Params, [u32; 4], f32, ColorImage),
     /// A panorama was written (or failed).
     Pano(Result<PathBuf, String>),
+    /// An import finished: the files copied, and any errors.
+    Imported(Vec<PathBuf>, Vec<String>),
     /// HDR merges finished: the files written (or the first error).
     Hdr(Result<Vec<PathBuf>, String>),
     /// A focus stack finished: the file written.
@@ -454,17 +456,40 @@ pub struct App {
     target_mode: usize,
     target_hit: Option<develop::Target>,
     rename_dlg: Option<RenameDlg>,
+    /// Which groups Paste and Sync copy (develop::PASTE_GROUPS), and the dialog to choose them: Some(false) to
+    /// paste here, Some(true) to sync to the folder.
+    paste_groups: Vec<bool>,
+    paste_dlg: Option<bool>,
+    /// Import from a card: the dialog (source folder, settings, the plan for that source), and whether it runs.
+    import_dlg: Option<ImportDlg>,
+    import_busy: bool,
     geo_dlg: Option<GeoDlg>,
     mask_ui: MaskUi,
     tool: Tool,
     chart: ChartUi,
     /// Saved camera and scanner profiles (Calibration).
     profiles: Vec<crate::calib::ColorProfile>,
+    /// DNG camera profiles found for the open photo's camera, and which photo they were looked up for.
+    dcps: (Option<PathBuf>, Vec<PathBuf>),
     crop_grab: Option<usize>,
     crop_aspect: usize,
+    /// Crop guide drawn over the frame (an index into CROP_GUIDES), cycled with O.
+    crop_guide: usize,
+    /// The Custom ratio's width and height, and whether a fixed ratio is turned to portrait.
+    crop_custom: [f32; 2],
+    /// Swap the ratio's sides (Shift+X).
+    crop_portrait: bool,
+    /// Straighten: drag a line along something that should be level or upright.
+    straighten: bool,
+    straighten_line: Option<(Pos2, Pos2)>,
+    /// Guided Upright: drawing guides, and the guides drawn so far (source pixels of the preview, quarter-turned;
+    /// true = should be upright).
+    guided: bool,
+    guides: Vec<([f32; 4], bool)>,
     spot_size: f32,
     /// Heal tool: new strokes clone instead of heal; the spot being edited; what a drag is doing.
-    heal_clone: bool,
+    /// 0 heal, 1 clone, 2 content-aware fill, 3 red eye.
+    heal_mode: usize,
     spot_sel: Option<usize>,
     heal_drag: Option<HealDrag>,
     /// Canvas w/h, photo offset on it, uncropped frame w/h and the crop's offset in it (render pixels).
@@ -494,10 +519,19 @@ pub struct App {
     /// Library multi-selection (Ctrl/Cmd-click, Shift-click), for panoramas.
     lib_multi: Vec<PathBuf>,
     pano_busy: bool,
+    /// Panoramas: fill the edges by stretching (boundary warp) instead of cropping.
+    pano_warp: bool,
     /// Photos picked in the library for "Export selected" (empty = the whole folder).
     export_sel: Vec<PathBuf>,
     /// Which one-click sets (Instagram, Story, Portfolio) to make.
     export_sets: [bool; 3],
+    /// Saved export presets, and the name being typed to save one.
+    export_presets: Vec<crate::ExportPreset>,
+    export_preset_name: String,
+    /// The photographer's details (Settings › Your details), written into exports.
+    rights: crate::output::Rights,
+    /// The Library's title and caption fields, and which photo they belong to.
+    info_text: (Option<PathBuf>, String, String),
     /// Folder watch: pick up new files, open them, give them the current settings.
     watch: bool,
     watch_open: bool,
@@ -812,6 +846,7 @@ fn describe_change(a: &Params, b: &Params) -> (String, String) {
         ("vig_round", "Vignette roundness"), ("vig_fea", "Vignette feather"), ("vig_hi", "Vignette highlights"), ("gr_amt", "Grain"), ("gr_size", "Grain size"),
         ("gr_rough", "Grain roughness"), ("cal_sh", "Shadows tint"), ("cal", "Calibration"), ("neg", "Negative"), ("border", "Border"), ("spots", "Heal"), ("masks", "Masks"), ("hal_amt", "Halation"), ("hal_size", "Halation size"), ("hal_thr", "Halation threshold"), ("curves", "Point curve"), ("lut", "LUT"), ("lut_amt", "LUT amount"), ("rating", "Rating"), ("flag", "Flag"),
         ("rot90", "Rotate 90°"), ("profile", "Profile"), ("label", "Label"), ("ai_nr", "AI denoise"), ("ir_clean", "Infrared clean"), ("snapshots", "Snapshot"),
+        ("bw", "Black & white"), ("bw_mix", "B&W mix"), ("dcp", "Camera profile"), ("dcp_tone", "Profile tone curve"), ("title", "Title"), ("caption", "Caption"),
     ];
     let changed: Vec<&(&str, &str)> = names.iter().filter(|(k, _)| ja.get(k) != jb.get(k)).collect();
     match changed.as_slice() {
@@ -856,10 +891,10 @@ impl App {
             history: vec![Params::default()], hist_pos: 0, copied: None, view: View::After, holding_before: false, picking_base: false,
             status: String::new(), presets, preset_tex: vec![], last_preset: None, preset_mix: None, preset_amt: 100.0, preset_name: String::new(), stock_query: String::new(), my_stocks: negative::custom_stocks(), my_stock_name: String::new(), proof: 0,
             stock_tab: 0, mixer_tab: 0, open: [true, false, false, false, false, false, false, false, false, false, false, false, false, false], tool: Tool::None,
-            zoom: None, curve_chan: 0, curve_grab: None, curve_big: false, samples: vec![], target_mode: 0, target_hit: None, rename_dlg: None, geo_dlg: None, mask_ui: MaskUi::default(), chart: ChartUi::new(), profiles: crate::calib::saved(),
-            crop_grab: None, crop_aspect: 0, spot_size: 2.0, heal_clone: false, spot_sel: None, heal_drag: None, view_map: [1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0], photo_wh: [1.0, 1.0],
-            export: ExportOpts::load(), editors: crate::editors::all(), edit_watch: vec![], edit_watch_at: 0.0, export_dialog: None, export_sel: vec![], export_sets: [false; 3], keymap: Keymap::load(), keys_open: false, keys_query: String::new(), settings_open: false, colour: crate::colour::Settings::load(), printer: None, binding: None, picking_wb: false,
-            thumb_due: false, lens_query: String::new(), lib_multi: vec![], pano_busy: false,
+            zoom: None, curve_chan: 0, curve_grab: None, curve_big: false, samples: vec![], target_mode: 0, target_hit: None, rename_dlg: None, paste_groups: develop::paste_defaults(), paste_dlg: None, import_dlg: None, import_busy: false, geo_dlg: None, mask_ui: MaskUi::default(), chart: ChartUi::new(), profiles: crate::calib::saved(), dcps: (None, vec![]),
+            crop_grab: None, crop_aspect: 0, crop_guide: 0, crop_custom: [5.0, 7.0], crop_portrait: false, straighten: false, straighten_line: None, guided: false, guides: vec![], spot_size: 2.0, heal_mode: 0, spot_sel: None, heal_drag: None, view_map: [1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0], photo_wh: [1.0, 1.0],
+            export: ExportOpts::load(), editors: crate::editors::all(), edit_watch: vec![], edit_watch_at: 0.0, export_dialog: None, export_sel: vec![], export_sets: [false; 3], export_presets: crate::ExportPreset::load_all(), export_preset_name: String::new(), rights: crate::output::Rights::load(), info_text: (None, String::new(), String::new()), keymap: Keymap::load(), keys_open: false, keys_query: String::new(), settings_open: false, colour: crate::colour::Settings::load(), printer: None, binding: None, picking_wb: false,
+            thumb_due: false, lens_query: String::new(), lib_multi: vec![], pano_busy: false, pano_warp: false,
             watch: false, watch_open: true, watch_apply: false, watch_at: 0.0, watch_sizes: Default::default(), wipe: 0.5, wipe_tex: None,
             cull: Default::default(), scan: ScanUi::default(), ai_busy: false, tx, rx, roll: Default::default(), roll_dir: None,
             search: Default::default(), search_gen: 0, search_busy: false, collections: crate::library::load(), collection: None, new_coll: None, kw_text: String::new(),
@@ -1353,6 +1388,17 @@ impl App {
                         }
                         z.shown = Some((p, win, sc));
                         z.busy = false;
+                    }
+                }
+                Msg::Imported(done, errs) => {
+                    self.import_busy = false;
+                    self.status = match (done.len(), errs.first()) {
+                        (n, None) => format!("Imported {n} files"),
+                        (n, Some(e)) => format!("Imported {n} files; {} could not be copied ({e})", errs.len()),
+                    };
+                    // Open the folder the last photo went into.
+                    if let Some(d) = done.last().and_then(|f| f.parent()).map(Path::to_path_buf) {
+                        self.open_path(ctx, &d);
                     }
                 }
                 Msg::Pano(r) => {
@@ -1883,6 +1929,182 @@ impl App {
         }
     }
 
+    fn open_import(&mut self) {
+        let src = crate::import::cards().first().map(|c| c.display().to_string()).unwrap_or_default();
+        self.import_dlg = Some(ImportDlg { src, opts: crate::import::ImportOpts::load(), plan: None, shots: Default::default(), planning: None, seen: Default::default(), changed: 0.0 });
+    }
+
+    /// Import from a card: where from, where to, folders and names, a backup copy, then copy on a thread.
+    fn import_window(&mut self, ctx: &egui::Context) {
+        let Some(d) = &mut self.import_dlg else { return };
+        // Plan again when the source or settings change. It reads each photo's date, so it runs on a thread, once
+        // typing has paused: a half-typed path such as "/" must not scan the whole disk on the UI thread.
+        let want = (d.src.clone(), d.opts.clone());
+        let now = ctx.input(|i| i.time);
+        if d.seen != want {
+            d.seen = want.clone();
+            d.changed = now;
+        }
+        if let Some((k, rx)) = &d.planning
+            && let Ok(jobs) = rx.try_recv()
+        {
+            d.plan = Some((k.clone(), jobs));
+            d.planning = None;
+        }
+        let usable = !d.src.trim().is_empty() && Path::new(&d.src).is_dir();
+        let stale = d.plan.as_ref().is_none_or(|p| p.0 != want);
+        if stale && usable && d.planning.is_none() {
+            let wait = 0.4 - (now - d.changed);
+            if wait > 0.0 {
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait));
+            } else {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let (src, o, shots, c2) = (PathBuf::from(&d.src), d.opts.clone(), d.shots.clone(), ctx.clone());
+                std::thread::spawn(move || {
+                    let mut cache = std::mem::take(&mut *shots.lock().unwrap());
+                    let jobs = crate::import::plan_cached(&src, &o, &mut cache);
+                    *shots.lock().unwrap() = cache;
+                    let _ = tx.send(jobs);
+                    c2.request_repaint();
+                });
+                d.planning = Some((want.clone(), rx));
+            }
+        }
+        let looking = stale && usable;
+        let mut go = false;
+        let open = dialog(ctx, "import", "Import photos", 420.0, |ui| {
+            ui.spacing_mut().item_spacing.y = 8.0;
+            ui.label(caps("From"));
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut d.src).hint_text("A memory card's DCIM folder, or any folder").desired_width(ui.available_width() - 80.0));
+                if ui.button("Choose…").clicked()
+                    && let Some(f) = rfd::FileDialog::new().pick_folder()
+                {
+                    d.src = f.display().to_string();
+                }
+            });
+            let cards = crate::import::cards();
+            if !cards.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Cards").size(12.0).color(LABEL));
+                    for c in cards {
+                        let s = c.display().to_string();
+                        if chip(ui, &s, d.src == s).clicked() {
+                            d.src = s;
+                        }
+                    }
+                });
+            }
+            ui.label(caps("To"));
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut d.opts.dest).hint_text("Your photo folder").desired_width(ui.available_width() - 80.0));
+                if ui.button("Choose…").clicked()
+                    && let Some(f) = rfd::FileDialog::new().pick_folder()
+                {
+                    d.opts.dest = f.display().to_string();
+                }
+            });
+            let mut li = crate::import::LAYOUTS.iter().position(|l| l.0 == d.opts.folders).unwrap_or(0);
+            egui::ComboBox::from_id_salt("import_layout").width(ui.available_width()).selected_text(format!("Folders: {}", crate::import::LAYOUTS[li].1)).show_ui(ui, |ui| {
+                for (k, l) in crate::import::LAYOUTS.iter().enumerate() {
+                    pick(ui, &mut li, k, l.1);
+                }
+            });
+            d.opts.folders = crate::import::LAYOUTS[li].0.to_string();
+            ui.add(egui::TextEdit::singleline(&mut d.opts.name).hint_text("New names (optional), for example {date}-{n}").desired_width(f32::INFINITY));
+            token_chips(ui, &mut d.opts.name);
+            ui.horizontal(|ui| {
+                let mut on = !d.opts.backup.is_empty();
+                ui.label(RichText::new("Second copy to").size(12.0).color(LABEL)).on_hover_text("A backup of every imported photo, for example on an external drive");
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if switch(ui, &mut on).changed() && on
+                        && let Some(f) = rfd::FileDialog::new().pick_folder()
+                    {
+                        d.opts.backup = f.display().to_string();
+                    }
+                    if !on {
+                        d.opts.backup.clear();
+                    } else {
+                        ui.add(egui::Label::new(RichText::new(&d.opts.backup).size(11.5).color(TEXT2)).truncate());
+                    }
+                });
+            });
+            switch_row(ui, "Leave out photos imported before", &mut d.opts.skip_known);
+            let (n, new) = d.plan.as_ref().map_or((0, 0), |p| (p.1.len(), p.1.iter().filter(|j| !(d.opts.skip_known && j.known)).count()));
+            let first = d.plan.as_ref().and_then(|p| p.1.iter().find(|j| !(d.opts.skip_known && j.known)));
+            ui.label(RichText::new(if looking { "Looking for photos…".to_string() } else if n == 0 { "No photos found there yet.".to_string() } else {
+                format!("{new} of {n} photos to import{}", first.map(|j| format!(", for example to {}", j.to.strip_prefix(&d.opts.dest).unwrap_or(&j.to).display())).unwrap_or_default())
+            }).size(11.5).color(TEXT2));
+            ui.label(RichText::new("Nothing on the card is changed or deleted.").size(11.5).color(TEXT3));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                go = primary(ui, "Import", !looking && new > 0 && !d.opts.dest.trim().is_empty()).clicked();
+            });
+        });
+        if go && let Some(d) = self.import_dlg.take() {
+            d.opts.save();
+            let jobs = d.plan.map(|p| p.1).unwrap_or_default();
+            self.import_busy = true;
+            let (tx, ctx2, o) = (self.tx.clone(), ctx.clone(), d.opts);
+            std::thread::spawn(move || {
+                let tx2 = tx.clone();
+                let c3 = ctx2.clone();
+                let (done, errs) = crate::import::run(&jobs, &o, &move |i, n| {
+                    let _ = tx2.send(Msg::Status(format!("Importing {i} of {n}…")));
+                    c3.request_repaint();
+                });
+                let _ = tx.send(Msg::Imported(done, errs));
+                ctx2.request_repaint();
+            });
+        } else if !open {
+            self.import_dlg = None;
+        }
+    }
+
+    /// Choose what Paste or Sync copies, then do it.
+    fn paste_window(&mut self, ctx: &egui::Context) {
+        let Some(sync) = self.paste_dlg else { return };
+        let mut go = false;
+        let groups = &mut self.paste_groups;
+        let open = dialog(ctx, "paste", if sync { "Sync settings to the folder" } else { "Paste settings" }, 360.0, |ui| {
+            ui.label(RichText::new(if sync { "Copy these groups of this photo's settings to every photo in the folder." } else { "Copy these groups of the copied settings to this photo." }).size(12.0).color(TEXT2));
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if small_action(ui, "All", false).clicked() {
+                    groups.iter_mut().for_each(|g| *g = true);
+                }
+                if small_action(ui, "None", false).clicked() {
+                    groups.iter_mut().for_each(|g| *g = false);
+                }
+                if small_action(ui, "Usual", false).on_hover_text("Everything except geometry, retouching and the film conversion").clicked() {
+                    *groups = develop::paste_defaults();
+                }
+            });
+            ui.add_space(4.0);
+            ui.columns(2, |c| {
+                let half = develop::PASTE_GROUPS.len().div_ceil(2);
+                for (i, (name, _, _)) in develop::PASTE_GROUPS.iter().enumerate() {
+                    c[i / half].checkbox(&mut groups[i], RichText::new(*name).size(12.0));
+                }
+            });
+            ui.add_space(10.0);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                go = primary(ui, if sync { "Sync" } else { "Paste" }, groups.iter().any(|g| *g)).clicked();
+            });
+        });
+        if go {
+            let on = self.paste_groups.clone();
+            if sync {
+                let me = self.params.clone();
+                self.sync_folder(move |other| other.with_parts_of(&me, &on));
+            } else if let Some(c) = &self.copied {
+                self.params = self.params.with_parts_of(c, &on);
+            }
+        }
+        if go || !open {
+            self.paste_dlg = None;
+        }
+    }
+
     /// Batch rename: pattern with tokens, a live preview, then rename on a background thread.
     fn rename_window(&mut self, ctx: &egui::Context) {
         let Some(d) = &mut self.rename_dlg else { return };
@@ -2011,6 +2233,47 @@ impl App {
         let title = if !all { "Print to file".to_string() } else { format!("Print {n} frame{} to files", if n == 1 { "" } else { "s" }) };
         let open = dialog(ctx, "print", &title, 320.0, |ui| {
                 ui.spacing_mut().item_spacing.y = 8.0;
+                // Saved presets: pick one to use its settings, or save these under a name.
+                ui.horizontal(|ui| {
+                    ui.label(caps("Preset"));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let cur = self.export_presets.iter().position(|x| x.opts() == self.export && x.ext == self.export.ext);
+                        if let Some(i) = cur
+                            && small_action(ui, "Delete", false).on_hover_text("Delete this preset").clicked()
+                        {
+                            self.export_presets.remove(i);
+                            if let Err(e) = crate::ExportPreset::save_all(&self.export_presets) {
+                                self.status = format!("Could not save presets: {e}");
+                            }
+                        }
+                        let shown = cur.map_or("Choose…".to_string(), |i| self.export_presets[i].name.clone());
+                        egui::ComboBox::from_id_salt("export_preset").width(ui.available_width() - 8.0).selected_text(shown).show_ui(ui, |ui| {
+                            if self.export_presets.is_empty() {
+                                ui.label(RichText::new("No presets yet. Save the settings below with a name.").size(11.5).color(TEXT3));
+                            }
+                            for x in &self.export_presets {
+                                if picked(ui, false, &x.name).clicked() {
+                                    self.export = x.opts();
+                                }
+                            }
+                        });
+                    });
+                });
+                ui.horizontal(|ui| {
+                    let r = ui.add(egui::TextEdit::singleline(&mut self.export_preset_name).hint_text("Name these settings, for example Lab prints").desired_width(ui.available_width() - 64.0));
+                    let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let name = self.export_preset_name.trim().to_string();
+                    if (ui.add_enabled(!name.is_empty(), egui::Button::new("Save")).clicked() || enter) && !name.is_empty() {
+                        let pr = crate::ExportPreset::of(&name, &self.export);
+                        match self.export_presets.iter_mut().find(|x| x.name.eq_ignore_ascii_case(&name)) {
+                            Some(x) => *x = pr,
+                            None => self.export_presets.push(pr),
+                        }
+                        self.export_presets.sort_by_key(|x| x.name.to_lowercase());
+                        self.status = match crate::ExportPreset::save_all(&self.export_presets) { Ok(()) => format!("Saved the export preset {name}"), Err(e) => format!("Could not save presets: {e}") };
+                        self.export_preset_name.clear();
+                    }
+                });
                 let o = &mut self.export;
                 ui.label(caps("Format"));
                 let exts = ["jpg", "tif", "png"];
@@ -2020,9 +2283,32 @@ impl App {
                 ui.label(caps("Size"));
                 let sizes = [0, 4096, 2048, 1080];
                 let printing = o.print[0] > 0.0;
-                let mut j = if printing { 4 } else { sizes.iter().position(|v| *v == o.long_edge).unwrap_or(0) };
-                segmented(ui, &mut j, &["Full", "4096", "2048", "1080", "Paper"]);
+                let custom = o.short_edge > 0 || o.megapixels > 0.0 || !sizes.contains(&o.long_edge);
+                let mut j = if printing { 5 } else if custom { 4 } else { sizes.iter().position(|v| *v == o.long_edge).unwrap_or(0) };
+                segmented(ui, &mut j, &["Full", "4096", "2048", "1080", "Custom", "Paper"]);
                 if j == 4 {
+                    o.print[0] = 0.0;
+                    // Custom: long edge, short edge or megapixels, typed in.
+                    let mut by = if o.short_edge > 0 { 1 } else if o.megapixels > 0.0 { 2 } else { 0 };
+                    let was = by;
+                    segmented(ui, &mut by, &["Long edge", "Short edge", "Megapixels"]);
+                    if by != was || !custom {
+                        let px = [o.long_edge, o.short_edge].into_iter().find(|v| *v > 0 && !sizes.contains(v)).unwrap_or(3000);
+                        (o.long_edge, o.short_edge, o.megapixels) = match by { 1 => (0, px.min(20000), 0.0), 2 => (0, 0, 12.0), _ => (px.max(1), 0, 0.0) };
+                    }
+                    ui.horizontal(|ui| {
+                        match by {
+                            1 => { ui.add(egui::DragValue::new(&mut o.short_edge).range(16..=60000).speed(10).suffix(" px")); }
+                            2 => { ui.add(egui::DragValue::new(&mut o.megapixels).range(0.1..=400.0).speed(0.1).max_decimals(1).suffix(" MP")); }
+                            _ => { ui.add(egui::DragValue::new(&mut o.long_edge).range(16..=60000).speed(10).suffix(" px")); }
+                        }
+                        ui.label(RichText::new(match by { 1 => "the shorter side", 2 => "in total, keeping the shape", _ => "the longer side" }).size(11.5).color(TEXT2));
+                    });
+                } else if j != 5 {
+                    (o.short_edge, o.megapixels) = (0, 0.0);
+                }
+                if j == 5 {
+                    (o.short_edge, o.megapixels) = (0, 0.0);
                     if !printing {
                         let (_, a, b) = crate::output::PAPERS[2];
                         o.print = [a, b, o.print[2].max(72.0)];
@@ -2048,7 +2334,7 @@ impl App {
                     });
                     ui.label(RichText::new(format!("{:.0} × {:.0} px at {:.0} dpi, turned to match the photo. {}", o.print[0] * o.print[2], o.print[1] * o.print[2], o.print[2],
                         if o.print_fill { "The photo is cropped to the paper's shape." } else { "White margins fill the difference in shape." })).size(11.5).color(TEXT2));
-                } else {
+                } else if j < 4 {
                     o.print[0] = 0.0;
                     o.long_edge = sizes[j];
                 }
@@ -2056,6 +2342,22 @@ impl App {
                     let mut q = o.quality as f32;
                     slider(ui, "Quality", &mut q, 50.0, 100.0, 92.0, None);
                     o.quality = q as u8;
+                    ui.horizontal(|ui| {
+                        let mut on = o.max_kb > 0;
+                        ui.label(RichText::new("Limit file size").size(12.0).color(LABEL)).on_hover_text("Lowers the quality until each file fits, for sites and forms with an upload limit");
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            switch(ui, &mut on);
+                            if on {
+                                if o.max_kb == 0 {
+                                    o.max_kb = 1000;
+                                }
+                                ui.add(egui::DragValue::new(&mut o.max_kb).range(20..=100_000).speed(10).suffix(" KB"));
+                            }
+                        });
+                        if !on {
+                            o.max_kb = 0;
+                        }
+                    });
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("HDR (gain map)").size(12.0).color(LABEL));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| switch(ui, &mut o.hdr));
@@ -2079,6 +2381,16 @@ impl App {
                     }
                 }
                 ui.label(RichText::new(note).size(11.5).color(TEXT2));
+                ui.label(caps("Output sharpening"));
+                let mut k = o.out_sharp as usize;
+                segmented(ui, &mut k, &["None", "Screen", "Matte", "Glossy"]);
+                o.out_sharp = k as u8;
+                if k > 0 {
+                    let mut a = o.out_sharp_amt as usize;
+                    segmented(ui, &mut a, &["Low", "Standard", "High"]);
+                    o.out_sharp_amt = a as u8;
+                    ui.label(RichText::new(if k == 1 { "A light touch for the final pixel size, for screens and the web." } else { "Made for the paper and its resolution, so it looks a little crisp on screen and right on paper." }).size(11.5).color(TEXT2));
+                }
                 disclose(ui, "Watermark", "wm", |ui| {
                     ui.add(egui::TextEdit::singleline(&mut o.wm_text).hint_text("© Your name").desired_width(f32::INFINITY));
                     ui.horizontal(|ui| {
@@ -2107,6 +2419,11 @@ impl App {
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| switch(ui, &mut o.meta));
                     });
                     ui.horizontal(|ui| {
+                        ui.label(RichText::new("Your name, copyright and contact").size(12.0).color(LABEL))
+                            .on_hover_text("From Settings › Your details, plus each photo's title and caption");
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| switch(ui, &mut o.copyright));
+                    });
+                    ui.horizontal(|ui| {
                         ui.label(RichText::new("Location (GPS), if the photo has one").size(12.0).color(LABEL))
                             .on_hover_text("Off by default, so shared photos don't show where they were taken");
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| switch(ui, &mut o.gps));
@@ -2122,7 +2439,7 @@ impl App {
                     }
                     ui.label(RichText::new("One click makes each set in its own subfolder, padded to shape with the border colour.").size(11.5).color(TEXT2));
                 });
-                ui.label(RichText::new("Prints hold only the picture unless you add the details above. GPS and serial numbers are never included.").size(11.5).color(TEXT2));
+                ui.label(RichText::new("Prints hold only the picture and your copyright unless you add the details above. GPS is left out unless you switch it on, and serial numbers are never included.").size(11.5).color(TEXT2));
                 ui.add_space(4.0);
                 let sets = self.export_sets.iter().any(|b| *b);
                 go = primary(ui, if sets { "Print sets to folder…" } else if all { "Print to folder…" } else { "Print to file…" }, true).clicked();
@@ -2428,6 +2745,18 @@ impl App {
     }
 
     /// Set a centred crop of `aspect` (w/h, in pixels), as large as the frame allows.
+    /// The crop's fixed width/height ratio, if any: the chosen preset or the custom one, turned to portrait if asked.
+    fn crop_ratio(&self) -> Option<f32> {
+        let a = if self.crop_aspect == ASPECTS.len() - 1 {
+            let [w, h] = self.crop_custom;
+            (w > 0.0 && h > 0.0).then(|| w / h)
+        } else {
+            ASPECTS[self.crop_aspect].1
+        }?;
+        // Turned: 4:5 becomes 5:4, 3:2 becomes 2:3.
+        Some(if self.crop_portrait { 1.0 / a } else { a })
+    }
+
     fn set_crop_aspect(&mut self, aspect: f32) {
         let Some(ph) = &self.photo else { return };
         let (pw, phh) = develop::oriented(ph.preview.width(), ph.preview.height(), &self.params);
@@ -2437,6 +2766,40 @@ impl App {
     }
 
     fn crop_tool(&mut self, ui: &Ui, resp: &egui::Response, r: Rect) {
+        // Straighten: the drag draws a line instead of moving the crop. On release the photo turns so the line
+        // is level (or upright, when it is closer to vertical).
+        if self.guided {
+            self.guide_tool(ui, resp, r);
+            return;
+        }
+        if self.straighten {
+            if resp.drag_started()
+                && let Some(p) = ui.input(|i| i.pointer.press_origin())
+            {
+                self.straighten_line = Some((p, p));
+            }
+            if resp.dragged()
+                && let (Some((a, _)), Some(p)) = (self.straighten_line, resp.interact_pointer_pos())
+            {
+                self.straighten_line = Some((a, p));
+            }
+            if resp.drag_stopped()
+                && let Some((a, b)) = self.straighten_line.take()
+            {
+                if let Some(d) = straighten_angle(a, b) {
+                    self.params.t_rot = (self.params.t_rot - d).clamp(-45.0, 45.0);
+                }
+                self.straighten = false;
+            }
+            let pt = ui.painter_at(r);
+            if let Some((a, b)) = self.straighten_line {
+                pt.line_segment([a, b], Stroke::new(3.0, Color32::from_black_alpha(140)));
+                pt.line_segment([a, b], Stroke::new(1.5, Color32::WHITE));
+            }
+            draw_guide(&pt, r, 1, Color32::from_white_alpha(45));
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+            return;
+        }
         let c = self.params.crop;
         let (mut x0, mut y0, mut x1, mut y1) = (c[0], c[1], 1.0 - c[2], 1.0 - c[3]);
         let sel = Rect::from_min_max(r.lerp_inside(vec2(x0, y0)), r.lerp_inside(vec2(x1, y1)));
@@ -2460,7 +2823,7 @@ impl App {
             } else {
                 if g == 0 || g == 3 { x0 = uv.x.min(x1 - MIN) } else { x1 = uv.x.max(x0 + MIN) }
                 if g == 0 || g == 1 { y0 = uv.y.min(y1 - MIN) } else { y1 = uv.y.max(y0 + MIN) }
-                if let Some(a) = ASPECTS[self.crop_aspect].1 {
+                if let Some(a) = self.crop_ratio() {
                     // Keep the ratio: height follows width, anchored at the opposite corner; shrink width if it won't fit.
                     let fa = r.width() / r.height();
                     let room = if g <= 1 { y1 } else { 1.0 - y0 };
@@ -2483,11 +2846,7 @@ impl App {
                   Rect::from_min_max(pos2(r.min.x, sel.min.y), pos2(sel.min.x, sel.max.y)), Rect::from_min_max(pos2(sel.max.x, sel.min.y), pos2(r.max.x, sel.max.y))] {
             pt.rect_filled(d, 0.0, dim);
         }
-        for i in 1..3 {
-            let f = i as f32 / 3.0;
-            pt.vline(sel.left() + sel.width() * f, sel.y_range(), Stroke::new(1.0, Color32::from_white_alpha(70)));
-            pt.hline(sel.x_range(), sel.top() + sel.height() * f, Stroke::new(1.0, Color32::from_white_alpha(70)));
-        }
+        draw_guide(&pt, sel, self.crop_guide, Color32::from_white_alpha(80));
         pt.rect_stroke(sel, 0.0, Stroke::new(1.0, Color32::WHITE), egui::StrokeKind::Inside);
         for c in corners {
             ui.painter().rect_filled(Rect::from_center_size(c, vec2(10.0, 10.0)), 2.0, Color32::WHITE);
@@ -2496,6 +2855,85 @@ impl App {
             let icon = if corners.iter().any(|c| c.distance(h) < 16.0) { egui::CursorIcon::Crosshair } else if sel.contains(h) { egui::CursorIcon::Grab } else { egui::CursorIcon::Default };
             ui.ctx().set_cursor_icon(icon);
         }
+    }
+
+    /// The Mapper for the preview as shown in the crop tool (uncropped), with its frame size.
+    fn preview_mapper(&self) -> Option<(develop::Mapper, f32, f32)> {
+        let ph = self.photo.as_ref()?;
+        let (w, h) = develop::oriented(ph.preview.width(), ph.preview.height(), &self.params);
+        Some((develop::Mapper::new(&self.params, w, h), w as f32, h as f32))
+    }
+
+    /// Guided Upright: drag lines along edges that should be upright or level; from two lines on, the photo is
+    /// straightened to match them all. Right-click a guide to remove it.
+    fn guide_tool(&mut self, ui: &Ui, resp: &egui::Response, r: Rect) {
+        let Some((m, w, h)) = self.preview_mapper() else { return };
+        let to_src = |p: Pos2| { let uv = (p - r.min) / r.size(); let (x, y, ..) = m.map(uv.x * w, uv.y * h); [x, y] };
+        let to_screen = |q: [f32; 2]| { let (x, y) = m.unmap(q[0], q[1], (q[0], q[1])); r.min + vec2(x / w * r.width(), y / h * r.height()) };
+        if resp.drag_started()
+            && let Some(p) = ui.input(|i| i.pointer.press_origin())
+        {
+            self.straighten_line = Some((p, p));
+        }
+        if resp.dragged()
+            && let (Some((a, _)), Some(p)) = (self.straighten_line, resp.interact_pointer_pos())
+        {
+            self.straighten_line = Some((a, p));
+        }
+        let mut changed = false;
+        if resp.drag_stopped()
+            && let Some((a, b)) = self.straighten_line.take()
+            && a.distance(b) > 16.0
+        {
+            let d = b - a;
+            let (sa, sb) = (to_src(a), to_src(b));
+            self.guides.push(([sa[0], sa[1], sb[0], sb[1]], d.y.abs() > d.x.abs()));
+            changed = true;
+        }
+        let screen: Vec<(Pos2, Pos2, bool)> = self.guides.iter().map(|(l, v)| (to_screen([l[0], l[1]]), to_screen([l[2], l[3]]), *v)).collect();
+        if resp.secondary_clicked()
+            && let Some(p) = resp.interact_pointer_pos()
+            && let Some(i) = screen.iter().position(|(a, b, _)| {
+                let (ab, ap) = (*b - *a, p - *a);
+                let t = (ap.dot(ab) / ab.length_sq().max(1.0)).clamp(0.0, 1.0);
+                (*a + ab * t).distance(p) < 8.0
+            })
+        {
+            self.guides.remove(i);
+            changed = true;
+        }
+        if changed {
+            self.apply_guides();
+        }
+        let pt = ui.painter_at(r);
+        for (a, b, v) in screen.iter().copied().chain(self.straighten_line.map(|(a, b)| (a, b, (b - a).y.abs() > (b - a).x.abs()))) {
+            pt.line_segment([a, b], Stroke::new(3.0, Color32::from_black_alpha(140)));
+            pt.line_segment([a, b], Stroke::new(1.5, if v { Color32::from_rgb(120, 200, 255) } else { Color32::from_rgb(255, 210, 110) }));
+            pt.circle_filled(a, 3.0, Color32::WHITE);
+            pt.circle_filled(b, 3.0, Color32::WHITE);
+        }
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+    }
+
+    /// Straighten the photo to the drawn guides (Rotate, Vertical and Horizontal), zooming just enough to hide
+    /// the corners. With fewer than two guides it waits for more.
+    fn apply_guides(&mut self) {
+        let Some(ph) = &self.photo else { return };
+        if self.guides.len() < 2 {
+            return;
+        }
+        let (w, h) = develop::oriented(ph.preview.width(), ph.preview.height(), &self.params);
+        let (lines, vert): (Vec<[f32; 4]>, Vec<bool>) = self.guides.iter().copied().unzip();
+        // Solve from no correction, so each new guide refines the whole set rather than piling on.
+        let base = Params { t_rot: 0.0, t_vert: 0.0, t_hor: 0.0, ..self.params.clone() };
+        let (r, v, hz) = crate::upright::solve_guided(&lines, &vert, w, h, &base);
+        (self.params.t_rot, self.params.t_vert, self.params.t_hor) = (r, v, hz);
+        self.params.t_scale = crate::upright::fill_scale(&self.params, w, h);
+    }
+
+    /// A new spot at frame position `f` in the Heal tool's current mode (red eye is a single circle).
+    fn new_spot(&self, f: [f32; 2], rad: f32) -> develop::Spot {
+        develop::Spot { x: f[0], y: f[1], r: rad, sx: f[0], sy: f[1], clone: self.heal_mode == 1, fill: self.heal_mode == 2, red_eye: self.heal_mode == 3, ..Default::default() }
     }
 
     /// Automatic source for a spot or stroke: the nearby area whose surroundings match best.
@@ -2528,7 +2966,7 @@ impl App {
         let rad = self.spot_size / 100.0;
         let frame_at = |s: &Self, pos: Pos2| s.to_frame((pos - r.min) / r.size());
         // What's under a screen position: a source (index) or a spot's own area.
-        let source_hit = |s: &Self, pos: Pos2| s.params.spots.iter().rposition(|sp| sp.points().any(|q| s.to_screen(r, s.source_of(sp, q)).distance(pos) < sp.r * to_px));
+        let source_hit = |s: &Self, pos: Pos2| s.params.spots.iter().rposition(|sp| !sp.fill && !sp.red_eye && sp.points().any(|q| s.to_screen(r, s.source_of(sp, q)).distance(pos) < sp.r * to_px));
         let spot_hit = |s: &Self, pos: Pos2| s.params.spots.iter().rposition(|sp| sp.points().any(|q| s.to_screen(r, q).distance(pos) < sp.r * to_px));
         if resp.drag_started()
             && let Some(pos) = ui.input(|i| i.pointer.press_origin())
@@ -2541,7 +2979,7 @@ impl App {
                     Some(HealDrag::Source(i, [f[0] - sp.sx, f[1] - sp.sy]))
                 }
                 None => {
-                    self.params.spots.push(develop::Spot { x: f[0], y: f[1], r: rad, sx: f[0], sy: f[1], clone: self.heal_clone, ..Default::default() });
+                    self.params.spots.push(self.new_spot(f, rad));
                     Some(HealDrag::Paint(self.params.spots.len() - 1))
                 }
             };
@@ -2580,8 +3018,11 @@ impl App {
                 self.spot_sel = Some(i); // select it to change its angle or mode
             } else {
                 let f = frame_at(self, pos);
-                let mut sp = develop::Spot { x: f[0], y: f[1], r: rad, sx: f[0], sy: f[1], clone: self.heal_clone, ..Default::default() };
-                if let Some(src) = self.auto_source(&sp) {
+                let mut sp = self.new_spot(f, rad);
+                if sp.fill || sp.red_eye {
+                    self.params.spots.push(sp);
+                    self.spot_sel = Some(self.params.spots.len() - 1);
+                } else if let Some(src) = self.auto_source(&sp) {
                     (sp.sx, sp.sy) = (src[0], src[1]);
                     self.params.spots.push(sp);
                     self.spot_sel = Some(self.params.spots.len() - 1);
@@ -2606,7 +3047,7 @@ impl App {
                 pt.add(egui::Shape::line(target.clone(), Stroke::new(w * 2.0, Color32::from_white_alpha(28))));
             }
             let dragging_this = matches!(self.heal_drag, Some(HealDrag::Paint(k)) if k == i);
-            if !dragging_this {
+            if !dragging_this && !s.fill && !s.red_eye {
                 let source: Vec<Pos2> = s.points().map(|q| self.to_screen(r, self.source_of(s, q))).collect();
                 pt.line_segment([target[0], source[0]], Stroke::new(1.0, Color32::from_white_alpha(90)));
                 if source.len() > 1 {
@@ -3267,6 +3708,9 @@ impl App {
                     && let Some(d) = rfd::FileDialog::new().pick_folder()
                 {
                     self.open_path(ui.ctx(), &d);
+                }
+                if ui.add_enabled(!self.import_busy, egui::Button::new(if self.import_busy { "Importing…" } else { "Import…" }).min_size(vec2(0.0, 28.0))).on_hover_text("Copy photos from a memory card or camera into dated folders").clicked() {
+                    self.open_import();
                 }
                 if !develop {
                     ui.add(egui::TextEdit::singleline(&mut self.lib_query).hint_text("Search keywords, camera, lens, iso>1600…").desired_width(260.0).margin(vec2(10.0, 6.0)))
@@ -4099,6 +4543,9 @@ impl App {
                     {
                         self.open_path(ui.ctx(), &d);
                     }
+                    if ui.button("Import from a memory card…").clicked() {
+                        self.open_import();
+                    }
                 });
             });
             return;
@@ -4183,6 +4630,7 @@ impl App {
                             let multi = self.lib_multi.len();
                             let in_multi = self.lib_multi.contains(f);
                             let pano_busy = self.pano_busy;
+                            let pano_warp = &mut self.pano_warp;
                             resp.context_menu(|ui| {
                                 if stacked > 0 && ui.button(format!("Open stack ({stacked} photos)")).clicked() {
                                     burst_toggle = Some(f.clone());
@@ -4211,6 +4659,8 @@ impl App {
                                     }
                                     ui.add_enabled_ui(!pano_busy, |ui| {
                                         ui.menu_button(format!("Merge {multi} photos to panorama"), |ui| {
+                                            ui.checkbox(&mut *pano_warp, "Fill the edges (boundary warp)").on_hover_text("Stretch the panorama out to a full rectangle instead of cropping its uneven edges");
+                                            ui.separator();
                                             for (pr, name) in crate::pano::Projection::ALL {
                                                 if ui.button(name).clicked() {
                                                     pano = Some(pr);
@@ -4479,6 +4929,32 @@ impl App {
     }
 
     /// Keywords of the selected photo (or of every selected photo, when several are): chips with ×, and a field.
+    /// Title and caption of the selected photo, saved with its edits when a field loses focus.
+    fn caption_panel(&mut self, ui: &mut Ui, f: &Path) {
+        if self.info_text.0.as_deref() != Some(f) {
+            let q = if self.current.as_deref() == Some(f) { self.params.clone() } else { read_params(f).unwrap_or_default() };
+            self.info_text = (Some(f.to_path_buf()), q.title, q.caption);
+        }
+        ui.add_space(10.0);
+        ui.label(caps("Title and caption"));
+        let t = ui.add(egui::TextEdit::singleline(&mut self.info_text.1).hint_text("Title").desired_width(f32::INFINITY));
+        let c = ui.add(egui::TextEdit::multiline(&mut self.info_text.2).hint_text("Caption").desired_rows(2).desired_width(f32::INFINITY));
+        if t.lost_focus() || c.lost_focus() {
+            let (title, caption) = (self.info_text.1.trim().to_string(), self.info_text.2.trim().to_string());
+            let mut q = read_params(f).unwrap_or_default();
+            if q.title != title || q.caption != caption {
+                (q.title, q.caption) = (title.clone(), caption.clone());
+                if write_params(f, &q).is_ok() && self.current.as_deref() == Some(f) {
+                    (self.params.title, self.params.caption) = (title.clone(), caption.clone());
+                    for h in &mut self.history {
+                        (h.title, h.caption) = (title.clone(), caption.clone());
+                    }
+                }
+                self.reindex(f);
+            }
+        }
+    }
+
     fn keywords_panel(&mut self, ui: &mut Ui, f: &Path) {
         let targets: Vec<PathBuf> = if self.lib_multi.len() >= 2 && self.lib_multi.iter().any(|m| m == f) { self.lib_multi.clone() } else { vec![f.to_path_buf()] };
         let kws = read_params(f).unwrap_or_default().keywords;
@@ -4626,6 +5102,7 @@ impl App {
             });
         });
         self.keywords_panel(ui, &f);
+        self.caption_panel(ui, &f);
         ui.add_space(12.0);
         ui.columns(2, |c| {
             if c[0].add(egui::Button::new("Open as negative").min_size(vec2(c[0].available_width(), 32.0))).clicked() {
@@ -4986,6 +5463,14 @@ impl App {
             self.chart_panel(ui);
             return;
         }
+        if self.dcps.0 != self.current {
+            let found = self.current.as_ref().and_then(|f| crate::lens::shot(&load::copy_of(f).unwrap_or(f.clone()))).map(|sh| {
+                crate::dcp::for_camera(crate::dcp::all_files(), &sh.make, &sh.model).into_iter().cloned().collect()
+            }).unwrap_or_default();
+            self.dcps = (self.current.clone(), found);
+        }
+        let dcps = &self.dcps.1;
+        let mut dcp_err = None;
         let d = Params::default();
         let photo = &self.photo;
         let mixer_tab = &mut self.mixer_tab;
@@ -4999,7 +5484,11 @@ impl App {
         let mut pick_profile: Option<Option<crate::calib::ColorProfile>> = None;
         let p = &mut self.params;
         let (spot_size, crop_aspect) = (&mut self.spot_size, &mut self.crop_aspect);
-        let (heal_clone, spot_sel) = (&mut self.heal_clone, &mut self.spot_sel);
+        let (crop_guide, crop_custom, crop_portrait, straighten) = (&mut self.crop_guide, &mut self.crop_custom, &mut self.crop_portrait, &mut self.straighten);
+        let mut crop_tool_on = false;
+        let guided = &mut self.guided;
+        let mut guides_clear = false;
+        let (heal_mode, spot_sel) = (&mut self.heal_mode, &mut self.spot_sel);
         let mut set_aspect = None;
         let frame_aspect = photo.as_ref().map(|ph| {
             let (w, h) = develop::oriented(ph.preview.width(), ph.preview.height(), p);
@@ -5066,6 +5555,11 @@ impl App {
                         if small_action(ui, "As shot", false).clicked() {
                             (p.temp, p.tint) = (d.temp, d.tint);
                         }
+                        if small_action(ui, "Auto", false).on_hover_text("Find white balance from the photo's neutral areas").clicked()
+                            && let Some(ph) = photo
+                        {
+                            (p.temp, p.tint) = develop::auto_wb(&ph.preview);
+                        }
                         pick_wb = small_action(ui, if picking_wb { "Cancel" } else { "Pick neutral" }, picking_wb)
                             .on_hover_text("Eyedropper (W). Click something that should be grey or white").clicked();
                     });
@@ -5112,7 +5606,34 @@ impl App {
                 slider(ui, "Darks", &mut p.c_da, -100.0, 100.0, 0.0, None);
                 slider(ui, "Shadows", &mut p.c_sh, -100.0, 100.0, 0.0, None);
             });
-            section(ui, "Colour mixer", o_mixer, changed(&["hsl"]), |ui| {
+            section(ui, if p.bw { "B&W mixer" } else { "Colour mixer" }, o_mixer, changed(&["hsl", "bw", "bw_mix"]), |ui| {
+                switch_row(ui, "Black & white", &mut p.bw).on_hover_text("Turn the photo grey. The mixer below then sets how light each colour becomes, like a coloured filter on black-and-white film");
+                if p.bw {
+                    for (b, name) in ["Red", "Orange", "Yellow", "Green", "Aqua", "Blue", "Purple", "Magenta"].into_iter().enumerate() {
+                        let h = HUE_CENTERS[b];
+                        // The grey this colour becomes, as bw_grey makes it.
+                        let g = move |t: f32| { let c = develop::hsv_to_rgb(h, 0.75, 0.8).map(crate::load::srgb_to_linear); let mut m = [0.0; 8]; m[b] = t; let y = develop::bw_grey(c, &m); lin([y.min(1.0); 3]) };
+                        slider_ex(ui, name, Some(hsv(h, 0.7, 0.9)), &mut p.bw_mix[b], -100.0, 100.0, 0.0, Some(&g));
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("Filter").size(12.0).color(LABEL));
+                        // The classic filters for black-and-white film, as starting points.
+                        for (name, mix) in [("None", [0.0; 8]), ("Red", [60.0, 40.0, 10.0, -40.0, -50.0, -60.0, -20.0, 30.0]), ("Orange", [40.0, 40.0, 20.0, -20.0, -35.0, -45.0, -15.0, 15.0]), ("Yellow", [15.0, 20.0, 25.0, 0.0, -15.0, -25.0, -10.0, 0.0]), ("Green", [-25.0, -10.0, 15.0, 40.0, 20.0, -10.0, -20.0, -20.0]), ("Blue", [-40.0, -30.0, -20.0, -10.0, 30.0, 50.0, 25.0, 0.0])] {
+                            if small_action(ui, name, p.bw_mix == mix).clicked() {
+                                p.bw_mix = mix;
+                            }
+                        }
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("Tone").size(12.0).color(LABEL));
+                        for (i, t) in develop::TONERS.iter().enumerate() {
+                            if small_action(ui, t.0, false).on_hover_text("Sets the shadows and highlights of Colour grading, so it can be fine-tuned there").clicked() {
+                                develop::apply_toner(p, i);
+                            }
+                        }
+                    });
+                    return;
+                }
                 ui.horizontal(|ui| segmented(ui, mixer_tab, &["Hue", "Saturation", "Luminance"]));
                 for (b, name) in ["Red", "Orange", "Yellow", "Green", "Aqua", "Blue", "Purple", "Magenta"].into_iter().enumerate() {
                     let h = HUE_CENTERS[b];
@@ -5209,27 +5730,34 @@ impl App {
             section(ui, "Crop & transform", o_geo, changed(&["t_vert","t_hor","t_rot","t_scale","flip_h","crop","rot90"]), |ui| {
                 // Upright: found from the photo's straight lines, then written into the three sliders below, so
                 // the result stays adjustable by hand.
-                ui.horizontal(|ui| {
-                    ui.label(caps("Upright"));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if small_action(ui, "Off", false).on_hover_text("Rotate, Vertical and Horizontal back to 0, Scale to 100").clicked() {
-                            (p.t_rot, p.t_vert, p.t_hor, p.t_scale) = (0.0, 0.0, 0.0, 100.0);
+                // The label sits on its own line: six buttons don't fit beside it in a narrow panel.
+                ui.label(caps("Upright"));
+                ui.horizontal_wrapped(|ui| {
+                    for (m, name) in crate::upright::Mode::ALL.iter() {
+                        let tip = match m {
+                            crate::upright::Mode::Auto => "Level, plus a gentle fix for leaning verticals when the photo clearly has them",
+                            crate::upright::Mode::Level => "Level the horizon from the photo's straight lines",
+                            crate::upright::Mode::Vertical => "Level and make converging verticals parallel (buildings)",
+                            crate::upright::Mode::Full => "Level and straighten verticals and horizontals",
+                        };
+                        if small_action(ui, name, false).on_hover_text(tip).clicked()
+                            && let Some(ph) = photo
+                        {
+                            *p = crate::upright::apply(&ph.preview, p, *m);
                         }
-                        for (m, name) in crate::upright::Mode::ALL.iter().rev() {
-                            let tip = match m {
-                                crate::upright::Mode::Auto => "Level, plus a gentle fix for leaning verticals when the photo clearly has them",
-                                crate::upright::Mode::Level => "Level the horizon from the photo's straight lines",
-                                crate::upright::Mode::Vertical => "Level and make converging verticals parallel (buildings)",
-                                crate::upright::Mode::Full => "Level and straighten verticals and horizontals",
-                            };
-                            if small_action(ui, name, false).on_hover_text(tip).clicked()
-                                && let Some(ph) = photo
-                            {
-                                *p = crate::upright::apply(&ph.preview, p, *m);
-                            }
-                        }
-                    });
+                    }
+                    if small_action(ui, "Guided", *guided).on_hover_text("Draw two to four lines along edges that should be upright or level").clicked() {
+                        *guided = !*guided;
+                        crop_tool_on = *guided;
+                        guides_clear = true;
+                    }
+                    if small_action(ui, "Off", false).on_hover_text("Rotate, Vertical and Horizontal back to 0, Scale to 100").clicked() {
+                        (p.t_rot, p.t_vert, p.t_hor, p.t_scale) = (0.0, 0.0, 0.0, 100.0);
+                    }
                 });
+                if *guided {
+                    ui.label(RichText::new("Drag along edges that should be upright (blue) or level (amber). From two guides on, the photo straightens to match. Right-click a guide to remove it.").size(11.5).color(TEXT2));
+                }
                 slider(ui, "Vertical", &mut p.t_vert, -100.0, 100.0, 0.0, None);
                 slider(ui, "Horizontal", &mut p.t_hor, -100.0, 100.0, 0.0, None);
                 slider(ui, "Rotate", &mut p.t_rot, -45.0, 45.0, 0.0, None);
@@ -5250,26 +5778,74 @@ impl App {
                     p.crop = [0.0; 4];
                 }
                 let mut a = *crop_aspect;
-                segmented(ui, &mut a, &ASPECTS.map(|x| x.0));
+                segmented(ui, &mut a, &ASPECTS[..ASPECTS.len() - 1].iter().map(|x| x.0).collect::<Vec<_>>());
+                ui.horizontal(|ui| {
+                    let custom = *crop_aspect == ASPECTS.len() - 1;
+                    if ui.selectable_label(custom, "Custom").on_hover_text("Type your own ratio, for example 5 by 7").clicked() {
+                        a = ASPECTS.len() - 1;
+                    }
+                    let edit = |ui: &mut Ui, v: &mut f32| {
+                        let r = ui.add(egui::DragValue::new(v).range(0.1..=100.0).speed(0.05).max_decimals(2));
+                        r.changed() || r.gained_focus()
+                    };
+                    let [mut w, mut h] = *crop_custom;
+                    let changed = edit(ui, &mut w) | { ui.label("×"); edit(ui, &mut h) };
+                    if changed {
+                        *crop_custom = [w, h];
+                        a = ASPECTS.len() - 1;
+                        set_aspect = Some(0.0);
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if small_action(ui, "Turn", *crop_portrait).on_hover_text("Swap the ratio's sides, landscape to portrait (Shift+X)").clicked() {
+                            *crop_portrait = !*crop_portrait;
+                            set_aspect = Some(0.0);
+                        }
+                    });
+                });
                 if a != *crop_aspect {
                     *crop_aspect = a;
-                    set_aspect = ASPECTS[a].1;
+                    set_aspect = Some(0.0);
                 }
                 let c = p.crop;
                 let (cw, ch) = (1.0 - c[0] - c[2], 1.0 - c[1] - c[3]);
                 ui.label(RichText::new(format!("Ratio {:.2} · {:.0}% of the frame. Use Crop in the toolbar to drag the corners.", cw * frame_aspect / ch.max(1e-3), cw * ch * 100.0)).size(11.5).color(TEXT2));
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Guide").size(12.0).color(LABEL));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        egui::ComboBox::from_id_salt("crop_guide").width(150.0).selected_text(CROP_GUIDES[*crop_guide]).show_ui(ui, |ui| {
+                            for (i, g) in CROP_GUIDES.iter().enumerate() {
+                                if picked(ui, *crop_guide == i, *g).clicked() {
+                                    *crop_guide = i;
+                                }
+                            }
+                        });
+                    });
+                });
+                ui.horizontal(|ui| {
+                    if ui.add(egui::Button::new(if *straighten { "Drag a line on the photo…" } else { "Straighten by a line" }).selected(*straighten).min_size(vec2(ui.available_width(), 26.0)))
+                        .on_hover_text("Drag along a horizon or an edge that should be level or upright, and the photo turns to match").clicked()
+                    {
+                        *straighten = !*straighten;
+                        crop_tool_on = *straighten;
+                    }
+                });
             });
             section(ui, "Heal", o_spot, changed(&["spots"]), |ui| {
-                let mut mode = *heal_clone as usize;
-                segmented(ui, &mut mode, &["Heal", "Clone"]);
-                *heal_clone = mode == 1;
+                segmented(ui, heal_mode, &["Heal", "Clone", "Fill", "Red eye"]);
                 slider(ui, "Size", spot_size, 0.5, 10.0, 2.0, None);
+                ui.label(RichText::new(match *heal_mode {
+                    2 => "Fill rebuilds the area from texture around it, for larger things like a sign, a branch or a stain.",
+                    3 => "Click each red pupil with a circle a little larger than the pupil.",
+                    _ => "",
+                }).size(11.5).color(TEXT2));
                 if let Some(sp) = spot_sel.and_then(|i| p.spots.get_mut(i)) {
                     group(ui, "Selected spot", None);
-                    let mut m = sp.clone as usize;
-                    segmented(ui, &mut m, &["Heal", "Clone"]);
-                    sp.clone = m == 1;
-                    slider(ui, "Source angle", &mut sp.angle, -180.0, 180.0, 0.0, None);
+                    let mut m = if sp.red_eye { 3 } else if sp.fill { 2 } else { sp.clone as usize };
+                    segmented(ui, &mut m, &["Heal", "Clone", "Fill", "Red eye"]);
+                    (sp.clone, sp.fill, sp.red_eye) = (m == 1, m == 2, m == 3);
+                    if m < 2 {
+                        slider(ui, "Source angle", &mut sp.angle, -180.0, 180.0, 0.0, None);
+                    }
                 }
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(format!("{} spots", p.spots.len())).size(12.0).color(LABEL));
@@ -5347,7 +5923,7 @@ impl App {
                 }
                 ui.label(RichText::new("Applied after the tone and colour settings, on display-ready colours (Rec.709 / sRGB LUTs).").size(11.5).color(TEXT2));
             });
-            section(ui, "Calibration", o_cal, changed(&["cal_sh","cal","profile"]), |ui| {
+            section(ui, "Calibration", o_cal, changed(&["cal_sh","cal","profile","dcp","dcp_tone"]), |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Profile").size(12.0));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -5367,6 +5943,42 @@ impl App {
                         });
                     });
                 });
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Camera profile").size(12.0)).on_hover_text("A DNG camera profile (.dcp), such as Adobe Standard or Camera Matching, from Lightroom, the free Adobe DNG Converter or RawTherapee");
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if small_action(ui, "Load…", false).on_hover_text("Choose a .dcp file").clicked()
+                            && let Some(f) = rfd::FileDialog::new().add_filter("DNG camera profile", &["dcp"]).pick_file()
+                        {
+                            let path = f.to_string_lossy().to_string();
+                            match std::fs::read(&f).map_err(|e| e.to_string()).and_then(|b| crate::dcp::parse(&b)) {
+                                Ok(_) => p.dcp = path,
+                                Err(e) => dcp_err = Some(e),
+                            }
+                        }
+                        let shown = if p.dcp.is_empty() { "Ferrotype colour".to_string() } else { crate::dcp::label(Path::new(&p.dcp)) };
+                        egui::ComboBox::from_id_salt("dcp").width(ui.available_width() - 8.0).selected_text(shown).show_ui(ui, |ui| {
+                            if picked(ui, p.dcp.is_empty(), "Ferrotype colour").clicked() {
+                                p.dcp.clear();
+                            }
+                            for f in dcps {
+                                let fs = f.to_string_lossy().to_string();
+                                if picked(ui, p.dcp == fs, crate::dcp::label(f)).on_hover_text(&fs).clicked() {
+                                    p.dcp = fs;
+                                }
+                            }
+                            if dcps.is_empty() {
+                                ui.label(RichText::new("No profiles found for this camera. Install the free Adobe DNG Converter or RawTherapee, or use Load….").size(11.5).color(TEXT3));
+                            }
+                        });
+                    });
+                });
+                if !p.dcp.is_empty() {
+                    match crate::dcp::load(&p.dcp) {
+                        Some(r) if r.has_tone() => { switch_row(ui, "Use the profile's tone curve", &mut p.dcp_tone).on_hover_text("Off keeps the camera's own tone, matched from its JPEG. On uses the contrast the profile was made with"); }
+                        Some(_) => {}
+                        None => { ui.label(RichText::new("This profile can't be read.").size(11.5).color(WARN)); }
+                    }
+                }
                 if profiles.is_empty() && p.profile.is_none() {
                     ui.label(RichText::new("Profiles correct a camera's or scanner's colours. Build one from a chart shot under your light.").size(11.5).color(TEXT2));
                 }
@@ -5383,11 +5995,28 @@ impl App {
                 }
             });
         });
-        if let Some(a) = set_aspect {
-            self.set_crop_aspect(a);
+        if set_aspect.is_some() {
+            if let Some(a) = self.crop_ratio() {
+                self.set_crop_aspect(a);
+            }
+        }
+        if self.tool != Tool::Crop && !crop_tool_on {
+            (self.guided, self.straighten) = (false, false);
+        }
+        if guides_clear {
+            self.guides.clear();
+            self.straighten = false;
+        }
+        if crop_tool_on && self.tool != Tool::Crop {
+            self.tool = Tool::Crop;
+            self.zoom = None;
+            self.view = View::After;
         }
         if let Some(pr) = pick_profile {
             self.set_profile(pr);
+        }
+        if let Some(e) = dcp_err {
+            self.status = format!("Could not use that profile: {e}");
         }
         if chart_on {
             self.tool = Tool::Chart;
@@ -5453,12 +6082,13 @@ impl App {
             return;
         }
         self.pano_busy = true;
+        let warp = self.pano_warp;
         self.status = format!("Merging {} photos…", files.len());
         let (tx, ctx2) = (self.tx.clone(), ctx.clone());
         std::thread::spawn(move || {
             let tx2 = tx.clone();
             let c3 = ctx2.clone();
-            let r = crate::make_pano(&files, proj, &move |m| {
+            let r = crate::make_pano(&files, proj, warp, &move |m| {
                 let _ = tx2.send(Msg::Status(format!("Panorama: {m}…")));
                 c3.request_repaint();
             });
@@ -5601,8 +6231,12 @@ impl App {
                 self.copied = Some(self.params.clone());
             }
             if ui.add_enabled(self.copied.is_some(), egui::Button::new(RichText::new("Paste").color(TEXT2)).fill(Color32::TRANSPARENT).stroke(Stroke::NONE))
-                .on_hover_text("Paste the copied settings (Ctrl/Cmd+V). Crop and negative conversion are kept").clicked() {
-                self.params = self.params.with_look_of(self.copied.as_ref().unwrap());
+                .on_hover_text("Paste the copied settings (Ctrl/Cmd+V), the groups chosen under Paste…").clicked() {
+                self.params = self.params.with_parts_of(self.copied.as_ref().unwrap(), &self.paste_groups);
+            }
+            if ui.add_enabled(self.copied.is_some(), egui::Button::new(RichText::new("Paste…").color(TEXT2)).fill(Color32::TRANSPARENT).stroke(Stroke::NONE))
+                .on_hover_text("Choose which settings to paste (Ctrl/Cmd+Shift+V)").clicked() {
+                self.paste_dlg = Some(false);
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ghost(ui, "Reset", false).on_hover_text("Clear this photo's Develop settings (undo brings them back)").clicked() {
@@ -5617,9 +6251,8 @@ impl App {
                 let prev = self.prev_params.clone().unwrap();
                 self.params = self.params.with_look_of(&prev);
             }
-            if c[1].add(egui::Button::new("Sync settings…").min_size(vec2(c[1].available_width(), 32.0))).on_hover_text("Copy these settings (not crop or transform) to every photo in the folder").clicked() {
-                let me = self.params.clone();
-                self.sync_folder(move |other| other.with_look_of(&me));
+            if c[1].add(egui::Button::new("Sync settings…").min_size(vec2(c[1].available_width(), 32.0))).on_hover_text("Choose which of these settings to copy to every photo in the folder").clicked() {
+                self.paste_dlg = Some(true);
             }
         });
     }
@@ -6056,6 +6689,21 @@ impl App {
                     self.tool = Tool::None;
                     self.zoom = None;
                 }
+                "crop_guide" if self.tool == Tool::Crop => self.crop_guide = (self.crop_guide + 1) % CROP_GUIDES.len(),
+                "crop_turn" if self.tool == Tool::Crop => {
+                    self.crop_portrait = !self.crop_portrait;
+                    if let Some(a) = self.crop_ratio() {
+                        self.set_crop_aspect(a);
+                    } else {
+                        // Free: turn the frame itself, keeping its centre.
+                        let [l, t, r, b] = self.params.crop;
+                        let (cx, cy, w, h) = ((l + 1.0 - r) / 2.0, (t + 1.0 - b) / 2.0, 1.0 - l - r, 1.0 - t - b);
+                        let fa = self.photo.as_ref().map_or(1.5, |ph| { let (w, h) = develop::oriented(ph.preview.width(), ph.preview.height(), &self.params); w as f32 / h as f32 });
+                        let (nw, nh) = ((h / fa).min(1.0), (w * fa).min(1.0));
+                        let (cx, cy) = (cx.clamp(nw / 2.0, 1.0 - nw / 2.0), cy.clamp(nh / 2.0, 1.0 - nh / 2.0));
+                        self.params.crop = [cx - nw / 2.0, cy - nh / 2.0, 1.0 - cx - nw / 2.0, 1.0 - cy - nh / 2.0];
+                    }
+                }
                 "rot_left" => self.params.rotate(false),
                 "rot_right" => self.params.rotate(true),
                 "snapshot" => self.add_snapshot(),
@@ -6074,7 +6722,12 @@ impl App {
         if prev { if browsing { self.step_selection(-1) } else { self.step(ctx, -1) } }
         if next { if browsing { self.step_selection(1) } else { self.step(ctx, 1) } }
         if copy { self.copied = Some(self.params.clone()); }
-        if paste && let Some(c) = &self.copied { self.params = self.params.with_look_of(c); }
+        let paste_choose = ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::V));
+        if paste_choose && self.copied.is_some() {
+            self.paste_dlg = Some(false);
+        } else if paste && let Some(c) = &self.copied {
+            self.params = self.params.with_parts_of(c, &self.paste_groups);
+        }
     }
 
     /// Move the Library / culling selection through the photos shown.
@@ -6161,7 +6814,7 @@ impl App {
         if !self.settings_open {
             return;
         }
-        let mut screen_changed = false;
+        let (mut screen_changed, mut rights_changed) = (false, false);
         let open = dialog(ctx, "settings", "Settings", 380.0, |ui| {
             ui.label(caps("Screen colour"));
             let cur = self.colour.screen.profile.clone();
@@ -6187,8 +6840,26 @@ impl App {
                 }
             });
             ui.label(RichText::new("If colours look too strong on a wide-gamut monitor, choose its profile here. macOS usually manages colour itself, so keep sRGB there unless photos look oversaturated.").size(11.5).color(TEXT2));
+            ui.add_space(10.0);
+            ui.label(caps("Your details"));
+            let r = &mut self.rights;
+            let before = r.clone();
+            egui::Grid::new("rights").num_columns(2).spacing(vec2(10.0, 6.0)).show(ui, |ui| {
+                for (label, v, hint) in [("Name", &mut r.creator, "Your name"), ("Copyright", &mut r.copyright, "© {year} Your name"), ("Email", &mut r.email, "you@example.com"), ("Website", &mut r.url, "https://…"), ("Usage terms", &mut r.usage, "All rights reserved")] {
+                    ui.label(RichText::new(label).size(12.0).color(LABEL));
+                    ui.add(egui::TextEdit::singleline(v).hint_text(hint).desired_width(f32::INFINITY));
+                    ui.end_row();
+                }
+            });
+            ui.label(RichText::new("Written into every export as the creator, copyright and contact, the way Lightroom and Bridge read them. {year} becomes the current year. Switch it off for one export under File names & details.").size(11.5).color(TEXT2));
+            if *r != before {
+                rights_changed = true;
+            }
             ui.add_space(4.0);
         });
+        if rights_changed && let Err(e) = self.rights.save() {
+            self.status = format!("Could not save your details: {e}");
+        }
         if screen_changed {
             self.apply_screen();
         }
@@ -6246,7 +6917,78 @@ impl App {
 
 }
 
-const ASPECTS: [(&str, Option<f32>); 6] = [("Free", None), ("1:1", Some(1.0)), ("4:5", Some(0.8)), ("2:3", Some(2.0 / 3.0)), ("3:2", Some(1.5)), ("16:9", Some(16.0 / 9.0))];
+const ASPECTS: [(&str, Option<f32>); 7] = [("Free", None), ("1:1", Some(1.0)), ("4:5", Some(0.8)), ("2:3", Some(2.0 / 3.0)), ("3:2", Some(1.5)), ("16:9", Some(16.0 / 9.0)), ("Custom", None)];
+struct ImportDlg {
+    src: String,
+    opts: crate::import::ImportOpts,
+    /// The plan, and the source and settings it was made for.
+    plan: Option<((String, crate::import::ImportOpts), Vec<crate::import::Job>)>,
+    /// Camera details of the photos on the card, read once (shared with the planning thread).
+    shots: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<PathBuf, crate::lens::Shot>>>,
+    /// A plan being made on a thread, and what it is for.
+    planning: Option<((String, crate::import::ImportOpts), std::sync::mpsc::Receiver<Vec<crate::import::Job>>)>,
+    /// The source and settings last seen, and when they changed, so planning waits for typing to pause.
+    seen: (String, crate::import::ImportOpts),
+    changed: f64,
+}
+
+/// How far to turn the photo (degrees, positive = clockwise on screen) so the line a→b becomes level, or upright
+/// when it is steeper than 45°. None for a line too short to mean anything.
+fn straighten_angle(a: Pos2, b: Pos2) -> Option<f32> {
+    let d = b - a;
+    if d.length() < 12.0 {
+        return None;
+    }
+    let mut deg = d.y.atan2(d.x).to_degrees(); // screen y points down, so positive = sloping down to the right
+    // Fold into -90..90 (direction doesn't matter), then measure against the nearest of level and upright.
+    if deg > 90.0 { deg -= 180.0 } else if deg < -90.0 { deg += 180.0 }
+    Some(if deg > 45.0 { deg - 90.0 } else if deg < -45.0 { deg + 90.0 } else { deg })
+}
+
+/// Draw crop guide `kind` (an index into CROP_GUIDES) inside `sel`.
+fn draw_guide(pt: &egui::Painter, sel: Rect, kind: usize, col: Color32) {
+    let st = Stroke::new(1.0, col);
+    let at = |fx: f32, fy: f32| pos2(sel.left() + sel.width() * fx, sel.top() + sel.height() * fy);
+    let (v, h) = (|pt: &egui::Painter, f: f32| pt.vline(sel.left() + sel.width() * f, sel.y_range(), st), |pt: &egui::Painter, f: f32| pt.hline(sel.x_range(), sel.top() + sel.height() * f, st));
+    const PHI: f32 = 0.618_034;
+    match kind {
+        0 => [1.0 / 3.0, 2.0 / 3.0].into_iter().for_each(|f| { v(pt, f); h(pt, f); }),
+        1 => (1..8).map(|i| i as f32 / 8.0).for_each(|f| { v(pt, f); h(pt, f); }),
+        2 => [1.0 - PHI, PHI].into_iter().for_each(|f| { v(pt, f); h(pt, f); }),
+        3 => {
+            // Corner diagonals at 45°, from each corner, as far as the frame allows.
+            let s = sel.width().min(sel.height());
+            for (c, dx, dy) in [(sel.left_top(), 1.0, 1.0), (sel.right_top(), -1.0, 1.0), (sel.left_bottom(), 1.0, -1.0), (sel.right_bottom(), -1.0, -1.0)] {
+                pt.line_segment([c, c + vec2(dx * s, dy * s)], st);
+            }
+        }
+        4 => {
+            // Golden spiral: quarter arcs in ever smaller golden rectangles, starting from the left.
+            let (mut x0, mut y0, mut x1, mut y1) = (0.0f32, 0.0f32, 1.0f32, 1.0f32);
+            for i in 0..8 {
+                let (w, hh) = (x1 - x0, y1 - y0);
+                // Square cut off one side in turn (left, top, right, bottom); the arc runs across that square.
+                let (sq, centre, start) = match i % 4 {
+                    0 => { let sx = x0 + w * PHI; let r = (x0, y0, sx, y1); x0 = sx; (r, (sx, y1), 180.0f32) }
+                    1 => { let sy = y0 + hh * PHI; let r = (x0, y0, x1, sy); y0 = sy; (r, (x0, sy), 270.0) }
+                    2 => { let sx = x1 - w * PHI; let r = (sx, y0, x1, y1); x1 = sx; (r, (sx, y0), 0.0) }
+                    _ => { let sy = y1 - hh * PHI; let r = (x0, sy, x1, y1); y1 = sy; (r, (x1, sy), 90.0) }
+                };
+                let (rx, ry) = (sq.2 - sq.0, sq.3 - sq.1);
+                let pts: Vec<Pos2> = (0..=16).map(|k| {
+                    let a = (start + k as f32 / 16.0 * 90.0).to_radians();
+                    at(centre.0 + rx * a.cos(), centre.1 + ry * a.sin())
+                }).collect();
+                pt.add(egui::Shape::line(pts, st));
+                pt.rect_stroke(Rect::from_min_max(at(sq.0, sq.1), at(sq.2, sq.3)), 0.0, Stroke::new(1.0, col.gamma_multiply(0.5)), egui::StrokeKind::Inside);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Guides over the crop frame, as in Lightroom's crop overlays.
+const CROP_GUIDES: [&str; 6] = ["Thirds", "Grid", "Golden ratio", "Diagonals", "Golden spiral", "None"];
 
 /// `n` five-point stars in a row starting at `c` (centre of the first), each `r` in radius.
 fn paint_stars(p: &egui::Painter, c: egui::Pos2, n: u8, r: f32, col: Color32) {
@@ -6461,6 +7203,8 @@ impl eframe::App for App {
         }
         self.export_window(&ctx);
         self.rename_window(&ctx);
+        self.paste_window(&ctx);
+        self.import_window(&ctx);
         self.geotag_window(&ctx);
         self.keys_window(&ctx);
         self.settings_window(&ctx);
@@ -6468,5 +7212,23 @@ impl eframe::App for App {
         if !ctx.input(|i| i.pointer.any_down()) && !ctx.memory(|m| m.has_focus(egui::Id::NULL.with("caption"))) {
             self.commit();
         }
+    }
+}
+
+#[cfg(test)]
+mod lr_gap_tests {
+    use super::*;
+
+    #[test]
+    fn straighten_line_finds_the_turn() {
+        // A horizon sloping down to the right by 5° needs turning back 5°.
+        let (a, b) = (pos2(0.0, 0.0), pos2(100.0, 100.0 * 5f32.to_radians().tan()));
+        assert!((straighten_angle(a, b).unwrap() - 5.0).abs() < 0.01);
+        // Drawn right to left, the same.
+        assert!((straighten_angle(b, a).unwrap() - 5.0).abs() < 0.01);
+        // A wall leaning 3° is made upright.
+        let w = straighten_angle(pos2(0.0, 0.0), pos2(100.0 * 3f32.to_radians().tan(), 100.0)).unwrap();
+        assert!((w + 3.0).abs() < 0.01, "{w}");
+        assert!(straighten_angle(pos2(0.0, 0.0), pos2(3.0, 2.0)).is_none());
     }
 }

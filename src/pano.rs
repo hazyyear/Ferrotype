@@ -552,6 +552,67 @@ fn from_uv(p: Projection, u: f64, v: f64) -> V3 {
     }
 }
 
+/// Boundary warp: stretch each column so the picture reaches the top and bottom of the frame, then each row so
+/// it reaches the sides. `mask` is where the panorama has picture, at a lower resolution (`lw`×`lh`). The outline
+/// is smoothed first, so straight lines bend gently instead of following every step of the edge.
+pub fn boundary_warp(img: &Rgb32FImage, mask: &[bool], lw: usize, lh: usize) -> Rgb32FImage {
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    if w < 2 || h < 2 || lw < 2 || lh < 2 {
+        return img.clone();
+    }
+    let smooth = |v: &[f32], r: usize| -> Vec<f32> {
+        (0..v.len()).map(|i| {
+            let (a, b) = (i.saturating_sub(r), (i + r + 1).min(v.len()));
+            v[a..b].iter().sum::<f32>() / (b - a) as f32
+        }).collect()
+    };
+    // Top and bottom of the picture in each low-res column (as fractions of the height); empty columns borrow
+    // from their neighbours.
+    let span = |n: usize, m: usize, at: &dyn Fn(usize, usize) -> bool| -> (Vec<f32>, Vec<f32>) {
+        let mut lo = vec![f32::NAN; n];
+        let mut hi = vec![f32::NAN; n];
+        for i in 0..n {
+            if let Some(a) = (0..m).find(|j| at(i, *j)) {
+                let b = (0..m).rev().find(|j| at(i, *j)).unwrap_or(a);
+                (lo[i], hi[i]) = (a as f32 / m as f32, (b + 1) as f32 / m as f32);
+            }
+        }
+        for v in [&mut lo, &mut hi] {
+            let first = v.iter().copied().find(|x| x.is_finite()).unwrap_or(0.0);
+            let mut last = first;
+            for x in v.iter_mut() {
+                if x.is_finite() { last = *x } else { *x = last }
+            }
+        }
+        let r = (n / 40).max(1);
+        (smooth(&lo, r), smooth(&hi, r))
+    };
+    let (top, bot) = span(lw, lh, &|x, y| mask[y * lw + x]);
+    let sample = |v: &[f32], f: f32| { let p = (f * (v.len() - 1) as f32).clamp(0.0, (v.len() - 1) as f32); let i = p as usize; let j = (i + 1).min(v.len() - 1); v[i] + (v[j] - v[i]) * (p - i as f32) };
+    // The mask after the vertical stretch, to find each row's sides.
+    let vmask: Vec<bool> = (0..lw * lh).map(|i| {
+        let (x, y) = (i % lw, i / lw);
+        let f = x as f32 / (lw - 1) as f32;
+        let sy = sample(&top, f) + (sample(&bot, f) - sample(&top, f)) * (y as f32 + 0.5) / lh as f32;
+        mask[((sy * lh as f32) as usize).min(lh - 1) * lw + x]
+    }).collect();
+    let (left, right) = span(lh, lw, &|y, x| vmask[y * lw + x]);
+    let mut out = Rgb32FImage::new(w as u32, h as u32);
+    out.par_chunks_mut(w * 3).enumerate().for_each(|(y, row)| {
+        let fy = (y as f32 + 0.5) / h as f32;
+        let (l, r) = (sample(&left, fy), sample(&right, fy));
+        for x in 0..w {
+            // Row stretch first (in the vertically stretched picture), then back through the column stretch.
+            let fx = l + (r - l) * (x as f32 + 0.5) / w as f32;
+            let (t, b) = (sample(&top, fx), sample(&bot, fx));
+            let sy = (t + (b - t) * fy) * h as f32 - 0.5;
+            let c = crate::develop::bilinear(img, fx * w as f32 - 0.5, sy);
+            row[x * 3..x * 3 + 3].copy_from_slice(&c);
+        }
+    });
+    out
+}
+
 /// Largest axis-aligned rectangle of valid pixels (row-histogram method). Returns x0, y0, x1, y1.
 fn largest_rect(mask: &[bool], w: usize, h: usize) -> (usize, usize, usize, usize) {
     let mut heights = vec![0usize; w];
@@ -582,7 +643,9 @@ fn largest_rect(mask: &[bool], w: usize, h: usize) -> (usize, usize, usize, usiz
 
 /// Merge overlapping photos (linear light). `focal_hint` is the focal length in full-size pixels of the first photo,
 /// from EXIF, when known. Returns the panorama and a crop [left, top, right, bottom] that trims the empty edges.
-pub fn stitch(imgs: &[Rgb32FImage], focal_hint: Option<f64>, proj: Projection, max_mp: f64, progress: &dyn Fn(&str)) -> Result<(Rgb32FImage, [f32; 4]), String> {
+/// With `warp`, the empty edges are not cropped away but filled by stretching the panorama out to the frame
+/// (Lightroom's Boundary Warp): see `boundary_warp`.
+pub fn stitch(imgs: &[Rgb32FImage], focal_hint: Option<f64>, proj: Projection, max_mp: f64, warp: bool, progress: &dyn Fn(&str)) -> Result<(Rgb32FImage, [f32; 4]), String> {
     if imgs.len() < 2 {
         return Err("pick at least two photos".into());
     }
@@ -724,6 +787,12 @@ pub fn stitch(imgs: &[Rgb32FImage], focal_hint: Option<f64>, proj: Projection, m
             }
         }
     });
+    if warp {
+        progress("Filling the edges");
+        let out = boundary_warp(&out, &mask, lw, lh);
+        // A hair off each side hides the softness the low-resolution outline leaves at the very edge.
+        return Ok((out, [0.004; 4]));
+    }
     let (x0, y0, x1, y1) = largest_rect(&mask, lw, lh);
     let crop = [x0 as f32 / lw as f32, y0 as f32 / lh as f32, 1.0 - x1 as f32 / lw as f32, 1.0 - y1 as f32 / lh as f32].map(|c| (c + 0.002).min(0.45));
     Ok((out, crop))
@@ -763,7 +832,7 @@ mod tests {
                 image::Rgb(scene(d))
             })
         }).collect();
-        let (pano, crop) = stitch(&views, None, Projection::Cylindrical, 50.0, &|_| {}).unwrap();
+        let (pano, crop) = stitch(&views, None, Projection::Cylindrical, 50.0, false, &|_| {}).unwrap();
         // Three views 26° apart with a ~56° field of view each: about 108° across.
         let want = f * (0.9 + 2.0 * (w as f64 / 2.0 / f).atan());
         assert!(((pano.width() as f64) - want).abs() < want * 0.08, "{} vs {want}", pano.width());
@@ -772,6 +841,18 @@ mod tests {
         let (cx, cy) = (pano.width() / 2, pano.height() / 2);
         let (a, b) = (pano.get_pixel(cx, cy).0, views[1].get_pixel(w / 2, h / 2).0);
         assert!((a[0] - b[0]).abs() < 0.08, "{a:?} {b:?}");
+    }
+
+    /// A picture covering a slanted band of the frame is stretched out to fill all of it.
+    #[test]
+    fn boundary_warp_fills_the_frame() {
+        let (w, h) = (200usize, 100usize);
+        let inside = |x: usize, y: usize| { let t = 10 + x / 10; y >= t && y < 80 + x / 20 };
+        let img = Rgb32FImage::from_fn(w as u32, h as u32, |x, y| image::Rgb(if inside(x as usize, y as usize) { [0.5; 3] } else { [0.0; 3] }));
+        let mask: Vec<bool> = (0..w * h).map(|i| inside(i % w, i / w)).collect();
+        let out = boundary_warp(&img, &mask, w, h);
+        let empty = out.pixels().filter(|p| p.0[0] < 0.25).count();
+        assert!(empty < w * h / 100, "{empty} empty pixels left");
     }
 
     #[test]

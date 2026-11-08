@@ -29,6 +29,8 @@ pub const ACTIONS: &[(&str, &str, &str)] = &[
     ("before", "Before / after", "Backslash"),
     ("clipping", "Show clipping", "J"),
     ("crop", "Crop tool", "R"),
+    ("crop_guide", "Next crop guide", "O"),
+    ("crop_turn", "Turn the crop ratio", "Shift+X"),
     ("heal", "Heal tool", "Q"),
     ("gradient", "Linear mask", "M"),
     ("brush", "Brush mask", "K"),

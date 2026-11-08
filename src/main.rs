@@ -30,6 +30,9 @@ mod geotag;
 mod gallery;
 mod scopes;
 mod sharp;
+mod fill;
+mod dcp;
+mod import;
 
 use develop::Params;
 use image::{DynamicImage, Rgb32FImage, codecs::jpeg::JpegEncoder};
@@ -283,6 +286,50 @@ pub struct ExportOpts {
     /// Command line: straighten each photo with Upright before exporting.
     #[serde(skip)]
     pub upright: Option<upright::Mode>,
+    /// Size by the short edge or by megapixels instead of the long edge (0 = not used).
+    pub short_edge: u32,
+    pub megapixels: f32,
+    /// JPEG: lower the quality until the file is at most this many kilobytes (0 = no limit).
+    pub max_kb: u32,
+    /// Output sharpening for where the picture is going: 0 none, 1 screen, 2 matte paper, 3 glossy paper;
+    /// strength 0 low, 1 standard, 2 high. Applied after resizing, so it suits the final pixel size.
+    pub out_sharp: u8,
+    pub out_sharp_amt: u8,
+    /// Write the creator, copyright and contact details from Metadata (and the photo's title and caption).
+    pub copyright: bool,
+}
+
+/// A saved set of export settings, with the file type (which `ExportOpts` itself doesn't save).
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct ExportPreset {
+    pub name: String,
+    pub ext: String,
+    pub opts: ExportOpts,
+}
+
+impl ExportPreset {
+    fn path() -> Option<PathBuf> {
+        Some(keys::dirs_config()?.join("export-presets.json"))
+    }
+
+    pub fn load_all() -> Vec<ExportPreset> {
+        Self::path().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+    }
+
+    pub fn save_all(list: &[ExportPreset]) -> Result<(), String> {
+        let p = Self::path().ok_or("no settings folder")?;
+        let _ = std::fs::create_dir_all(p.parent().unwrap_or(&p));
+        write_atomic(&p, serde_json::to_string_pretty(list).unwrap_or_default().as_bytes()).map_err(|e| e.to_string())
+    }
+
+    pub fn of(name: &str, o: &ExportOpts) -> ExportPreset {
+        ExportPreset { name: name.trim().to_string(), ext: o.ext.to_string(), opts: o.clone() }
+    }
+
+    /// The settings to export with (the file type put back).
+    pub fn opts(&self) -> ExportOpts {
+        ExportOpts { ext: match self.ext.as_str() { "tif" => "tif", "png" => "png", _ => "jpg" }, ..self.opts.clone() }
+    }
 }
 
 impl Default for ExportOpts {
@@ -291,6 +338,7 @@ impl Default for ExportOpts {
             ext: "jpg", long_edge: 0, quality: 92, hdr: false, canvas: [0, 0], print: [0.0, 0.0, 300.0], print_fill: false,
             wm_text: String::new(), wm_logo: String::new(), wm_pos: 0, wm_size: 4.0, wm_opacity: 70.0,
             name: String::new(), roll: String::new(), meta: false, gps: false, tree: false, upright: None, space: colour::Space::Srgb,
+            short_edge: 0, megapixels: 0.0, max_kb: 0, out_sharp: 0, out_sharp_amt: 1, copyright: true,
         }
     }
 }
@@ -333,9 +381,20 @@ fn render_export_with(full: &Rgb32FImage, p: &Params, o: &ExportOpts, render: im
     // The long edge is for the finished picture: size the source so the cropped photo still reaches it.
     let [l, t, r, b] = develop::crop_of(p);
     let (w, h) = develop::oriented(full.width(), full.height(), p);
-    let crop_long = (w as f32 * (1.0 - l - r)).max(h as f32 * (1.0 - t - b));
+    let (cw0, ch0) = (w as f32 * (1.0 - l - r), h as f32 * (1.0 - t - b));
+    let crop_long = cw0.max(ch0);
+    // Short edge and megapixels become a long edge for this photo's shape.
+    let ratio = crop_long / cw0.min(ch0).max(1.0);
+    let long = if o.short_edge > 0 {
+        (o.short_edge as f32 * ratio).round() as u32
+    } else if o.megapixels > 0.0 {
+        (o.megapixels * 1e6 * ratio).sqrt().round() as u32
+    } else {
+        o.long_edge
+    };
     // A canvas only needs the photo at about the canvas's long side.
-    let want = o.canvas_px().map_or(o.long_edge, |(cw, ch, _)| cw.max(ch));
+    let want = o.canvas_px().map_or(long, |(cw, ch, _)| cw.max(ch));
+    let o = &ExportOpts { long_edge: long, ..o.clone() };
     let o = &ExportOpts { long_edge: if o.long_edge == 0 { want } else { o.long_edge.min(want.max(1)) }, ..o.clone() };
     let out = if o.long_edge == 0 || o.long_edge as f32 >= crop_long {
         render(full, p, 1.0)
@@ -344,6 +403,9 @@ fn render_export_with(full: &Rgb32FImage, p: &Params, o: &ExportOpts, render: im
         render(&src, p, src.width() as f32 / full.width() as f32)
     };
     let mut out = if o.long_edge == 0 { out } else { load::fit(&out, o.long_edge) }; // the border made it larger
+    if o.out_sharp > 0 {
+        output::sharpen_for_output(&mut out, o.out_sharp, o.out_sharp_amt, if o.print[0] > 0.0 { o.print[2] } else { 300.0 });
+    }
     if let Some((w, h, print)) = o.canvas_px() {
         // Social sizes pad with the border's colour (black unless it's white); prints with white paper.
         let white = print || p.border.white || p.border.width <= 0.0;
@@ -383,12 +445,18 @@ pub fn export_description(p: &Params, o: &ExportOpts, src: &Path) -> String {
 pub fn export_embed(p: &Params, o: &ExportOpts, src: &Path) -> output::Embed {
     let mut e = output::Embed { dpi: (o.print[0] > 0.0 && o.canvas[0] == 0).then(|| o.print[2].round() as u16), icc: o.space.icc(), ..Default::default() };
     let location = if o.gps { p.gps.or_else(|| lens::shot(src).and_then(|s| s.gps)) } else { None };
-    if o.meta || location.is_some() {
+    let rights = if o.copyright { output::Rights::for_photo(p) } else { output::Rights::default() };
+    if o.meta || location.is_some() || !rights.is_empty() {
         let mut shot = if o.meta { export_shot(src) } else { lens::Shot::default() };
         shot.gps = location;
-        let desc = if o.meta { export_description(p, o, src) } else { String::new() };
-        e.exif = output::exif_tiff(&shot, &desc);
-        e.xmp = output::xmp_packet(&shot, &desc, &p.keywords);
+        let mut desc = if o.meta { export_description(p, o, src) } else { String::new() };
+        // The photo's own caption comes first; the roll details follow it.
+        if !rights.caption.is_empty() {
+            desc = [rights.caption.clone(), desc].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ");
+        }
+        let kws: &[String] = if o.meta || o.copyright { &p.keywords } else { &[] };
+        e.exif = output::exif_tiff_with(&shot, &desc, &rights);
+        e.xmp = output::xmp_packet_with(&shot, &desc, kws, &rights);
     }
     e
 }
@@ -408,6 +476,12 @@ pub fn write_export(full: &Rgb32FImage, p: &Params, o: &ExportOpts, out: &Path, 
         let bytes = hdr::encode_ultrahdr(&sdr, &hdr::gain_map(&sdr, &low), o.quality.clamp(1, 100), &segs, e.dpi)?;
         return std::fs::write(out, bytes).map_err(|e| e.to_string());
     }
+    if o.max_kb > 0 && o.ext == "jpg" {
+        let img = render_export(full, p, o);
+        jpeg_fits(&img)?;
+        let rgb = DynamicImage::ImageRgb32F(img).to_rgb8();
+        return std::fs::write(out, jpeg_within(&rgb, o.quality, o.max_kb, &e)?).map_err(|e| e.to_string());
+    }
     save_output_with(render_export(full, p, o), out, o.quality, &e)
 }
 
@@ -426,19 +500,50 @@ pub fn save_output_with(img: Rgb32FImage, out: &Path, quality: u8, e: &output::E
         "png" => output::write_png(&dynimg.to_rgb8(), out, e),
         _ => {
             jpeg_fits(dynimg.as_rgb32f().unwrap())?;
-            let mut bytes = vec![];
-            let mut enc = JpegEncoder::new_with_quality(&mut bytes, quality.clamp(1, 100));
-            if let Some(d) = e.dpi {
-                enc.set_pixel_density(image::codecs::jpeg::PixelDensity::dpi(d));
-            }
-            dynimg.to_rgb8().write_with_encoder(enc).map_err(|e| e.to_string())?;
-            let segs = output::jpeg_segments(e);
-            if !segs.is_empty() {
-                bytes = output::insert_segment(&bytes, &segs);
-            }
-            std::fs::write(out, bytes).map_err(|e| e.to_string())
+            let rgb = dynimg.to_rgb8();
+            std::fs::write(out, encode_jpeg(&rgb, quality, e)?).map_err(|e| e.to_string())
         }
     }
+}
+
+/// A JPEG of `rgb` at `quality`, with what `e` holds.
+fn encode_jpeg(rgb: &image::RgbImage, quality: u8, e: &output::Embed) -> Result<Vec<u8>, String> {
+    let mut bytes = vec![];
+    let mut enc = JpegEncoder::new_with_quality(&mut bytes, quality.clamp(1, 100));
+    if let Some(d) = e.dpi {
+        enc.set_pixel_density(image::codecs::jpeg::PixelDensity::dpi(d));
+    }
+    rgb.write_with_encoder(enc).map_err(|e| e.to_string())?;
+    let segs = output::jpeg_segments(e);
+    if !segs.is_empty() {
+        bytes = output::insert_segment(&bytes, &segs);
+    }
+    Ok(bytes)
+}
+
+/// The JPEG at the highest quality (up to `quality`) that fits in `max_kb` kilobytes, found by halving the range.
+/// When even quality 10 is too big, that smallest one is returned: the limit can't be met without resizing.
+pub fn jpeg_within(rgb: &image::RgbImage, quality: u8, max_kb: u32, e: &output::Embed) -> Result<Vec<u8>, String> {
+    let limit = max_kb as usize * 1000;
+    let best = encode_jpeg(rgb, quality, e)?;
+    if best.len() <= limit {
+        return Ok(best);
+    }
+    let (mut lo, mut hi) = (10u8, quality.saturating_sub(1).max(10));
+    let mut found = encode_jpeg(rgb, lo, e)?;
+    if found.len() > limit {
+        return Ok(found);
+    }
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        let b = encode_jpeg(rgb, mid, e)?;
+        if b.len() <= limit {
+            (lo, found) = (mid, b);
+        } else {
+            hi = mid - 1;
+        }
+    }
+    Ok(found)
 }
 
 /// JPEG stores width and height in 16 bits: say so plainly instead of the encoder's error.
@@ -548,7 +653,7 @@ const PANO_MAX_MP: f64 = 150.0;
 
 /// Merge photos into a panorama next to the first one (`IMG_0001-pano.tif`, 16-bit), with a crop that trims the
 /// empty edges saved as its edits. Each photo's lens profile (or one found from its EXIF) is applied first.
-pub fn make_pano(files: &[PathBuf], proj: pano::Projection, progress: &dyn Fn(&str)) -> Result<PathBuf, String> {
+pub fn make_pano(files: &[PathBuf], proj: pano::Projection, warp: bool, progress: &dyn Fn(&str)) -> Result<PathBuf, String> {
     use rayon::prelude::*;
     progress("Loading photos");
     // Memory: 12 bytes a pixel. Six 45 MP frames at full size are 3.2 GB before blending, so the frames share a
@@ -571,7 +676,7 @@ pub fn make_pano(files: &[PathBuf], proj: pano::Projection, progress: &dyn Fn(&s
     // Focal length in pixels from EXIF (35 mm-equivalent width is 36 mm); the alignment refines it.
     let long = imgs[0].width().max(imgs[0].height()) as f64;
     let hint = lens::shot(&files[0]).filter(|s| s.focal > 0.0).and_then(|s| Some(s.focal as f64 * lens::camera_crop(&s)? as f64 / 36.0 * long));
-    let (pano, crop) = pano::stitch(&imgs, hint, proj, PANO_MAX_MP, progress)?;
+    let (pano, crop) = pano::stitch(&imgs, hint, proj, PANO_MAX_MP, warp, progress)?;
     progress("Saving");
     let dir = files[0].parent().unwrap_or(Path::new("."));
     let out = claim_output(dir, &format!("{}-pano", export_stem(&files[0])), "tif")?;
@@ -582,9 +687,50 @@ pub fn make_pano(files: &[PathBuf], proj: pano::Projection, progress: &dyn Fn(&s
     Ok(out)
 }
 
+/// `ferrotype import`: copy photos from a card into dated folders.
+fn cli_import(args: &[String]) -> Result<(), String> {
+    let mut o = import::ImportOpts::load();
+    let (mut src, mut dry) = (None::<PathBuf>, false);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--to" => o.dest = it.next().ok_or("--to needs a folder")?.clone(),
+            "--folders" => o.folders = it.next().ok_or("--folders needs a pattern like {yyyy}/{date}")?.clone(),
+            "--name" => o.name = it.next().ok_or("--name needs a pattern like {date}-{n}")?.clone(),
+            "--backup" => o.backup = it.next().ok_or("--backup needs a folder")?.clone(),
+            "--all" => o.skip_known = false,
+            "--dry-run" => dry = true,
+            f => src = Some(PathBuf::from(f)),
+        }
+    }
+    let src = match src {
+        Some(s) => s,
+        None => import::cards().into_iter().next().ok_or("no memory card found: name the folder to import from")?,
+    };
+    if o.dest.trim().is_empty() {
+        return Err("--to needs a folder".into());
+    }
+    let jobs = import::plan(&src, &o);
+    let new: Vec<&import::Job> = jobs.iter().filter(|j| !(o.skip_known && j.known)).collect();
+    eprintln!("{} photos on {}, {} to import", jobs.len(), src.display(), new.len());
+    if dry {
+        for j in new {
+            println!("{} -> {}", j.from.display(), j.to.display());
+        }
+        return Ok(());
+    }
+    let (done, errs) = import::run(&jobs, &o, &|i, n| if n > 0 && (i % 10 == 0 || i == n) { eprintln!("{i}/{n}") });
+    for e in &errs {
+        eprintln!("{e}");
+    }
+    println!("Imported {} files into {}", done.len(), o.dest);
+    if errs.is_empty() { Ok(()) } else { Err(format!("{} files could not be copied", errs.len())) }
+}
+
 const USAGE: &str = "ferrotype                      open the editor
 ferrotype <folder|file>         open the editor on a folder or photo
-ferrotype export [--out DIR] [--tif|--png|--hdr] [--size PX] [--quality Q] [--neg STOCK] [--lens] [--upright MODE] [--space SPACE] FILES...
+ferrotype export [--out DIR] [--tif|--png|--hdr] [--size PX|--short PX|--mp N] [--quality Q] [--max-kb KB]
+                [--sharpen screen|matte|glossy[:low|:high]] [--preset NAME] [--no-copyright] [--neg STOCK] [--lens] [--upright MODE] [--space SPACE] FILES...
                 [--set instagram|story|portfolio] [--print 8x10|20x30cm] [--dpi N] [--watermark TEXT] [--logo PNG]
                 [--name PATTERN] [--roll N] [--meta] [--gps]
                                 render files with their saved edits (headless); --lens adds the lens profile;
@@ -594,8 +740,12 @@ ferrotype export [--out DIR] [--tif|--png|--hdr] [--size PX] [--quality Q] [--ne
 ferrotype rename --name PATTERN [--roll N] [--dry-run] FILES...
                                 rename photos and their edits from a pattern (tokens as for export)
 ferrotype rename --undo FOLDER  put back the names from the last rename in FOLDER
-ferrotype pano [--projection auto|cylindrical|spherical|perspective] FILES...
-                                merge overlapping photos into FIRST-pano.tif
+ferrotype import [--to DIR] [--folders {yyyy}/{date}] [--name PATTERN] [--backup DIR] [--all] [--dry-run] [CARD]
+                                copy photos from a memory card (found by its DCIM folder) into dated
+                                folders; photos imported before are left out unless --all
+ferrotype pano [--projection auto|cylindrical|spherical|perspective] [--warp] FILES...
+                                merge overlapping photos into FIRST-pano.tif; --warp fills the
+                                empty edges by stretching instead of cropping them off
 ferrotype hdr FILES...          merge an exposure bracket into FIRST-hdr.exr (32-bit, opens like any photo)
 ferrotype hdr --auto FOLDER     find brackets (by capture time and exposure) and merge each
 ferrotype geotag --gpx TRACK.gpx [--offset HOURS] [--dry-run] FILES...
@@ -622,6 +772,22 @@ fn cli_export(args: &[String]) -> Result<(), String> {
             "--hdr" => o.hdr = true,
             "--size" => o.long_edge = it.next().and_then(|v| v.parse().ok()).ok_or("--size needs the long edge in pixels")?,
             "--quality" => o.quality = it.next().and_then(|v| v.parse().ok()).ok_or("--quality needs 1-100")?,
+            "--short" => o.short_edge = it.next().and_then(|v| v.parse().ok()).ok_or("--short needs the short edge in pixels")?,
+            "--mp" => o.megapixels = it.next().and_then(|v| v.parse().ok()).filter(|m: &f32| *m > 0.0).ok_or("--mp needs megapixels, for example 12")?,
+            "--max-kb" => o.max_kb = it.next().and_then(|v| v.parse().ok()).ok_or("--max-kb needs a size in kilobytes")?,
+            "--sharpen" => {
+                let v = it.next().ok_or("--sharpen needs screen, matte or glossy (add :low or :high)")?;
+                let (kind, amt) = v.split_once(':').unwrap_or((v, "standard"));
+                o.out_sharp = match kind { "screen" => 1, "matte" => 2, "glossy" => 3, _ => return Err("--sharpen is screen, matte or glossy".into()) };
+                o.out_sharp_amt = match amt { "low" => 0, "high" => 2, _ => 1 };
+            }
+            "--preset" => {
+                let v = it.next().ok_or("--preset needs the name of a saved export preset")?;
+                let all = ExportPreset::load_all();
+                let pr = all.iter().find(|x| x.name.eq_ignore_ascii_case(v)).ok_or_else(|| format!("no export preset called {v}. Saved: {}", all.iter().map(|x| x.name.as_str()).collect::<Vec<_>>().join(", ")))?;
+                o = ExportOpts { upright: o.upright, ..pr.opts() };
+            }
+            "--no-copyright" => o.copyright = false,
             "--neg" => neg = Some(it.next().ok_or("--neg needs a stock id")?.clone()),
             "--lens" => lens_auto = true,
             "--space" => {
@@ -702,6 +868,40 @@ fn cli_export(args: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jpeg_size_limit_lowers_quality_until_it_fits() {
+        // Noise compresses badly, so quality has to come down to meet a tight limit.
+        let mut n = 1u32;
+        let img = image::RgbImage::from_fn(256, 256, |_, _| { n = n.wrapping_mul(1_103_515_245).wrapping_add(12_345); image::Rgb([(n >> 16) as u8, (n >> 8) as u8, n as u8]) });
+        let e = output::Embed::default();
+        let full = encode_jpeg(&img, 95, &e).unwrap().len();
+        let limit = (full / 3 / 1000) as u32;
+        let small = jpeg_within(&img, 95, limit, &e).unwrap();
+        assert!(small.len() <= limit as usize * 1000, "{} > {} KB", small.len(), limit);
+        assert!(small.len() > limit as usize * 1000 / 2, "not far below the limit either: {}", small.len());
+        // A limit already met keeps the asked-for quality.
+        assert_eq!(jpeg_within(&img, 95, (full / 1000 + 10) as u32, &e).unwrap().len(), full);
+    }
+
+    #[test]
+    fn short_edge_and_megapixels_size_the_export() {
+        let full = Rgb32FImage::new(600, 400);
+        let p = Params { sh_amt: 0.0, ..Default::default() };
+        let by_short = render_export(&full, &p, &ExportOpts { short_edge: 200, ..Default::default() });
+        assert_eq!(by_short.dimensions(), (300, 200));
+        let by_mp = render_export(&full, &p, &ExportOpts { megapixels: 0.06, ..Default::default() });
+        assert_eq!(by_mp.dimensions(), (300, 200));
+    }
+
+    #[test]
+    fn export_presets_keep_their_file_type() {
+        let o = ExportOpts { ext: "tif", long_edge: 2048, out_sharp: 2, ..Default::default() };
+        let pr = ExportPreset::of("  Lab prints ", &o);
+        let back: ExportPreset = serde_json::from_str(&serde_json::to_string(&pr).unwrap()).unwrap();
+        assert_eq!(back.name, "Lab prints");
+        assert!(back.opts() == o, "same settings, TIFF included");
+    }
 
     #[test]
     fn export_never_overwrites() {
@@ -958,10 +1158,11 @@ fn cli_rename(args: &[String]) -> Result<(), String> {
 }
 
 fn cli_pano(args: &[String]) -> Result<(), String> {
-    let (mut proj, mut files) = (pano::Projection::Auto, vec![]);
+    let (mut proj, mut files, mut warp) = (pano::Projection::Auto, vec![], false);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
+            "--warp" => warp = true,
             "--projection" => proj = it.next().and_then(|v| pano::Projection::parse(v)).ok_or("--projection is auto, cylindrical, spherical or perspective")?,
             f => files.push(PathBuf::from(f)),
         }
@@ -969,7 +1170,7 @@ fn cli_pano(args: &[String]) -> Result<(), String> {
     if files.len() < 2 {
         return Err(USAGE.into());
     }
-    let out = make_pano(&files, proj, &|m| eprintln!("{m}…"))?;
+    let out = make_pano(&files, proj, warp, &|m| eprintln!("{m}…"))?;
     println!("{}", out.display());
     Ok(())
 }
@@ -1004,6 +1205,7 @@ fn main() {
         Some("export") => cli_export(&args[1..]),
         Some("contact") => cli_contact(&args[1..]),
         Some("pano") => cli_pano(&args[1..]),
+        Some("import") => cli_import(&args[1..]),
         Some("rename") => cli_rename(&args[1..]),
         Some("hdr") => cli_hdr(&args[1..]),
         Some("stack") => cli_stack(&args[1..]),

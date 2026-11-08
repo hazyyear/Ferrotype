@@ -210,7 +210,9 @@ pub fn dialog(ctx: &egui::Context, id: &str, title: &str, width: f32, body: impl
             });
         });
         ui.add_space(8.0);
-        body(ui);
+        // Tall dialogs (Print with every section open) scroll instead of running off a small screen.
+        let max_h = (ui.ctx().content_rect().height() - 120.0).max(200.0);
+        egui::ScrollArea::vertical().max_height(max_h).min_scrolled_height(max_h).auto_shrink([false, true]).show(ui, |ui| body(ui));
         close
     });
     !(r.inner || r.should_close())

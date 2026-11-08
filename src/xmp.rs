@@ -86,7 +86,11 @@ pub fn parse(x: &str) -> (Option<String>, Params) {
         p.crop = [num(x, "CropLeft").unwrap_or(0.0), num(x, "CropTop").unwrap_or(0.0), 1.0 - num(x, "CropRight").unwrap_or(1.0), 1.0 - num(x, "CropBottom").unwrap_or(1.0)];
     }
     if get(x, "ConvertToGrayscale").as_deref() == Some("True") {
-        p.saturation = -100.0;
+        // Lightroom's B&W mix runs -100..100 like ours, so its values carry straight over.
+        p.bw = true;
+        for (b, name) in ["Red", "Orange", "Yellow", "Green", "Aqua", "Blue", "Purple", "Magenta"].into_iter().enumerate() {
+            set(&mut p.bw_mix[b], &format!("GrayMixer{name}"));
+        }
     }
     for (i, n) in ["ToneCurvePV2012", "ToneCurvePV2012Red", "ToneCurvePV2012Green", "ToneCurvePV2012Blue"].into_iter().enumerate() {
         p.curves[i] = curve(x, n);
