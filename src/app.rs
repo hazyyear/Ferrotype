@@ -849,6 +849,10 @@ fn describe_change(a: &Params, b: &Params) -> (String, String) {
         ("bw", "Black & white"), ("bw_mix", "B&W mix"), ("dcp", "Camera profile"), ("dcp_tone", "Profile tone curve"), ("title", "Title"), ("caption", "Caption"),
     ];
     let changed: Vec<&(&str, &str)> = names.iter().filter(|(k, _)| ja.get(k) != jb.get(k)).collect();
+    // A toner sets several grading values at once: name the toner, not "Colour grading +1".
+    if b.bw && !changed.is_empty() && changed.iter().all(|(k, _)| ["grade", "g_bal"].contains(k)) && let Some(i) = develop::toner_of(b) {
+        return (format!("Toner {}", develop::TONERS[i].0), String::new());
+    }
     match changed.as_slice() {
         [] => ("No change".into(), String::new()),
         [(k, n)] => {
@@ -2021,8 +2025,11 @@ impl App {
                 }
             });
             d.opts.folders = crate::import::LAYOUTS[li].0.to_string();
-            ui.add(egui::TextEdit::singleline(&mut d.opts.name).hint_text("New names (optional), for example {date}-{n}").desired_width(f32::INFINITY));
-            token_chips(ui, &mut d.opts.name);
+            let name_box = ui.add(egui::TextEdit::singleline(&mut d.opts.name).hint_text("New names (optional), for example {date}-{n}").desired_width(f32::INFINITY));
+            // The name tokens only while naming: most imports keep the camera's names.
+            if name_box.has_focus() || !d.opts.name.trim().is_empty() {
+                token_chips(ui, &mut d.opts.name);
+            }
             ui.horizontal(|ui| {
                 let mut on = !d.opts.backup.is_empty();
                 ui.label(RichText::new("Second copy to").size(12.0).color(LABEL)).on_hover_text("A backup of every imported photo, for example on an external drive");
@@ -2042,12 +2049,13 @@ impl App {
             switch_row(ui, "Leave out photos imported before", &mut d.opts.skip_known);
             let (n, new) = d.plan.as_ref().map_or((0, 0), |p| (p.1.len(), p.1.iter().filter(|j| !(d.opts.skip_known && j.known)).count()));
             let first = d.plan.as_ref().and_then(|p| p.1.iter().find(|j| !(d.opts.skip_known && j.known)));
-            ui.label(RichText::new(if looking { "Looking for photos…".to_string() } else if n == 0 { "No photos found there yet.".to_string() } else {
+            ui.label(RichText::new(if looking { "Looking for photos…".to_string() } else if d.src.trim().is_empty() { "Choose a card or folder to import from.".to_string() } else if n == 0 { "No photos found there yet.".to_string() } else {
                 format!("{new} of {n} photos to import{}", first.map(|j| format!(", for example to {}", j.to.strip_prefix(&d.opts.dest).unwrap_or(&j.to).display())).unwrap_or_default())
             }).size(11.5).color(TEXT2));
             ui.label(RichText::new("Nothing on the card is changed or deleted.").size(11.5).color(TEXT3));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                go = primary(ui, "Import", !looking && new > 0 && !d.opts.dest.trim().is_empty()).clicked();
+                let verb = if new > 0 && !looking { format!("Import {new} photo{}", if new == 1 { "" } else { "s" }) } else { "Import".into() };
+                go = primary(ui, &verb, !looking && new > 0 && !d.opts.dest.trim().is_empty()).clicked();
             });
         });
         if go && let Some(d) = self.import_dlg.take() {
@@ -2074,6 +2082,8 @@ impl App {
     fn paste_window(&mut self, ctx: &egui::Context) {
         let Some(sync) = self.paste_dlg else { return };
         let mut go = false;
+        // Sync changes many files at once: the button says how many.
+        let others = self.files.iter().filter(|f| Some(*f) != self.current.as_ref()).count();
         let groups = &mut self.paste_groups;
         let open = dialog(ctx, "paste", if sync { "Sync settings to the folder" } else { "Paste settings" }, 360.0, |ui| {
             ui.label(RichText::new(if sync { "Copy these groups of this photo's settings to every photo in the folder." } else { "Copy these groups of the copied settings to this photo." }).size(12.0).color(TEXT2));
@@ -2085,7 +2095,7 @@ impl App {
                 if small_action(ui, "None", false).clicked() {
                     groups.iter_mut().for_each(|g| *g = false);
                 }
-                if small_action(ui, "Usual", false).on_hover_text("Everything except geometry, retouching and the film conversion").clicked() {
+                if small_action(ui, "Look only", false).on_hover_text("Everything except geometry, retouching and the film conversion").clicked() {
                     *groups = develop::paste_defaults();
                 }
             });
@@ -2098,7 +2108,8 @@ impl App {
             });
             ui.add_space(10.0);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                go = primary(ui, if sync { "Sync" } else { "Paste" }, groups.iter().any(|g| *g)).clicked();
+                let verb = if sync { format!("Sync to {others} photo{}", if others == 1 { "" } else { "s" }) } else { "Paste".into() };
+                go = primary(ui, &verb, groups.iter().any(|g| *g) && (!sync || others > 0)).clicked();
             });
         });
         if go {
@@ -2242,6 +2253,9 @@ impl App {
         // Print here means a file (JPEG, TIFF, PNG), not paper: the title says so, since the Proof menu talks about printers.
         let title = if !all { "Print to file".to_string() } else { format!("Print {n} frame{} to files", if n == 1 { "" } else { "s" }) };
         let open = dialog(ctx, "print", &title, 320.0, |ui| {
+                // The settings scroll; the note and the Print button below them stay in view.
+                let max_h = (ui.ctx().content_rect().height() - 300.0).max(160.0);
+                fit_scroll(ui, "print_body", max_h, |ui| {
                 ui.spacing_mut().item_spacing.y = 8.0;
                 // Saved presets: pick one to use its settings, or save these under a name.
                 ui.horizontal(|ui| {
@@ -2448,6 +2462,7 @@ impl App {
                         ui.checkbox(&mut self.export_sets[k], what);
                     }
                     ui.label(RichText::new("One click makes each set in its own subfolder, padded to shape with the border colour.").size(11.5).color(TEXT2));
+                });
                 });
                 ui.label(RichText::new("Prints hold only the picture and your copyright unless you add the details above. GPS is left out unless you switch it on, and serial numbers are never included.").size(11.5).color(TEXT2));
                 ui.add_space(4.0);
@@ -5557,7 +5572,17 @@ impl App {
         let (has_spots, has_masks) = (!p.spots.is_empty(), !p.masks.is_empty() || !p.brushes.is_empty() || !p.grads.is_empty());
         let changed = |keys: &[&str]| keys.iter().any(|k| match *k { "spots" => has_spots, "masks" => has_masks, _ => pj.get(k) != dj.get(k) });
         egui::ScrollArea::vertical().id_salt("develop_right").auto_shrink([false, false]).show(ui, |ui| {
-            section(ui, "Basic", o_basic, changed(&["temp","tint","exposure","contrast","highlights","shadows","whites","blacks","texture","clarity","dehaze","vibrance","saturation"]), |ui| {
+            section(ui, "Basic", o_basic, changed(&["temp","tint","exposure","contrast","highlights","shadows","whites","blacks","texture","clarity","dehaze","vibrance","saturation","bw"]), |ui| {
+                // Where Lightroom users look for black and white: the same switch as in the mixer below.
+                ui.horizontal(|ui| {
+                    ui.label(caps("Treatment"));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        // Listed right to left, so it reads Colour, B&W on screen.
+                        let mut t = (!p.bw) as usize;
+                        segmented(ui, &mut t, &["B&W", "Colour"]);
+                        p.bw = t == 0;
+                    });
+                });
                 // The eyedropper sits with "As shot" in the group's header, as Lightroom's does: an action, not a field.
                 ui.horizontal(|ui| {
                     ui.label(caps("White balance"));
@@ -5625,22 +5650,32 @@ impl App {
                         let g = move |t: f32| { let c = develop::hsv_to_rgb(h, 0.75, 0.8).map(crate::load::srgb_to_linear); let mut m = [0.0; 8]; m[b] = t; let y = develop::bw_grey(c, &m); lin([y.min(1.0); 3]) };
                         slider_ex(ui, name, Some(hsv(h, 0.7, 0.9)), &mut p.bw_mix[b], -100.0, 100.0, 0.0, Some(&g));
                     }
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new("Filter").size(12.0).color(LABEL));
-                        // The classic filters for black-and-white film, as starting points.
-                        for (name, mix) in [("None", [0.0; 8]), ("Red", [60.0, 40.0, 10.0, -40.0, -50.0, -60.0, -20.0, 30.0]), ("Orange", [40.0, 40.0, 20.0, -20.0, -35.0, -45.0, -15.0, 15.0]), ("Yellow", [15.0, 20.0, 25.0, 0.0, -15.0, -25.0, -10.0, 0.0]), ("Green", [-25.0, -10.0, 15.0, 40.0, 20.0, -10.0, -20.0, -20.0]), ("Blue", [-40.0, -30.0, -20.0, -10.0, 30.0, 50.0, 25.0, 0.0])] {
-                            if small_action(ui, name, p.bw_mix == mix).clicked() {
-                                p.bw_mix = mix;
-                            }
-                        }
+                    // Drop-downs that name what is set now ("Custom" once a slider moves), so the state is never a guess.
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Filter").size(12.0).color(LABEL)).on_hover_text("The coloured filters used on black-and-white film, as starting points for the mixer");
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let cur = develop::BW_FILTERS.iter().find(|f| f.1 == p.bw_mix).map_or("Custom", |f| f.0);
+                            egui::ComboBox::from_id_salt("bw_filter").width(150.0).selected_text(cur).show_ui(ui, |ui| {
+                                for (name, mix) in develop::BW_FILTERS {
+                                    if picked(ui, cur == name, name).clicked() {
+                                        p.bw_mix = mix;
+                                    }
+                                }
+                            });
+                        });
                     });
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new("Tone").size(12.0).color(LABEL));
-                        for (i, t) in develop::TONERS.iter().enumerate() {
-                            if small_action(ui, t.0, false).on_hover_text("Sets the shadows and highlights of Colour grading, so it can be fine-tuned there").clicked() {
-                                develop::apply_toner(p, i);
-                            }
-                        }
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Toner").size(12.0).color(LABEL)).on_hover_text("Sets the shadows and highlights of Colour grading, so it can be fine-tuned there");
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let cur = develop::toner_of(p).map_or("Custom", |i| develop::TONERS[i].0);
+                            egui::ComboBox::from_id_salt("bw_toner").width(150.0).selected_text(cur).show_ui(ui, |ui| {
+                                for (i, t) in develop::TONERS.iter().enumerate() {
+                                    if picked(ui, cur == t.0, t.0).clicked() {
+                                        develop::apply_toner(p, i);
+                                    }
+                                }
+                            });
+                        });
                     });
                     return;
                 }
@@ -5740,9 +5775,11 @@ impl App {
             section(ui, "Crop & transform", o_geo, changed(&["t_vert","t_hor","t_rot","t_scale","flip_h","crop","rot90"]), |ui| {
                 // Upright: found from the photo's straight lines, then written into the three sliders below, so
                 // the result stays adjustable by hand.
-                // The label sits on its own line: six buttons don't fit beside it in a narrow panel.
-                ui.label(caps("Upright"));
-                ui.horizontal_wrapped(|ui| {
+                // "Off" is the group's action, like Crop's Reset, so the five ways to straighten fit on one row.
+                if group(ui, "Upright", Some("Off")) {
+                    (p.t_rot, p.t_vert, p.t_hor, p.t_scale) = (0.0, 0.0, 0.0, 100.0);
+                }
+                ui.horizontal(|ui| {
                     for (m, name) in crate::upright::Mode::ALL.iter() {
                         let tip = match m {
                             crate::upright::Mode::Auto => "Level, plus a gentle fix for leaning verticals when the photo clearly has them",
@@ -5760,9 +5797,6 @@ impl App {
                         *guided = !*guided;
                         crop_tool_on = *guided;
                         guides_clear = true;
-                    }
-                    if small_action(ui, "Off", false).on_hover_text("Rotate, Vertical and Horizontal back to 0, Scale to 100").clicked() {
-                        (p.t_rot, p.t_vert, p.t_hor, p.t_scale) = (0.0, 0.0, 0.0, 100.0);
                     }
                 });
                 if *guided {
@@ -5799,7 +5833,8 @@ impl App {
                         r.changed() || r.gained_focus()
                     };
                     let [mut w, mut h] = *crop_custom;
-                    let changed = edit(ui, &mut w) | { ui.label("×"); edit(ui, &mut h) };
+                    // The sides only show for Custom, so they never look like the ratio of another preset.
+                    let changed = custom && (edit(ui, &mut w) | { ui.label("×"); edit(ui, &mut h) });
                     if changed {
                         *crop_custom = [w, h];
                         a = ASPECTS.len() - 1;
@@ -5841,12 +5876,14 @@ impl App {
                 });
             });
             section(ui, "Heal", o_spot, changed(&["spots"]), |ui| {
+                group(ui, "New marks", None);
                 segmented(ui, heal_mode, &["Heal", "Clone", "Fill", "Red eye"]);
                 slider(ui, "Size", spot_size, 0.5, 10.0, 2.0, None);
                 ui.label(RichText::new(match *heal_mode {
+                    0 => "Heal copies texture from nearby and blends it into the colour around the spot.",
+                    1 => "Clone copies the source exactly, colour and all.",
                     2 => "Fill rebuilds the area from texture around it, for larger things like a sign, a branch or a stain.",
-                    3 => "Click each red pupil with a circle a little larger than the pupil.",
-                    _ => "",
+                    _ => "Click each red pupil with a circle a little larger than the pupil.",
                 }).size(11.5).color(TEXT2));
                 if let Some(sp) = spot_sel.and_then(|i| p.spots.get_mut(i)) {
                     group(ui, "Selected spot", None);
@@ -5866,7 +5903,7 @@ impl App {
                         dust = ui.button("Find dust").on_hover_text("Marks small dark specks (dust on the scan or sensor) for healing").clicked();
                     });
                 });
-                ui.label(RichText::new("Choose Heal in the toolbar, then click a spot or paint over a larger area. Drag the thin source circle to take texture from somewhere else, and right-click a spot to remove it. Clone copies the source exactly, while Heal blends it in.").size(11.5).color(TEXT2));
+                ui.label(RichText::new("Choose Heal in the toolbar, then click a spot or paint over a larger area. Drag the thin source circle to take texture from somewhere else, and right-click a spot to remove it.").size(11.5).color(TEXT2));
             });
             section(ui, "Masks", o_masks, changed(&["masks"]), |ui| {
                 mask_tool_on = masks::masks_panel(ui, mask_ui, p);
@@ -6244,7 +6281,7 @@ impl App {
                 .on_hover_text("Paste the copied settings (Ctrl/Cmd+V), the groups chosen under Paste…").clicked() {
                 self.params = self.params.with_parts_of(self.copied.as_ref().unwrap(), &self.paste_groups);
             }
-            if ui.add_enabled(self.copied.is_some(), egui::Button::new(RichText::new("Paste…").color(TEXT2)).fill(Color32::TRANSPARENT).stroke(Stroke::NONE))
+            if ui.add_enabled(self.copied.is_some(), egui::Button::new(RichText::new("Paste some…").color(TEXT2)).fill(Color32::TRANSPARENT).stroke(Stroke::NONE))
                 .on_hover_text("Choose which settings to paste (Ctrl/Cmd+Shift+V)").clicked() {
                 self.paste_dlg = Some(false);
             }

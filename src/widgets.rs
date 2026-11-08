@@ -197,6 +197,19 @@ pub fn filter_chip(ui: &mut Ui, text: &str, on: bool) -> egui::Response {
 
 /// A dialog: one at a time, over a dimmed page, closed by Esc, a click outside or ×.
 /// Title in Plex Sans 500 on the left, as panels are. Returns false once it should close.
+/// A vertical scroll area as tall as its content, up to `max_h`. egui can't size a
+/// scroll area to content inside a Modal, so this uses last frame's content height.
+pub fn fit_scroll<R>(ui: &mut Ui, salt: &str, max_h: f32, body: impl FnOnce(&mut Ui) -> R) -> R {
+    let key = egui::Id::unique(("fit_scroll", salt));
+    let last: f32 = ui.ctx().data(|d| d.get_temp(key)).unwrap_or(max_h);
+    // A solid bar takes its own space, so it never covers switches at the right edge.
+    let out = ui.scope(|ui| { ui.spacing_mut().scroll = egui::style::ScrollStyle::solid(); egui::ScrollArea::vertical().id_salt(salt).max_height(max_h).min_scrolled_height(last.min(max_h))
+        .auto_shrink([false, true]).show(ui, body) }).inner;
+    let h = out.content_size.y;
+    if (h - last).abs() > 0.5 { ui.ctx().data_mut(|d| d.insert_temp(key, h)); ui.ctx().request_repaint(); }
+    out.inner
+}
+
 pub fn dialog(ctx: &egui::Context, id: &str, title: &str, width: f32, body: impl FnOnce(&mut Ui)) -> bool {
     let frame = egui::Frame::new().fill(PANEL).stroke(Stroke::new(1.0, BORDER)).corner_radius(6).inner_margin(egui::Margin::same(18));
     let r = egui::Modal::new(egui::Id::unique(("dialog", id))).frame(frame).backdrop_color(Color32::from_rgba_unmultiplied(8, 8, 9, 160)).show(ctx, |ui| {
@@ -212,7 +225,7 @@ pub fn dialog(ctx: &egui::Context, id: &str, title: &str, width: f32, body: impl
         ui.add_space(8.0);
         // Tall dialogs (Print with every section open) scroll instead of running off a small screen.
         let max_h = (ui.ctx().content_rect().height() - 120.0).max(200.0);
-        egui::ScrollArea::vertical().max_height(max_h).min_scrolled_height(max_h).auto_shrink([false, true]).show(ui, |ui| body(ui));
+        fit_scroll(ui, "dialog_body", max_h, body);
         close
     });
     !(r.inner || r.should_close())

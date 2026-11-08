@@ -942,6 +942,25 @@ pub const TONERS: [(&str, [f32; 2], [f32; 2], f32); 6] = [
     ("Platinum", [28.0, 18.0], [40.0, 14.0], 10.0),
 ];
 
+/// The classic colour filters for black-and-white film, as grey-mixer settings.
+pub const BW_FILTERS: [(&str, [f32; 8]); 6] = [
+    ("None", [0.0; 8]),
+    ("Red", [60.0, 40.0, 10.0, -40.0, -50.0, -60.0, -20.0, 30.0]),
+    ("Orange", [40.0, 40.0, 20.0, -20.0, -35.0, -45.0, -15.0, 15.0]),
+    ("Yellow", [15.0, 20.0, 25.0, 0.0, -15.0, -25.0, -10.0, 0.0]),
+    ("Green", [-25.0, -10.0, 15.0, 40.0, 20.0, -10.0, -20.0, -20.0]),
+    ("Blue", [-40.0, -30.0, -20.0, -10.0, 30.0, 50.0, 25.0, 0.0]),
+];
+
+/// Which toner the colour grading is set to now, if it is exactly one of them.
+pub fn toner_of(p: &Params) -> Option<usize> {
+    (0..TONERS.len()).find(|&i| {
+        let mut q = p.clone();
+        apply_toner(&mut q, i);
+        q.grade == p.grade && q.g_bal == p.g_bal
+    })
+}
+
 /// Set colour grading to toner `i` (shadows and highlights only; midtones and global are cleared).
 pub fn apply_toner(p: &mut Params, i: usize) {
     let (_, sh, hi, bal) = TONERS[i];
