@@ -2964,7 +2964,7 @@ impl App {
 
     /// A new spot at frame position `f` in the Heal tool's current mode (red eye is a single circle).
     fn new_spot(&self, f: [f32; 2], rad: f32) -> develop::Spot {
-        develop::Spot { x: f[0], y: f[1], r: rad, sx: f[0], sy: f[1], clone: self.heal_mode == 1, fill: self.heal_mode == 2, red_eye: self.heal_mode == 3, ..Default::default() }
+        develop::Spot { x: f[0], y: f[1], r: rad, sx: f[0], sy: f[1], clone: self.heal_mode == 1, fill: self.heal_mode == 2, red_eye: self.heal_mode == 3, avoid: self.heal_mode == 4, ..Default::default() }
     }
 
     /// Automatic source for a spot or stroke: the nearby area whose surroundings match best.
@@ -2997,7 +2997,7 @@ impl App {
         let rad = self.spot_size / 100.0;
         let frame_at = |s: &Self, pos: Pos2| s.to_frame((pos - r.min) / r.size());
         // What's under a screen position: a source (index) or a spot's own area.
-        let source_hit = |s: &Self, pos: Pos2| s.params.spots.iter().rposition(|sp| !sp.fill && !sp.red_eye && sp.points().any(|q| s.to_screen(r, s.source_of(sp, q)).distance(pos) < sp.r * to_px));
+        let source_hit = |s: &Self, pos: Pos2| s.params.spots.iter().rposition(|sp| !sp.fill && !sp.red_eye && !sp.avoid && sp.points().any(|q| s.to_screen(r, s.source_of(sp, q)).distance(pos) < sp.r * to_px));
         let spot_hit = |s: &Self, pos: Pos2| s.params.spots.iter().rposition(|sp| sp.points().any(|q| s.to_screen(r, q).distance(pos) < sp.r * to_px));
         if resp.drag_started()
             && let Some(pos) = ui.input(|i| i.pointer.press_origin())
@@ -3050,7 +3050,7 @@ impl App {
             } else {
                 let f = frame_at(self, pos);
                 let mut sp = self.new_spot(f, rad);
-                if sp.fill || sp.red_eye {
+                if sp.fill || sp.red_eye || sp.avoid {
                     self.params.spots.push(sp);
                     self.spot_sel = Some(self.params.spots.len() - 1);
                 } else if let Some(src) = self.auto_source(&sp) {
@@ -3073,12 +3073,16 @@ impl App {
             let sel = self.spot_sel == Some(i);
             let w = s.r * to_px;
             let target: Vec<Pos2> = s.points().map(|q| self.to_screen(r, q)).collect();
-            let col = if sel { ACCENT } else { Color32::WHITE };
+            // Avoid marks are amber (the warning hue): an area to keep out of, not one to change.
+            let col = if sel { ACCENT } else if s.avoid { WARN } else { Color32::WHITE };
+            let wash = if s.avoid { WARN.gamma_multiply(0.22) } else { Color32::from_white_alpha(28) };
             if target.len() > 1 {
-                pt.add(egui::Shape::line(target.clone(), Stroke::new(w * 2.0, Color32::from_white_alpha(28))));
+                pt.add(egui::Shape::line(target.clone(), Stroke::new(w * 2.0, wash)));
+            } else if s.avoid {
+                pt.circle_filled(target[0], w, wash);
             }
             let dragging_this = matches!(self.heal_drag, Some(HealDrag::Paint(k)) if k == i);
-            if !dragging_this && !s.fill && !s.red_eye {
+            if !dragging_this && !s.fill && !s.red_eye && !s.avoid {
                 let source: Vec<Pos2> = s.points().map(|q| self.to_screen(r, self.source_of(s, q))).collect();
                 pt.line_segment([target[0], source[0]], Stroke::new(1.0, Color32::from_white_alpha(90)));
                 if source.len() > 1 {
@@ -5883,19 +5887,20 @@ impl App {
             });
             section(ui, "Heal", o_spot, changed(&["spots"]), |ui| {
                 group(ui, "New marks", None);
-                segmented(ui, heal_mode, &["Heal", "Clone", "Fill", "Red eye"]);
+                segmented(ui, heal_mode, &["Heal", "Clone", "Fill", "Red eye", "Avoid"]);
                 slider(ui, "Size", spot_size, 0.5, 10.0, 2.0, None);
                 ui.label(RichText::new(match *heal_mode {
                     0 => "Heal copies texture from nearby and blends it into the colour around the spot.",
                     1 => "Clone copies the source exactly, colour and all.",
                     2 => "Fill rebuilds the area from texture around it, for larger things like a sign, a branch or a stain.",
-                    _ => "Click each red pupil with a circle a little larger than the pupil.",
+                    3 => "Click each red pupil with a circle a little larger than the pupil.",
+                    _ => "Avoid marks what Fill must never copy from, like a person next to the area. It changes nothing by itself.",
                 }).size(11.5).color(TEXT2));
                 if let Some(sp) = spot_sel.and_then(|i| p.spots.get_mut(i)) {
                     group(ui, "Selected spot", None);
-                    let mut m = if sp.red_eye { 3 } else if sp.fill { 2 } else { sp.clone as usize };
-                    segmented(ui, &mut m, &["Heal", "Clone", "Fill", "Red eye"]);
-                    (sp.clone, sp.fill, sp.red_eye) = (m == 1, m == 2, m == 3);
+                    let mut m = if sp.avoid { 4 } else if sp.red_eye { 3 } else if sp.fill { 2 } else { sp.clone as usize };
+                    segmented(ui, &mut m, &["Heal", "Clone", "Fill", "Red eye", "Avoid"]);
+                    (sp.clone, sp.fill, sp.red_eye, sp.avoid) = (m == 1, m == 2, m == 3, m == 4);
                     if m < 2 {
                         slider(ui, "Source angle", &mut sp.angle, -180.0, 180.0, 0.0, None);
                     }

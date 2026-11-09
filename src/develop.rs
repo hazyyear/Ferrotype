@@ -192,6 +192,10 @@ pub struct Spot {
     /// Red eye: take the red out of a flash-lit pupil inside the circle and darken it.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub red_eye: bool,
+    /// Don't sample: marks an area that fills may not copy from (the thing to remove, a face, a sign); it changes
+    /// nothing by itself.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub avoid: bool,
     /// Which of the possible fills to use ("Try another" counts it up); 0 is the first.
     #[serde(skip_serializing_if = "is_zero_u32")]
     pub variant: u32,
@@ -674,9 +678,13 @@ fn heal(img: &mut Rgb32FImage, p: &Params, full: (usize, usize), off: (f32, f32)
     let (fw, fh, ox, oy) = frame_of(p, full.0, full.1);
     let (ox, oy) = (ox + off.0, oy + off.1);
     let src = img.clone();
+    let to_px = |s: &Spot| -> (Vec<[f32; 2]>, f32) { (s.points().map(|q| [q[0] * fw - ox, q[1] * fh - oy]).collect(), (s.r * fw.max(fh)).max(1.5)) };
+    let avoid: Vec<(Vec<[f32; 2]>, f32)> = p.spots.iter().filter(|s| s.avoid).map(to_px).collect();
     for s in &p.spots {
-        let r = (s.r * fw.max(fh)).max(1.5);
-        let pts: Vec<[f32; 2]> = s.points().map(|q| [q[0] * fw - ox, q[1] * fh - oy]).collect();
+        if s.avoid {
+            continue;
+        }
+        let (pts, r) = to_px(s);
         if s.red_eye {
             red_eye(img, pts[0], r);
             continue;
@@ -684,7 +692,7 @@ fn heal(img: &mut Rgb32FImage, p: &Params, full: (usize, usize), off: (f32, f32)
         if s.fill {
             // Seeded by where the spot is, so the same fill comes back on every render.
             let seed = (s.x * 9_973.0 + s.y * 7_919.0).to_bits() ^ s.variant.wrapping_mul(0x9E37_79B9);
-            crate::fill::fill(img, &pts, r, seed);
+            crate::fill::fill_avoiding(img, &pts, r, seed, &avoid);
             continue;
         }
         let (tx, ty, sx, sy) = (pts[0][0], pts[0][1], s.sx * fw - ox, s.sy * fh - oy);
