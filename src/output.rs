@@ -177,7 +177,7 @@ pub fn file_name(pattern: &str, path: &Path, n: usize, roll: &str, p: &Params, s
 }
 
 /// The file's modification date, YYYY-MM-DD.
-fn file_date(path: &Path) -> String {
+pub(crate) fn file_date(path: &Path) -> String {
     std::fs::metadata(crate::load::copy_of(path).as_deref().unwrap_or(path)).and_then(|m| m.modified()).ok()
         .map(|t| {
             let days = t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() / 86400).unwrap_or(0) as i64;
@@ -233,9 +233,120 @@ fn rational(v: f32) -> (u32, u32) {
 /// The camera details as a TIFF-structured EXIF block (little-endian): description, make, model and software in
 /// IFD0; exposure time, f-number, ISO, date taken, focal length and lens in the Exif IFD. For a JPEG APP1 segment
 /// (after "Exif\0\0") or a PNG eXIf chunk.
+#[cfg(test)]
 pub fn exif_tiff(shot: &Shot, description: &str) -> Vec<u8> {
+    exif_tiff_with(shot, description, &Rights::default())
+}
+
+/// Who made the photo and who may use it: the photographer's details (saved once, in Metadata) and the photo's
+/// own title and caption. Written into exports as EXIF Artist and Copyright and as XMP / IPTC Core fields.
+#[derive(Clone, Default, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Rights {
+    pub creator: String,
+    pub copyright: String,
+    pub email: String,
+    pub url: String,
+    pub usage: String,
+    #[serde(skip)]
+    pub title: String,
+    #[serde(skip)]
+    pub caption: String,
+}
+
+impl Rights {
+    fn path() -> Option<std::path::PathBuf> {
+        Some(crate::keys::dirs_config()?.join("metadata.json"))
+    }
+
+    /// The photographer's saved details.
+    pub fn load() -> Rights {
+        Self::path().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+    }
+
+    pub fn save(&self) -> Result<(), String> {
+        let p = Self::path().ok_or("no settings folder")?;
+        let _ = std::fs::create_dir_all(p.parent().unwrap_or(&p));
+        crate::keep_if_damaged::<Rights>(&p).map_err(|e| e.to_string())?;
+        crate::write_atomic(&p, serde_json::to_string_pretty(self).unwrap_or_default().as_bytes()).map_err(|e| e.to_string())
+    }
+
+    /// The saved details plus this photo's title and caption. `{year}` in the copyright becomes this year.
+    pub fn for_photo(p: &Params) -> Rights {
+        let mut r = Rights::load();
+        r.copyright = r.copyright.replace("{year}", &crate::output::this_year());
+        (r.title, r.caption) = (p.title.trim().to_string(), p.caption.trim().to_string());
+        r
+    }
+
+    pub fn is_empty(&self) -> bool {
+        [&self.creator, &self.copyright, &self.email, &self.url, &self.usage, &self.title, &self.caption].iter().all(|v| v.trim().is_empty())
+    }
+}
+
+/// The current year, from the system clock (UTC).
+pub fn this_year() -> String {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    // Days since 1970 → civil year (Howard Hinnant's algorithm, year part only).
+    let z = (secs / 86_400) as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let y = yoe + era * 400 + if mp >= 10 { 1 } else { 0 };
+    y.to_string()
+}
+
+/// Output sharpening for the medium: an unsharp mask whose radius suits a screen (0) or a print at `dpi`
+/// (matte paper spreads ink more, so it gets a wider radius than glossy). `kind` 1 screen, 2 matte, 3 glossy;
+/// `amt` 0 low, 1 standard, 2 high.
+pub fn sharpen_for_output(img: &mut Rgb32FImage, kind: u8, amt: u8, dpi: f32) {
+    let k = (dpi / 300.0).clamp(0.5, 2.0);
+    let (sigma, amounts) = match kind {
+        1 => (0.6, [0.25, 0.45, 0.7]),
+        2 => (1.1 * k, [0.5, 0.8, 1.2]),
+        _ => (0.8 * k, [0.4, 0.65, 1.0]),
+    };
+    let a = amounts[amt.min(2) as usize];
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    if w < 3 || h < 3 {
+        return;
+    }
+    // Sharpen brightness only, so edges don't pick up colour fringes. Not clipped here: a wide-gamut export
+    // still holds colours outside sRGB (as values below 0 or above 1) until it is converted to its space.
+    let y: Vec<f32> = img.pixels().map(|p| crate::develop::luma(p.0)).collect();
+    let b = gauss(&y, w, h, sigma);
+    for (i, px) in img.pixels_mut().enumerate() {
+        let d = (y[i] - b[i]) * a;
+        px.0 = px.0.map(|v| v + d);
+    }
+}
+
+/// A small Gaussian blur (the pipeline's `blur` is built for wide radii).
+fn gauss(v: &[f32], w: usize, h: usize, sigma: f32) -> Vec<f32> {
+    let r = (sigma * 3.0).ceil().max(1.0) as i64;
+    let k: Vec<f32> = (-r..=r).map(|i| (-(i * i) as f32 / (2.0 * sigma * sigma)).exp()).collect();
+    let sum: f32 = k.iter().sum();
+    let k: Vec<f32> = k.iter().map(|x| x / sum).collect();
+    use rayon::prelude::*;
+    let pass = |src: &[f32], horiz: bool| -> Vec<f32> {
+        (0..w * h).into_par_iter().map(|i| {
+            let (x, y) = ((i % w) as i64, (i / w) as i64);
+            k.iter().enumerate().map(|(j, kv)| {
+                let d = j as i64 - r;
+                let (xx, yy) = if horiz { ((x + d).clamp(0, w as i64 - 1), y) } else { (x, (y + d).clamp(0, h as i64 - 1)) };
+                src[yy as usize * w + xx as usize] * kv
+            }).sum()
+        }).collect()
+    };
+    pass(&pass(v, true), false)
+}
+
+/// `exif_tiff`, plus the creator (Artist) and copyright from `r`.
+pub fn exif_tiff_with(shot: &Shot, description: &str, r: &Rights) -> Vec<u8> {
     let mut ifd0: Vec<(u16, Val)> = vec![];
-    for (tag, v) in [(0x010Eu16, description), (0x010F, shot.make.as_str()), (0x0110, shot.model.as_str()), (0x0131, "Ferrotype")] {
+    for (tag, v) in [(0x010Eu16, description), (0x010F, shot.make.as_str()), (0x0110, shot.model.as_str()), (0x0131, "Ferrotype"), (0x013B, r.creator.as_str()), (0x8298, r.copyright.as_str())] {
         if !v.trim().is_empty() {
             ifd0.push((tag, Val::Ascii(v.trim().to_string())));
         }
@@ -352,7 +463,13 @@ pub fn exif_segment(shot: &Shot, description: &str) -> Vec<u8> {
 
 /// The same details as an XMP packet, plus keywords: what TIFF and PNG exports carry (and what Lightroom, Bridge
 /// and exiftool read from them).
+#[cfg(test)]
 pub fn xmp_packet(shot: &Shot, description: &str, keywords: &[String]) -> String {
+    xmp_packet_with(shot, description, keywords, &Rights::default())
+}
+
+/// `xmp_packet`, plus title, creator, copyright, usage terms and contact details (IPTC Core), as Lightroom writes them.
+pub fn xmp_packet_with(shot: &Shot, description: &str, keywords: &[String], r: &Rights) -> String {
     let mut attrs = vec![("xmp:CreatorTool", "Ferrotype".to_string())];
     let mut add = |k: &'static str, v: String| {
         if !v.trim().is_empty() {
@@ -390,13 +507,37 @@ pub fn xmp_packet(shot: &Shot, description: &str, keywords: &[String]) -> String
         }
     }
     let mut x = String::from("<?xpacket begin=\"\u{feff}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\n<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n");
-    x += "<rdf:Description rdf:about=\"\" xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:tiff=\"http://ns.adobe.com/tiff/1.0/\" xmlns:exif=\"http://ns.adobe.com/exif/1.0/\" xmlns:exifEX=\"http://cipa.jp/exif/1.0/\" xmlns:aux=\"http://ns.adobe.com/exif/1.0/aux/\"";
+    x += "<rdf:Description rdf:about=\"\" xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:tiff=\"http://ns.adobe.com/tiff/1.0/\" xmlns:exif=\"http://ns.adobe.com/exif/1.0/\" xmlns:exifEX=\"http://cipa.jp/exif/1.0/\" xmlns:aux=\"http://ns.adobe.com/exif/1.0/aux/\" xmlns:xmpRights=\"http://ns.adobe.com/xap/1.0/rights/\" xmlns:Iptc4xmpCore=\"http://iptc.org/std/Iptc4xmpCore/1.0/xmlns/\"";
     for (k, v) in &attrs {
         x += &format!("\n  {k}=\"{}\"", crate::xmp::escape(v));
     }
     x += ">\n";
     if shot.iso > 0.0 {
         x += &format!("<exif:ISOSpeedRatings><rdf:Seq><rdf:li>{}</rdf:li></rdf:Seq></exif:ISOSpeedRatings>\n", shot.iso.round());
+    }
+    let alt = |tag: &str, v: &str| format!("<{tag}><rdf:Alt><rdf:li xml:lang=\"x-default\">{}</rdf:li></rdf:Alt></{tag}>\n", crate::xmp::escape(v.trim()));
+    if !r.title.trim().is_empty() {
+        x += &alt("dc:title", &r.title);
+    }
+    if !r.creator.trim().is_empty() {
+        x += &format!("<dc:creator><rdf:Seq><rdf:li>{}</rdf:li></rdf:Seq></dc:creator>\n", crate::xmp::escape(r.creator.trim()));
+    }
+    if !r.copyright.trim().is_empty() {
+        x += &alt("dc:rights", &r.copyright);
+        x += "<xmpRights:Marked>True</xmpRights:Marked>\n";
+    }
+    if !r.usage.trim().is_empty() {
+        x += &alt("xmpRights:UsageTerms", &r.usage);
+    }
+    if !r.email.trim().is_empty() || !r.url.trim().is_empty() {
+        x += "<Iptc4xmpCore:CreatorContactInfo rdf:parseType=\"Resource\">";
+        if !r.email.trim().is_empty() {
+            x += &format!("<Iptc4xmpCore:CiEmailWork>{}</Iptc4xmpCore:CiEmailWork>", crate::xmp::escape(r.email.trim()));
+        }
+        if !r.url.trim().is_empty() {
+            x += &format!("<Iptc4xmpCore:CiUrlWork>{}</Iptc4xmpCore:CiUrlWork>", crate::xmp::escape(r.url.trim()));
+        }
+        x += "</Iptc4xmpCore:CreatorContactInfo>\n";
     }
     if !description.trim().is_empty() {
         x += &format!("<dc:description><rdf:Alt><rdf:li xml:lang=\"x-default\">{}</rdf:li></rdf:Alt></dc:description>\n", crate::xmp::escape(description.trim()));
@@ -513,6 +654,32 @@ pub fn insert_segment(jpeg: &[u8], seg: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copyright_and_contact_are_written() {
+        let r = Rights { creator: "Ana Silva".into(), copyright: "© 2026 Ana Silva".into(), email: "ana@example.com".into(), url: "https://ana.example".into(), usage: "All rights reserved".into(), title: "Harbour at dusk".into(), caption: String::new() };
+        let x = xmp_packet_with(&Shot::default(), "", &[], &r);
+        for want in ["<dc:creator><rdf:Seq><rdf:li>Ana Silva</rdf:li>", "<dc:rights><rdf:Alt><rdf:li xml:lang=\"x-default\">© 2026 Ana Silva", "<Iptc4xmpCore:CiEmailWork>ana@example.com", "<dc:title>", "xmpRights:UsageTerms"] {
+            assert!(x.contains(want), "missing {want} in {x}");
+        }
+        let e = exif_tiff_with(&Shot::default(), "", &r);
+        let has = |s: &str| e.windows(s.len()).any(|w| w == s.as_bytes());
+        assert!(has("Ana Silva") && has("© 2026 Ana Silva"));
+        assert!(Rights::default().is_empty());
+        assert_eq!(this_year().len(), 4);
+    }
+
+    #[test]
+    fn output_sharpening_adds_edge_contrast() {
+        let mut img = Rgb32FImage::from_fn(32, 8, |x, _| image::Rgb([if x < 16 { 0.3 } else { 0.6 }; 3]));
+        sharpen_for_output(&mut img, 1, 1, 300.0);
+        assert!(img.get_pixel(15, 4).0[0] < 0.3 && img.get_pixel(16, 4).0[0] > 0.6, "{:?} {:?}", img.get_pixel(15, 4), img.get_pixel(16, 4));
+        assert!((img.get_pixel(2, 4).0[0] - 0.3).abs() < 1e-4, "flat areas are left alone");
+        // A colour outside sRGB (a negative channel, as a wide-gamut render holds it) survives sharpening.
+        let mut wide = Rgb32FImage::from_pixel(16, 16, image::Rgb([0.9, -0.2, 0.1]));
+        sharpen_for_output(&mut wide, 1, 2, 300.0);
+        assert!(wide.get_pixel(8, 8).0[1] < -0.19, "{:?}", wide.get_pixel(8, 8));
+    }
 
     #[test]
     fn names_from_a_pattern() {
