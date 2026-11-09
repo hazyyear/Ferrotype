@@ -853,6 +853,12 @@ fn describe_change(a: &Params, b: &Params) -> (String, String) {
     if b.bw && !changed.is_empty() && changed.iter().all(|(k, _)| ["grade", "g_bal"].contains(k)) && let Some(i) = develop::toner_of(b) {
         return (format!("Toner {}", develop::TONERS[i].0), String::new());
     }
+    // Only a fill's variant moved: "Try another fill".
+    if a.spots.len() == b.spots.len() && a.spots.iter().zip(&b.spots).any(|(x, y)| x.variant != y.variant)
+        && a.spots.iter().zip(&b.spots).all(|(x, y)| develop::Spot { variant: y.variant, ..x.clone() } == *y)
+        && changed.iter().all(|(k, _)| *k == "spots") {
+        return ("Another fill".into(), String::new());
+    }
     match changed.as_slice() {
         [] => ("No change".into(), String::new()),
         [(k, n)] => {
@@ -5892,6 +5898,10 @@ impl App {
                     (sp.clone, sp.fill, sp.red_eye) = (m == 1, m == 2, m == 3);
                     if m < 2 {
                         slider(ui, "Source angle", &mut sp.angle, -180.0, 180.0, 0.0, None);
+                    }
+                    if m == 2 && ui.add(egui::Button::new("Try another fill").min_size(vec2(ui.available_width(), 28.0)))
+                        .on_hover_text("Build this fill again from different matches; undo goes back").clicked() {
+                        sp.variant = sp.variant.wrapping_add(1);
                     }
                 }
                 ui.horizontal(|ui| {

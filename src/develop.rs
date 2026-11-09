@@ -192,6 +192,13 @@ pub struct Spot {
     /// Red eye: take the red out of a flash-lit pupil inside the circle and darken it.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub red_eye: bool,
+    /// Which of the possible fills to use ("Try another" counts it up); 0 is the first.
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    pub variant: u32,
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 
 impl Spot {
@@ -676,7 +683,7 @@ fn heal(img: &mut Rgb32FImage, p: &Params, full: (usize, usize), off: (f32, f32)
         }
         if s.fill {
             // Seeded by where the spot is, so the same fill comes back on every render.
-            let seed = (s.x * 9_973.0 + s.y * 7_919.0).to_bits();
+            let seed = (s.x * 9_973.0 + s.y * 7_919.0).to_bits() ^ s.variant.wrapping_mul(0x9E37_79B9);
             crate::fill::fill(img, &pts, r, seed);
             continue;
         }
