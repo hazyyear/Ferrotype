@@ -162,7 +162,9 @@ fn sources(l: &Level) -> Vec<bool> {
 
 /// What the matched patches say each pixel should be: a weighted sum and the total weight, for the hole and for
 /// the ring of real pixels the hole's patches reach over. A match counts less the worse it is.
-fn vote(l: &Level, holes: &[(i32, i32)], nnf: &[M], cost: &[f32]) -> Vec<[f32; 4]> {
+/// With `best`, each pixel instead takes its value from the one best-matched patch over it (Newson et al.
+/// 2014): averaging many patches blurs grain and fine texture, so the finest level's last pass copies.
+fn vote(l: &Level, holes: &[(i32, i32)], nnf: &[M], cost: &[f32], best: bool) -> Vec<[f32; 4]> {
     // Scale the weights by a typical match cost (the 75th percentile), so they work at any brightness.
     let mut cs: Vec<f32> = holes.iter().map(|&(x, y)| cost[(y * l.w + x) as usize]).filter(|c| c.is_finite()).collect();
     let typical = if cs.is_empty() {
@@ -173,6 +175,28 @@ fn vote(l: &Level, holes: &[(i32, i32)], nnf: &[M], cost: &[f32]) -> Vec<[f32; 4
     };
     let scale = 1.0 / (2.0 * typical + 1e-9);
     let mut acc = vec![[0.0f32; 4]; (l.w * l.h) as usize];
+    if best {
+        let mut low = vec![f32::INFINITY; (l.w * l.h) as usize];
+        for &(x, y) in holes {
+            let i = (y * l.w + x) as usize;
+            let (m, s) = (nnf[i], nnf[i].sx());
+            for dy in -HALF..=HALF {
+                for dx in -HALF..=HALF {
+                    let (tx, ty) = (x + dx, y + dy);
+                    if tx < 0 || ty < 0 || tx >= l.w || ty >= l.h {
+                        continue;
+                    }
+                    let t = (ty * l.w + tx) as usize;
+                    if cost[i] < low[t] {
+                        low[t] = cost[i];
+                        let c = l.at(m.x + s * dx, m.y + dy);
+                        acc[t] = [c[0], c[1], c[2], 1.0];
+                    }
+                }
+            }
+        }
+        return acc;
+    }
     for &(x, y) in holes {
         let i = (y * l.w + x) as usize;
         let m = nnf[i];
@@ -196,7 +220,7 @@ fn vote(l: &Level, holes: &[(i32, i32)], nnf: &[M], cost: &[f32]) -> Vec<[f32; 4
 
 /// Run PatchMatch on one level: improve the match `nnf` of every hole pixel, then rebuild the hole from the
 /// matched patches. Returns the last vote and the hole pixels, for the blend.
-fn patchmatch(l: &mut Level, nnf: &mut [M], rng: &mut Rng, iters: usize) -> Option<(Vec<[f32; 4]>, Vec<(i32, i32)>)> {
+fn patchmatch(l: &mut Level, nnf: &mut [M], rng: &mut Rng, iters: usize, finest: bool) -> Option<(Vec<[f32; 4]>, Vec<(i32, i32)>)> {
     let ok = sources(l);
     if !ok.iter().any(|v| *v) {
         return None;
@@ -253,7 +277,7 @@ fn patchmatch(l: &mut Level, nnf: &mut [M], rng: &mut Rng, iters: usize) -> Opti
                 rad /= 2;
             }
         }
-        let acc = vote(l, &holes, nnf, &cost);
+        let acc = vote(l, &holes, nnf, &cost, finest && it + 1 == iters);
         for &(x, y) in &holes {
             let i = (y * l.w + x) as usize;
             if acc[i][3] > 0.0 {
@@ -328,6 +352,36 @@ fn blend(l: &mut Level, acc: &[[f32; 4]], holes: &[(i32, i32)], r: f32) {
         for i in 0..n {
             if !l.hole[i] && acc[i][3] > 0.0 && size(c[i]) > limit {
                 (c[i], known[i]) = ([0.0; 3], false);
+            }
+        }
+    }
+    // The difference wanted is a tone shift, not grain: one pixel's difference is mostly grain or noise, and
+    // spread into the hole it would leave blotches. So average it along the ring over a few pixels first.
+    let ring: Vec<bool> = (0..n).map(|i| !l.hole[i] && acc[i][3] > 0.0).collect();
+    let rad = ((r * 0.25) as i32).max(4);
+    let (w, h) = (l.w as usize, l.h as usize);
+    // Summed tables of the kept differences and of how many were kept.
+    let mut sum = vec![[0.0f64; 4]; (w + 1) * (h + 1)];
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            let v = if ring[i] && known[i] { [c[i][0] as f64, c[i][1] as f64, c[i][2] as f64, 1.0] } else { [0.0; 4] };
+            let (a, b, d) = (sum[y * (w + 1) + x + 1], sum[(y + 1) * (w + 1) + x], sum[y * (w + 1) + x]);
+            sum[(y + 1) * (w + 1) + x + 1] = [0, 1, 2, 3].map(|k| v[k] + a[k] + b[k] - d[k]);
+        }
+    }
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            if !ring[i] {
+                continue;
+            }
+            let (x0, y0) = ((x as i32 - rad).max(0) as usize, (y as i32 - rad).max(0) as usize);
+            let (x1, y1) = ((x as i32 + rad + 1).min(l.w) as usize, (y as i32 + rad + 1).min(l.h) as usize);
+            let at = |xx: usize, yy: usize| sum[yy * (w + 1) + xx];
+            let t = [0, 1, 2, 3].map(|k| at(x1, y1)[k] - at(x0, y1)[k] - at(x1, y0)[k] + at(x0, y0)[k]);
+            if t[3] > 0.5 {
+                (c[i], known[i]) = ([0, 1, 2].map(|k| (t[k] / t[3]) as f32), true);
             }
         }
     }
@@ -444,7 +498,7 @@ pub fn fill(img: &mut Rgb32FImage, pts: &[[f32; 2]], r: f32, seed: u32) {
             f.grads();
             nnf = up;
         }
-        let out = patchmatch(&mut levels[k], &mut nnf, &mut rng, if k == 0 { 3 } else { 5 });
+        let out = patchmatch(&mut levels[k], &mut nnf, &mut rng, if k == 0 { 3 } else { 5 }, k == 0);
         if k == 0 {
             if let Some((acc, holes)) = out {
                 blend(&mut levels[0], &acc, &holes, r);
@@ -531,10 +585,48 @@ mod tests {
         assert!(worst < 0.012, "worst row offset {worst}");
     }
 
+    /// On film grain the fill keeps the brightness and most of the grain: copying the best patch at the end
+    /// instead of averaging keeps grain, and the edge correction only carries the tone, not single grains.
+    #[test]
+    fn keeps_grain_and_brightness() {
+        let grain = |x: u32, y: u32, s: u32| {
+            let mut h = x.wrapping_mul(374_761_393) ^ y.wrapping_mul(668_265_263) ^ s.wrapping_mul(2_246_822_519);
+            h = (h ^ (h >> 13)).wrapping_mul(1_274_126_177);
+            h ^= h >> 16;
+            (0..4).map(|k| ((h >> (8 * k)) & 0xff) as f32 / 255.0 - 0.5).sum::<f32>()
+        };
+        let stats = |img: &Rgb32FImage, a: u32, b: u32| {
+            let v: Vec<f32> = (a..b).flat_map(|y| (a..b).map(move |x| (x, y))).map(|(x, y)| img.get_pixel(x, y).0[1]).collect();
+            let m = v.iter().sum::<f32>() / v.len() as f32;
+            (m, (v.iter().map(|q| (q - m).powi(2)).sum::<f32>() / v.len() as f32).sqrt())
+        };
+        let (mut off, mut kept) = (0.0, 0.0);
+        for seed in 1..=6u32 {
+            let mut img = Rgb32FImage::from_fn(200, 200, |x, y| {
+                let v = 0.18 * (1.0 + 0.6 * grain(x, y, seed));
+                image::Rgb([v, v, v])
+            });
+            let (m0, s0) = stats(&img, 70, 130);
+            for y in 85..115 {
+                for x in 85..115 {
+                    img.put_pixel(x, y, image::Rgb([0.9, 0.9, 0.9]));
+                }
+            }
+            fill(&mut img, &[[100.0, 100.0]], 24.0, seed);
+            let (m1, s1) = stats(&img, 88, 112);
+            (off, kept) = (off + (m1 / m0 - 1.0).abs() / 6.0, kept + s1 / s0 / 6.0);
+        }
+        // Before: 4% off on average (9% at worst) and 61% of the grain.
+        assert!(off < 0.025, "brightness off by {off}");
+        assert!(kept > 0.75, "grain kept {kept}");
+    }
+
     /// A different variant gives a different fill of the same spot, and the same variant the same one.
     #[test]
     fn another_seed_gives_another_fill() {
-        let make = || Rgb32FImage::from_fn(120, 120, |x, y| image::Rgb([((x * 5 + y * 11) % 17) as f32 / 17.0, ((x * 3 + y) % 7) as f32 / 7.0, 0.4]));
+        // Irregular texture: on an exactly repeating pattern every seed finds the same perfect matches.
+        let n = |x: u32, y: u32| ((x.wrapping_mul(2_654_435_761) ^ y.wrapping_mul(40_503)).wrapping_mul(2_246_822_519) >> 24) as f32 / 255.0;
+        let make = || Rgb32FImage::from_fn(120, 120, |x, y| image::Rgb([n(x / 2, y / 2), n(y, x) * 0.5, 0.4]));
         let (mut a, mut b) = (make(), make());
         fill(&mut a, &[[60.0, 60.0]], 10.0, 1);
         fill(&mut b, &[[60.0, 60.0]], 10.0, 1 ^ 0x9E37_79B9);
