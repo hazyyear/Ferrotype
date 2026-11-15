@@ -66,6 +66,12 @@ pub(super) struct DirectUi {
     oversample: u32,
     linear: bool,
     infrared: bool,
+    /// Whole passes over each frame, averaged (USB).
+    passes: u32,
+    /// Focus check: the holder height being tested (1 to 5), and each tested height's edge strength.
+    focus_height: u32,
+    focus: Vec<(u32, f32)>,
+    focus_done: bool,
     /// Frame size change in percent (+ adds room around the frame, − crops into it).
     overage: f32,
     /// Shift of every frame box, in millimetres (film never sits exactly where the holder was measured).
@@ -87,13 +93,27 @@ impl Default for DirectUi {
         DirectUi {
             devices: None, looking: false, note: None, key: String::new(), usb: None, sane_opts: None,
             sane: scanner::Settings { depth: 16, resolution: 2400, passes: 1, linear: true, ..Default::default() },
-            layout: 0, frames: BTreeSet::new(), dpi: 3200, oversample: 1, linear: true, infrared: true, overage: 4.0, nudge: [0.0; 2],
+            layout: 0, frames: BTreeSet::new(), dpi: 3200, oversample: 1, linear: true, infrared: true, passes: 1, focus_height: 3, focus: vec![], focus_done: false, overage: 4.0, nudge: [0.0; 2],
             preview: None, found: vec![], show_positive: true, busy: false, cancel: Arc::new(AtomicBool::new(false)), tx, rx,
         }
     }
 }
 
 impl DirectUi {
+    /// Whether the job that just ended was a focus test (and clear the mark).
+    pub(super) fn focus_result(&mut self) -> bool {
+        std::mem::take(&mut self.focus_done)
+    }
+
+    /// A focus test came back: keep one result per height, the newest.
+    pub(super) fn add_focus(&mut self, v: f32) {
+        self.focus_done = true;
+        let h = self.focus_height;
+        self.focus.retain(|(k, _)| *k != h);
+        self.focus.push((h, v));
+        self.focus.sort_by_key(|(k, _)| *k);
+    }
+
     fn dev(&self) -> Option<&Dev> {
         self.devices.as_ref()?.iter().find(|d| d.key == self.key)
     }
@@ -500,10 +520,18 @@ impl App {
                 let Some(scanner) = d.usb_scanner().cloned() else { return };
                 egui::Grid::new("direct_opts").num_columns(2).spacing(vec2(8.0, 6.0)).show(ui, |ui| {
                     label(ui, "Resolution");
-                    egui::ComboBox::from_id_salt("direct_dpi").width(170.0).selected_text(format!("{} ppi", d.dpi)).show_ui(ui, |ui| {
+                    // Past 4800 ppi the V800/V850 adds file size, not detail: say so in the list.
+                    let real = scanner.real_ppi();
+                    let name = |r: u32| if real.is_some() && r > 4800 { format!("{r} ppi (no more detail)") } else { format!("{r} ppi") };
+                    egui::ComboBox::from_id_salt("direct_dpi").width(170.0).selected_text(name(d.dpi)).show_ui(ui, |ui| {
                         for r in scanner.resolutions() {
-                            pick(ui, &mut d.dpi, r, format!("{r} ppi"));
+                            pick(ui, &mut d.dpi, r, name(r));
                         }
+                    })
+                    .response
+                    .on_hover_text(match real {
+                        Some((a, b)) => format!("This scanner resolves about {a} to {b} ppi of real detail, measured in a lab test. 3200 ppi captures all of it on 35 mm, and higher settings only make bigger files"),
+                        None => "Higher resolutions take longer and make bigger files".into(),
                     });
                     ui.end_row();
                     label(ui, "Depth");
@@ -517,6 +545,16 @@ impl App {
                     })
                     .response
                     .on_hover_text(noise_tip);
+                    ui.end_row();
+                    label(ui, "Passes");
+                    let passes = |n: u32| if n <= 1 { "One".to_string() } else { format!("{n}, averaged") };
+                    egui::ComboBox::from_id_salt("direct_passes").width(170.0).selected_text(passes(d.passes)).show_ui(ui, |ui| {
+                        for n in [1, 2, 4] {
+                            pick(ui, &mut d.passes, n, passes(n));
+                        }
+                    })
+                    .response
+                    .on_hover_text("Scans the whole frame again and averages the passes, lined up, on top of Noise reduction. It digs cleaner detail out of dense negatives and dark slides. This scanner has no exposure control, so this takes the place of multi-exposure. Infrared is scanned once");
                     ui.end_row();
                 });
                 switch_row(ui, "Linear (for Negative)", &mut d.linear).on_hover_text(linear_tip);
@@ -609,12 +647,84 @@ impl App {
         let dpi = dpi as f64;
         let px: f64 = d.frames.iter().filter_map(|&f| boxes.get(f as usize - 1)).map(|r| (r[2] / 25.4 * dpi) * (r[3] / 25.4 * dpi)).sum();
         let samples = if d.kind() == Some(Kind::Usb) && d.infrared && d.usb_scanner().is_some_and(|s| s.infrared) { 4.0 } else { 3.0 };
+        if d.kind() == Some(Kind::Usb) && d.infrared && d.frames.iter().filter_map(|&f| boxes.get(f as usize - 1)).any(|r| !direct::ir_fits(*r)) {
+            ui.add_space(4.0);
+            ui.label(RichText::new("Frames bigger than 14.9 × 23.9 cm are scanned without infrared, as Epson only allows it up to that size.").size(12.0).color(TEXT2));
+        }
         if px > 0.0 {
             // Multi-pass SANE scans are averaged to 16 bits.
             let bits = if d.kind() == Some(Kind::Sane) && d.sane.passes > 1 { 16 } else { bits };
             ui.add_space(4.0);
             ui.label(RichText::new(format!("About {:.0} MB as {bits}-bit TIFF", px * samples * (bits as f64 / 8.0) / 1e6)).size(12.0).color(TEXT3));
         }
+        if d.kind() == Some(Kind::Usb) && d.usb_scanner().is_some_and(|s| s.real_ppi().is_some()) {
+            self.focus_check(ui);
+        }
+    }
+
+    /// Focus check for the V800/V850: the lens doesn't refocus, so sharpness comes from the height of the film
+    /// holder's feet. Scan a small patch at each height and keep the one with the strongest edges.
+    fn focus_check(&mut self, ui: &mut Ui) {
+        let ctx = ui.ctx().clone();
+        let busy = self.scan.direct.busy || self.scan.scanning.is_some();
+        let d = &mut self.scan.direct;
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            ui.label(caps("Focus check"));
+            if !d.focus.is_empty() {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ghost(ui, "Clear", false).clicked() {
+                        d.focus.clear();
+                    }
+                });
+            }
+        });
+        ui.label(RichText::new("This scanner's lens doesn't refocus. Sharpness comes from the height of the holder's feet. Set all six feet to the same position, test, move them, and test again.").size(11.5).color(TEXT2));
+        let mut test = false;
+        let has_frame = !d.frames.is_empty();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Feet at").size(12.0).color(TEXT2));
+            egui::ComboBox::from_id_salt("focus_height").width(110.0).selected_text(format!("Position {}", d.focus_height)).show_ui(ui, |ui| {
+                for n in 1..=5 {
+                    pick(ui, &mut d.focus_height, n, format!("Position {n}"));
+                }
+            });
+            ui.add_enabled_ui(has_frame && !busy, |ui| {
+                test = ui.button("Test").on_hover_text("Scans a small patch from the middle of the first chosen frame and measures how sharp it is").on_disabled_hover_text("Choose a frame first").clicked();
+            });
+        });
+        if let Some(best) = d.focus.iter().map(|f| f.1).reduce(f32::max).filter(|b| *b > 0.0) {
+            for (h, v) in &d.focus {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("Position {h}")).size(12.0));
+                    let pct = v / best * 100.0;
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let top = (*v - best).abs() < f32::EPSILON;
+                        ui.label(RichText::new(if top { format!("{pct:.0}%  sharpest") } else { format!("{pct:.0}%") }).monospace().size(11.5).color(if top { BONE } else { TEXT2 }));
+                    });
+                });
+            }
+            if d.focus.len() == 1 {
+                ui.label(RichText::new("Move the feet one position and test again to compare.").size(11.5).color(TEXT3));
+            }
+        }
+        if test {
+            self.focus_test(&ctx);
+        }
+    }
+
+    fn focus_test(&mut self, ctx: &egui::Context) {
+        let d = &mut self.scan.direct;
+        let (Some(layout), Some(first)) = (d.layout_now(), d.frames.iter().next().copied()) else { return };
+        let Some(rect_mm) = d.boxes().get(first as usize - 1).copied() else { return };
+        let job = direct::Job { source: layout.source, rect_mm, dpi: d.dpi.max(2400), oversample: 1, linear: d.linear, infrared: false, passes: 1 };
+        d.cancel.store(false, Ordering::Relaxed);
+        self.scan.scanning = Some(format!("Focus test at position {}…", d.focus_height));
+        self.scan.progress = Some(0.0);
+        let (sc, cancel, loc) = (self.scan.sc_tx.clone(), d.cancel.clone(), d.key.clone());
+        let tmp = std::env::temp_dir().join(format!("ferrotype-focus-{}", std::process::id()));
+        let ctx = ctx.clone();
+        scanner::run(sc, move || ctx.request_repaint(), move |say| direct::focus_test(&loc, &job, &tmp, &cancel, say));
     }
 
     pub(super) fn scanner_footer(&mut self, ui: &mut Ui) {
@@ -725,7 +835,8 @@ impl App {
             Kind::Usb => {
                 let Some(layout) = d.layout_now() else { return };
                 let infrared = d.infrared && d.usb_scanner().is_some_and(|s| s.infrared);
-                let jobs: Vec<direct::Job> = chosen.into_iter().map(|rect_mm| direct::Job { source: layout.source, rect_mm, dpi: d.dpi, oversample: d.oversample, linear: d.linear, infrared }).collect();
+                // Epson only takes an infrared pass up to 14.9 × 23.9 cm: bigger frames are scanned without one.
+                let jobs: Vec<direct::Job> = chosen.into_iter().map(|rect_mm| direct::Job { source: layout.source, rect_mm, dpi: d.dpi, oversample: d.oversample, linear: d.linear, infrared: infrared && direct::ir_fits(rect_mm), passes: d.passes }).collect();
                 let loc = d.key.clone();
                 scanner::run(sc, move || ctx2.request_repaint(), move |say| direct::frames(&loc, &jobs, &dir, &cancel, say));
             }

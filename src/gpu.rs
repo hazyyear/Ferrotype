@@ -260,5 +260,7 @@ mod tests {
         p.dehaze = -20.0;
         p.vig = 25.0;
         check(&p);
+        p.agx = true;
+        check(&p);
     }
 }

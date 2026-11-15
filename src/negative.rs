@@ -34,6 +34,7 @@ pub const STOCKS: &[Stock] = &[
     s("generic_ecn2", "Generic", "Generic ECN-2", Cine, 0.95, 0.95, -0.01, 0.0),
     s("generic_bw", "Generic", "Generic B&W", Bw, 1.0, 0.0, 0.0, 0.0),
     s("generic_e6", "Generic", "Slide film (E-6, no inversion)", Slide, 1.0, 1.0, 0.0, 0.0),
+    s("kodachrome", "Kodak", "Kodachrome (no inversion)", Slide, 1.0, 1.0, 0.0, 0.0),
     s("portra160", "Kodak", "Portra 160", Color, 0.9, 0.85, 0.02, 0.0),
     s("portra400", "Kodak", "Portra 400", Color, 0.93, 0.9, 0.03, 0.0),
     s("portra800", "Kodak", "Portra 800", Color, 1.0, 1.0, 0.04, 0.0),
@@ -155,11 +156,15 @@ pub struct NegParams {
     pub grade: f32,
     /// Print exposure in stops: more light under the enlarger makes a darker print.
     pub print_exp: f32,
+    /// Neutral greys picked on the scan (linear scan colour, before inversion), at most two. One grey takes out a
+    /// cast; two of different brightness also match each channel's contrast, so shadows and highlights both come
+    /// out neutral (RawTherapee's way of calibrating a roll). Copied with the roll.
+    pub greys: Vec<[f32; 3]>,
 }
 
 impl Default for NegParams {
     fn default() -> Self {
-        Self { enabled: false, stock: "portra400".into(), look: Look::Neutral, base: None, levels: None, density: 0.0, contrast: 0.0, cy: 0.0, mg: 0.0, yb: 0.0, toe: 40.0, shoulder: 55.0, grade: NEUTRAL_GRADE, print_exp: 0.0 }
+        Self { enabled: false, stock: "portra400".into(), look: Look::Neutral, base: None, levels: None, density: 0.0, contrast: 0.0, cy: 0.0, mg: 0.0, yb: 0.0, toe: 40.0, shoulder: 55.0, grade: NEUTRAL_GRADE, print_exp: 0.0, greys: vec![] }
     }
 }
 
@@ -317,6 +322,55 @@ pub fn analyse(img: &Rgb32FImage, np: &NegParams) -> ([f32; 3], [[f32; 2]; 3]) {
     (base, levels)
 }
 
+/// Why infrared cleaning can't work on this film, if it can't: silver images (black-and-white film other than
+/// chromogenic ones like XP2) and Kodachrome's dyes block infrared, so the picture itself would look like dust.
+pub fn ir_blocked(np: &NegParams) -> Option<&'static str> {
+    if !np.enabled {
+        return None;
+    }
+    let st = stock(&np.stock);
+    if st.id.starts_with("kodachrome") {
+        Some("Kodachrome")
+    } else if st.kind == Kind::Bw && st.id != "xp2" {
+        Some("black-and-white film")
+    } else {
+        None
+    }
+}
+
+/// Per-channel gain and offset on the normalised densities that make the picked greys neutral, matched to green
+/// (the reference, as in RawTherapee). One grey sets offsets only; two set gains too. Greys too close in
+/// density to tell apart count as one.
+pub fn grey_fix(greys: &[[f32; 3]], base: [f32; 3], levels: &[[f32; 2]; 3], mono: bool) -> [[f32; 2]; 3] {
+    let n = |c: &[f32; 3]| {
+        let d = densities(c, base, mono);
+        [0, 1, 2].map(|k| (d[k] - levels[k][0]) / (levels[k][1] - levels[k][0]))
+    };
+    let mut fix = [[1.0, 0.0]; 3];
+    match greys {
+        [] => {}
+        [a] => {
+            let a = n(a);
+            for k in [0, 2] {
+                fix[k][1] = a[1] - a[k];
+            }
+        }
+        [a, b, ..] => {
+            let (a, b) = (n(a), n(b));
+            for k in [0, 2] {
+                let span = b[k] - a[k];
+                if span.abs() < 0.05 || (b[1] - a[1]).abs() < 0.05 {
+                    fix[k][1] = (a[1] + b[1] - a[k] - b[k]) / 2.0;
+                } else {
+                    let g = ((b[1] - a[1]) / span).clamp(0.5, 2.0);
+                    fix[k] = [g, a[1] - g * a[k]];
+                }
+            }
+        }
+    }
+    fix
+}
+
 /// Quadratic toe and shoulder joins: C1-continuous soft clipping of the print curve.
 fn roll_off(x: f32, toe: f32, shoulder: f32) -> f32 {
     let (a, b) = ((toe / 100.0 * 0.3).max(1e-4), (shoulder / 100.0 * 0.3).max(1e-4));
@@ -350,9 +404,10 @@ pub fn convert(img: &mut Rgb32FImage, np: &NegParams) {
     let dens = np.density / 100.0 * 0.3;
     // A stop is 0.3 density of light: as a share of this frame's density range, per channel.
     let expo = levels.map(|l| np.print_exp * std::f32::consts::LOG10_2 / (l[1] - l[0]).max(0.05));
+    let fix = grey_fix(&np.greys, base, &levels, mono);
     crate::develop::px3_mut(img).par_iter_mut().for_each(|px| {
         let d = densities(px, base, mono);
-        let mut n = [0, 1, 2].map(|c| (d[c] - levels[c][0]) / (levels[c][1] - levels[c][0]));
+        let mut n = [0, 1, 2].map(|c| (d[c] - levels[c][0]) / (levels[c][1] - levels[c][0]) * fix[c][0] + fix[c][1]);
         n = [0, 1, 2].map(|c| (0.5 + (n[c] - 0.5 - dens - expo[c]) * gamma) + bal[c]);
         let m = (n[0] + n[1] + n[2]) / 3.0;
         n = n.map(|v| m + (v - m) * sat);
@@ -372,6 +427,30 @@ mod tests {
             let scene = x as f32 / 63.0; // 0 = black, 1 = white
             image::Rgb(base.map(|b| b * 10f32.powf(-scene * 1.2)))
         })
+    }
+
+    #[test]
+    fn two_greys_make_shadows_and_highlights_neutral() {
+        // A frame whose darkest and brightest parts aren't grey: each channel's levels come out a little off, so
+        // greys print warm in the shadows and cool in the highlights.
+        let img = fake_negative();
+        let mut np = NegParams { enabled: true, ..Default::default() };
+        let (b, mut l) = analyse(&img, &np);
+        l[0] = [l[0][0] + 0.06, l[0][1] - 0.12];
+        (np.base, np.levels) = (Some(b), Some(l));
+        let cast = |np: &NegParams| {
+            let mut out = img.clone();
+            convert(&mut out, np);
+            [16u32, 48].map(|x| { let p = out.get_pixel(x, 4).0; (p[0] - p[1]).abs() + (p[2] - p[1]).abs() })
+        };
+        np.stock = "generic_c41".into();
+        let before = cast(&np);
+        np.greys = vec![img.get_pixel(16, 4).0, img.get_pixel(48, 4).0];
+        let after = cast(&np);
+        assert!(after[0] < 0.01 && after[1] < 0.01, "both greys neutral: {after:?} (was {before:?})");
+        // One grey: neutral there.
+        np.greys.truncate(1);
+        assert!(cast(&np)[0] < 0.01);
     }
 
     #[test]

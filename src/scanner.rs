@@ -25,6 +25,8 @@ pub enum Event {
     Progress(f32),
     /// A scan was saved.
     Saved(PathBuf),
+    /// A focus test finished: how strong the edges in the test patch are (only compared with each other).
+    Focus(f32),
     /// The scanner was closed: how many pictures came in, or what went wrong.
     Done(Result<usize, String>),
 }

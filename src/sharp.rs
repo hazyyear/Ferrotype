@@ -10,10 +10,17 @@ pub const SIZE: u32 = 1024;
 /// Score a linear picture. Takes the strongest 1% of edges (Laplacian of gamma-encoded luma): one sharp
 /// subject on a blurred background still scores high, a frame missed everywhere scores low.
 pub fn score(img: &Rgb32FImage) -> u8 {
+    let v = edges(img);
+    (100.0 * (1.0 - (-v / 0.11).exp())).round().clamp(0.0, 100.0) as u8
+}
+
+/// The strength behind `score`, before it is squeezed into 0..100: for comparing scans of the same film (a
+/// focus test), where `score` would sit near 100 for all of them.
+pub fn edges(img: &Rgb32FImage) -> f32 {
     let small = if img.width().max(img.height()) > SIZE { crate::load::fit(img, SIZE) } else { img.clone() };
     let (w, h) = (small.width() as usize, small.height() as usize);
     if w < 3 || h < 3 {
-        return 0;
+        return 0.0;
     }
     // Square root is close enough to a display gamma here, and cheap.
     let l: Vec<f32> = small.chunks(3).map(|c| (0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]).max(0.0).sqrt()).collect();
@@ -32,8 +39,7 @@ pub fn score(img: &Rgb32FImage) -> u8 {
     let mut ls: Vec<f32> = l.iter().step_by(3).copied().collect();
     ls.sort_by(|a, b| a.total_cmp(b));
     let spread = (ls[ls.len() * 995 / 1000] - ls[ls.len() * 5 / 1000]).max(0.1);
-    let v = top.iter().sum::<f32>() / top.len().max(1) as f32 / spread;
-    (100.0 * (1.0 - (-v / 0.11).exp())).round().clamp(0.0, 100.0) as u8
+    top.iter().sum::<f32>() / top.len().max(1) as f32 / spread
 }
 
 /// Score a file from its fast preview (the JPEG a RAW carries), or None when it can't be read.

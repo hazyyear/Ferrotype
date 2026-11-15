@@ -6,7 +6,10 @@
 //!   with weights that follow the green detail (edge-aware), and a final green refinement. Much finer than the
 //!   bilinear rawler uses.
 //! - Colour: the camera matrix is applied without clipping negative channels, so colours outside sRGB survive
-//!   for wide-gamut exports (see `colour`). Highlights above white keep rawler's hue-preserving blend.
+//!   for wide-gamut exports (see `colour`).
+//! - Highlights: clipped photosites are rebuilt before demosaicing from the colours around them ("inpaint
+//!   opposed", darktable's default method), and values above white are kept, so lowering Exposure or Highlights
+//!   brings back detail. The blend that turns clipped highlights white happens at the display end (`develop`).
 //!
 //! Anything else (4-colour sensors, monochrome, linear DNGs, Fuji SuperCCD) goes back to rawler.
 
@@ -36,7 +39,10 @@ pub fn develop(raw: &RawImage) -> Option<Rgb32FImage> {
     };
     let mut r = raw.clone();
     r.apply_scaling().ok()?;
-    let data = r.data.as_f32();
+    let mut data = match std::mem::replace(&mut r.data, rawler::rawimage::RawImageData::Float(vec![])) {
+        rawler::rawimage::RawImageData::Float(v) => v,
+        other => other.as_f32().into_owned(),
+    };
     let (w, h) = (r.width, r.height);
     let cfa = &config.cfa;
     // The pattern repeats every cfa.width × cfa.height pixels: build one tile and repeat it row by row.
@@ -47,6 +53,8 @@ pub fn develop(raw: &RawImage) -> Option<Rgb32FImage> {
         let t = &tile[(y % th) * tw..][..tw];
         row.iter_mut().enumerate().for_each(|(x, v)| *v = t[x % tw]);
     });
+    let wb = if raw.wb_coeffs[0].is_nan() || raw.wb_coeffs[1] <= 0.0 { [1.0; 3] } else { [0, 1, 2].map(|c| raw.wb_coeffs[c] / raw.wb_coeffs[1]) };
+    reconstruct_highlights(&mut data, &pattern, w, h, wb);
     let planes = match sensor {
         Sensor::Bayer => rcd(&data, &pattern, w, h),
         Sensor::XTrans => xtrans(&data, &pattern, w, h),
@@ -81,17 +89,98 @@ fn to_srgb(raw: &RawImage, planes: &[Vec<f32>; 3], w: usize, (cx, cy, cw, ch): (
         let i = (cy + y) * w + cx + x;
         let c = [planes[0][i] * wb[0], planes[1][i] * wb[1], planes[2][i] * wb[2]];
         let mut s = [0, 1, 2].map(|k| cam2rgb[k][0] * c[0] + cam2rgb[k][1] * c[1] + cam2rgb[k][2] * c[2]);
-        let max = s[0].max(s[1]).max(s[2]);
-        if max > 1.0 {
-            // Past white: rawler's blend of the colour's direction and its brightness, so clipped highlights
-            // turn white smoothly instead of magenta.
-            s = rawler::imgop::raw::clip_euclidean_norm_avg(&s);
-        } else if s[0] + s[1] + s[2] < 0.0 {
+        // Values past white are kept (highlight headroom): `develop` blends them to white at the display end.
+        if s[0] + s[1] + s[2] < 0.0 {
             s = [0.0; 3];
         }
         px.copy_from_slice(&s);
     });
     Some(out)
+}
+
+/// A photosite at or above this (after black and white level scaling) has clipped.
+const CLIP: f32 = 0.987;
+
+/// Rebuild clipped photosites in place ("inpaint opposed", darktable's default highlight reconstruction).
+///
+/// A clipped photosite only says "at least this bright". Its likely value comes from the other two colours
+/// around it (white balanced, averaged as cube roots so one bright neighbour doesn't dominate), times a colour
+/// correction per channel measured on the unclipped photosites at the edge of the clipped areas. darktable adds
+/// that correction; here it is a ratio, so it scales with brightness across a sky that brightens into the clip. This runs on
+/// the raw data, before demosaicing and before any colour profile, as darktable does: there's no "white" yet at
+/// this stage, so nothing is pushed towards white here. Returns how many photosites were rebuilt.
+///
+/// It can guess wrong where a clipped area touches something of a different colour (a lamp against a red wall):
+/// the edge colour is averaged over the whole photo.
+pub fn reconstruct_highlights(data: &mut [f32], pattern: &[u8], w: usize, h: usize, wb: [f32; 3]) -> usize {
+    if w < 3 || h < 3 || data.len() != w * h || pattern.len() != w * h {
+        return 0;
+    }
+    let clipped: Vec<bool> = data.par_iter().map(|&v| v >= CLIP).collect();
+    if !clipped.par_iter().any(|&c| c) {
+        return 0;
+    }
+    let wb = wb.map(|v| if v.is_finite() && v > 0.0 { v } else { 1.0 });
+    let val = |d: &[f32], i: usize| d[i] * wb[pattern[i] as usize];
+    // The other two colours around photosite i, white balanced: the cube of the mean of the cube roots.
+    let opposed = |d: &[f32], i: usize| -> f32 {
+        let (x, y) = ((i % w) as isize, (i / w) as isize);
+        let me = pattern[i] as usize;
+        let (mut acc, mut n) = ([0f32; 3], [0u32; 3]);
+        for dy in -1isize..=1 {
+            for dx in -1isize..=1 {
+                let (xx, yy) = ((x + dx).clamp(0, w as isize - 1) as usize, (y + dy).clamp(0, h as isize - 1) as usize);
+                let j = yy * w + xx;
+                let k = pattern[j] as usize;
+                if k != me && k < 3 {
+                    acc[k] += val(d, j).max(0.0).cbrt();
+                    n[k] += 1;
+                }
+            }
+        }
+        let (mut sum, mut m) = (0f32, 0f32);
+        for k in 0..3 {
+            if k != me && n[k] > 0 {
+                sum += acc[k] / n[k] as f32;
+                m += 1.0;
+            }
+        }
+        if m > 0.0 { (sum / m).powi(3) } else { val(d, i) }
+    };
+    // The edge of the clipped areas: unclipped photosites within 3 of a clipped one (separable dilation).
+    const R: usize = 3;
+    let mut rows = vec![false; w * h];
+    rows.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        let src = &clipped[y * w..][..w];
+        for x in 0..w {
+            row[x] = src[x.saturating_sub(R)..(x + R + 1).min(w)].iter().any(|&c| c);
+        }
+    });
+    let near: Vec<bool> = (0..w * h).into_par_iter().map(|i| {
+        let (x, y) = (i % w, i / w);
+        (y.saturating_sub(R)..(y + R + 1).min(h)).any(|yy| rows[yy * w + x])
+    }).collect();
+    drop(rows);
+    // Colour correction per channel: how each colour compares with its opposed colours along that edge.
+    let (sum, cnt) = (0..w * h).into_par_iter().filter(|&i| near[i] && !clipped[i] && data[i] > 0.2).fold(|| ([0f64; 3], [0u64; 3]), |(mut s, mut n), i| {
+        let k = pattern[i] as usize;
+        let o = opposed(data, i);
+        if k < 3 && o > 0.02 {
+            s[k] += (val(data, i) / o).ln() as f64;
+            n[k] += 1;
+        }
+        (s, n)
+    }).reduce(|| ([0f64; 3], [0u64; 3]), |a, b| ([0, 1, 2].map(|k| a.0[k] + b.0[k]), [0, 1, 2].map(|k| a.1[k] + b.1[k])));
+    // Geometric mean of the ratios, kept to a sane range (one odd edge can't paint a highlight bright green).
+    let chroma = [0, 1, 2].map(|k| if cnt[k] > 0 { ((sum[k] / cnt[k] as f64).exp() as f32).clamp(0.25, 4.0) } else { 1.0 });
+    let fixed: Vec<(usize, f32)> = (0..w * h).into_par_iter().filter(|&i| clipped[i]).map(|i| {
+        let k = (pattern[i] as usize).min(2);
+        (i, val(data, i).max(opposed(data, i) * chroma[k]) / wb[k])
+    }).collect();
+    for &(i, v) in &fixed {
+        data[i] = v;
+    }
+    fixed.len()
 }
 
 /// Every pixel's colour from its own and its neighbours' samples, simply (fills the borders the real
@@ -461,6 +550,38 @@ fn neighbours_mean(v: &[f32], pattern: &[u8], w: usize, h: usize, i: usize, chan
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `BENCH_FILE=x.NEF cargo test --release bench_raw_develop -- --ignored --nocapture`: decode time and how
+    /// much of the photo sits past white (rebuilt highlights).
+    #[test]
+    #[ignore]
+    fn bench_raw_develop() {
+        let Some(f) = std::env::var_os("BENCH_FILE") else { return };
+        let t = std::time::Instant::now();
+        let img = crate::load::load(std::path::Path::new(&f)).unwrap();
+        let over = img.chunks(3).filter(|c| c[0].max(c[1]).max(c[2]) > 1.0).count();
+        let max = img.iter().cloned().fold(0.0, f32::max);
+        eprintln!("load {:.0} ms, {:.3}% past white, max {max:.2}", t.elapsed().as_secs_f64() * 1e3, over as f64 / (img.len() / 3) as f64 * 100.0);
+    }
+
+    #[test]
+    fn rebuilds_clipped_green_from_red_and_blue() {
+        // A bright, slightly warm sky: true green 1.4 clips at 1.0; red and blue stay below white.
+        let (w, h) = (40, 40);
+        let truth = |y: usize, x: usize| if (12..28).contains(&x) && (12..28).contains(&y) { [0.9, 1.4, 0.7] } else { [0.45, 0.7, 0.35] };
+        let (mut cfa, pat) = mosaic(&truth, w, h, &bayer);
+        cfa.iter_mut().for_each(|v| *v = v.min(1.0));
+        let n = reconstruct_highlights(&mut cfa, &pat, w, h, [1.0; 3]);
+        assert!(n > 0);
+        let i = 20 * w + 21; // a green photosite in the clipped area
+        assert_eq!(pat[i], 1);
+        assert!(cfa[i] > 1.2 && cfa[i] < 1.6, "green rebuilt near its true 1.4, got {}", cfa[i]);
+        // Nothing unclipped changes.
+        assert!((cfa[2 * w + 2] - truth(2, 2)[pat[2 * w + 2] as usize]).abs() < 1e-6);
+        // Nothing to do on an unclipped photo.
+        let (mut low, _) = mosaic(&|_, _| [0.4, 0.5, 0.3], w, h, &bayer);
+        assert_eq!(reconstruct_highlights(&mut low, &pat, w, h, [1.0; 3]), 0);
+    }
 
     const XTRANS: [&str; 6] = ["GGRGGB", "GGBGGR", "BRGRBG", "GGBGGR", "GGRGGB", "RBGBRG"];
 
