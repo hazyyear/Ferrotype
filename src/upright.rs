@@ -302,12 +302,42 @@ pub fn solve_edges(edges: &[Edgelet], w: u32, h: u32, p: &Params, mode: Mode) ->
     if vw + hw < total * 0.05 || sets.vert.len() + sets.hor.len() < 4 {
         return (0.0, 0.0, 0.0);
     }
-    let (use_v, use_h) = (mode != Mode::Level || vw > 0.0, true);
     let (free_v, free_h) = match mode {
         Mode::Level => (false, false),
         Mode::Vertical | Mode::Auto => (true, false),
         Mode::Full => (true, true),
     };
+    optimise(&sets, total, w, h, p, mode, (mode != Mode::Level || vw > 0.0, true), (free_v, free_h))
+}
+
+/// Guided Upright: straighten so that the lines you drew become upright (`vertical[i]`) or level. Each line is
+/// [x0, y0, x1, y1] in source pixels (the quarter-turned source, `w`×`h`). Two upright lines free Vertical, two
+/// level ones free Horizontal; Rotate is always free.
+pub fn solve_guided(lines: &[[f32; 4]], vertical: &[bool], w: u32, h: u32, p: &Params) -> (f32, f32, f32) {
+    let mut sets = Sets { vert: vec![], hor: vec![] };
+    for (l, v) in lines.iter().zip(vertical) {
+        let (dx, dy) = (l[2] - l[0], l[3] - l[1]);
+        let len = (dx * dx + dy * dy).sqrt();
+        if len < 4.0 {
+            continue;
+        }
+        // Pieces along the line, so a long line counts as much as its length says.
+        for k in 0..9 {
+            let t = (k as f32 + 0.5) / 9.0;
+            let e = Edgelet { x: l[0] + dx * t, y: l[1] + dy * t, dx: dx / len, dy: dy / len, w: 1.0 };
+            if *v { sets.vert.push(e) } else { sets.hor.push(e) }
+        }
+    }
+    if sets.vert.is_empty() && sets.hor.is_empty() {
+        return (p.t_rot, p.t_vert, p.t_hor);
+    }
+    let total = (sets.vert.len() + sets.hor.len()) as f32;
+    let (nv, nh) = (vertical.iter().filter(|v| **v).count(), vertical.iter().filter(|v| !**v).count());
+    optimise(&sets, total, w, h, p, Mode::Full, (!sets.vert.is_empty(), !sets.hor.is_empty()), (nv >= 2, nh >= 2))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn optimise(sets: &Sets, total: f32, w: u32, h: u32, p: &Params, mode: Mode, (use_v, use_h): (bool, bool), (free_v, free_h): (bool, bool)) -> (f32, f32, f32) {
     // With the verticals free, horizontals mostly decide the level; with them fixed, both sets vote on it.
     let hor_weight = if free_v && !free_h { 0.5 } else { 1.0 };
     let reg = if mode == Mode::Auto { 0.6 } else { 0.15 };
@@ -443,6 +473,20 @@ mod tests {
             }
         }
         img
+    }
+
+    /// Two lines drawn along leaning walls are enough to put them upright.
+    #[test]
+    fn guided_lines_straighten_walls() {
+        let truth = Params { t_rot: 2.0, t_vert: 25.0, ..Params::default() };
+        let (w, h) = (600u32, 800u32);
+        let m = Mapper::new(&truth, w, h);
+        // Walls at frame x = 120 and 480, from near the top to near the bottom, as seen in the source.
+        let line = |x: f32| { let (a, b) = (m.map(x, 100.0), m.map(x, 700.0)); [a.0, a.1, b.0, b.1] };
+        let (r, v, hz) = solve_guided(&[line(120.0), line(480.0)], &[true, true], w, h, &Params::default());
+        assert!((r - 2.0).abs() < 0.3, "rotate {r}");
+        assert!((v - 25.0).abs() < 3.0, "vertical {v}");
+        assert_eq!(hz, 0.0);
     }
 
     #[test]

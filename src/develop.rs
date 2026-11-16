@@ -31,6 +31,10 @@ pub struct Params {
     pub c_sh: f32,
     // Color mixer: [hue, sat, lum] for red, orange, yellow, green, aqua, blue, purple, magenta
     pub hsl: [[f32; 3]; 8],
+    /// Black & white: the photo becomes grey, each colour band set lighter or darker by `bw_mix` (-100..100) first,
+    /// as with coloured filters on black-and-white film. Colour grading then tones the greys.
+    pub bw: bool,
+    pub bw_mix: [f32; 8],
     // Color grading: [hue 0..360, sat, lum] for shadows, midtones, highlights, global
     pub grade: [[f32; 3]; 4],
     pub g_blend: f32,
@@ -114,6 +118,12 @@ pub struct Params {
     /// Camera or scanner colour profile built from a chart (see `calib`), applied to the source first.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile: Option<crate::calib::ColorProfile>,
+    /// A DNG camera profile (.dcp file, such as Adobe Standard or Camera Matching), "" = Ferrotype's own colour.
+    /// With `dcp_tone`, its tone curve replaces the camera curve matched from the embedded JPEG.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub dcp: String,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub dcp_tone: bool,
     /// The camera's tone curve for a RAW (`load::camera_curve`): (linear RAW, linear camera JPEG) brightness pairs,
     /// measured when the photo is first opened so an unedited RAW looks like the camera's picture. Belongs to the
     /// photo, not to a look. Not used on negatives, whose inversion needs linear data.
@@ -123,6 +133,11 @@ pub struct Params {
     /// rating: never copied by paste, presets or sync.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub keywords: Vec<String>,
+    /// The photo's title and caption (IPTC), written into exports and its XMP. Per photo, like keywords.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub caption: String,
     /// Where it was taken (from a GPX track). Belongs to the photo: never copied by paste, presets or sync.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gps: Option<crate::geotag::Location>,
@@ -171,6 +186,23 @@ pub struct Spot {
     pub clone: bool,
     /// Turn the source by this many degrees.
     pub angle: f32,
+    /// Content-aware fill: rebuild the area from texture found around it (patch matching) instead of one source.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub fill: bool,
+    /// Red eye: take the red out of a flash-lit pupil inside the circle and darken it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub red_eye: bool,
+    /// Don't sample: marks an area that fills may not copy from (the thing to remove, a face, a sign); it changes
+    /// nothing by itself.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub avoid: bool,
+    /// Which of the possible fills to use ("Try another" counts it up); 0 is the first.
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    pub variant: u32,
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 
 impl Spot {
@@ -284,7 +316,7 @@ impl Default for Params {
             temp: 5500.0, tint: 0.0, exposure: 0.0, contrast: 0.0, highlights: 0.0, shadows: 0.0, whites: 0.0, blacks: 0.0,
             texture: 0.0, clarity: 0.0, dehaze: 0.0, vibrance: 0.0, saturation: 0.0,
             c_hi: 0.0, c_li: 0.0, c_da: 0.0, c_sh: 0.0,
-            hsl: [[0.0; 3]; 8],
+            hsl: [[0.0; 3]; 8], bw: false, bw_mix: [0.0; 8],
             grade: [[0.0; 3]; 4], g_blend: 50.0, g_bal: 0.0,
             sh_amt: 40.0, sh_rad: 1.0, sh_det: 25.0, sh_mask: 0.0, nr_lum: 0.0, nr_det: 50.0, nr_col: 25.0,
             o_dist: 0.0, o_vig: 0.0, o_fringe: 0.0,
@@ -299,14 +331,44 @@ impl Default for Params {
             grads: vec![],
             brushes: vec![],
             masks: vec![],
-            rot90: 0, label: 0, ai_nr: 0.0, ir_clean: 0.0, keywords: vec![], gps: None, snapshots: vec![],
+            rot90: 0, label: 0, ai_nr: 0.0, ir_clean: 0.0, keywords: vec![], title: String::new(), caption: String::new(), gps: None, snapshots: vec![],
             lens: String::new(), lens_focal: 0.0, lens_f: 0.0, lens_crop: 1.0, lens_dist: 100.0, lens_vig: 100.0,
-            profile: None,
+            profile: None, dcp: String::new(), dcp_tone: false,
             cam_curve: vec![],
             process: 2,
             strip_frame: false,
         }
     }
+}
+
+/// The groups Paste and Sync can copy: (name, settings in the group, on unless chosen). The last four are off by
+/// default because they belong to one frame: its geometry, retouching and film conversion, and the camera profile
+/// (made for one camera model).
+pub const PASTE_GROUPS: [(&str, &[&str], bool); 19] = [
+    ("White balance", &["temp", "tint"], true),
+    ("Tone", &["exposure", "contrast", "highlights", "shadows", "whites", "blacks"], true),
+    ("Presence", &["texture", "clarity", "dehaze", "vibrance", "saturation"], true),
+    ("Tone curve", &["c_hi", "c_li", "c_da", "c_sh", "curves", "curve_lum"], true),
+    ("Colour mixer and B&W", &["hsl", "bw", "bw_mix"], true),
+    ("Colour grading", &["grade", "g_blend", "g_bal"], true),
+    ("Sharpening", &["sh_amt", "sh_rad", "sh_det", "sh_mask"], true),
+    ("Noise reduction", &["nr_lum", "nr_det", "nr_col", "ai_nr"], true),
+    ("Manual lens corrections", &["o_dist", "o_vig", "o_fringe"], true),
+    ("Effects", &["vig", "vig_mid", "vig_round", "vig_fea", "vig_hi", "gr_amt", "gr_size", "gr_rough", "gr_hi", "hal_amt", "hal_size", "hal_thr"], true),
+    ("Colour look (LUT)", &["lut", "lut_amt"], true),
+    ("Calibration", &["cal_sh", "cal"], true),
+    ("Border", &["border"], true),
+    ("Masks", &["masks", "grads", "brushes"], true),
+    ("Transform", &["t_vert", "t_hor", "t_rot", "t_scale", "flip_h"], false),
+    ("Crop", &["crop"], false),
+    ("Heal spots and red eye", &["spots"], false),
+    ("Negative conversion", &["neg"], false),
+    ("Camera profile (DCP)", &["dcp", "dcp_tone"], false),
+];
+
+/// Which paste groups are on by default.
+pub fn paste_defaults() -> Vec<bool> {
+    PASTE_GROUPS.iter().map(|g| g.2).collect()
 }
 
 impl Params {
@@ -324,11 +386,28 @@ impl Params {
             (self.lens.clone(), self.lens_focal, self.lens_f, self.lens_crop, self.lens_dist, self.lens_vig);
         // So does the camera or scanner profile: the negative conversion was measured with it.
         p.profile = self.profile.clone();
+        (p.dcp, p.dcp_tone) = (self.dcp.clone(), self.dcp_tone);
         (p.cam_curve, p.process) = (self.cam_curve.clone(), self.process);
         p.keywords = self.keywords.clone();
+        (p.title, p.caption) = (self.title.clone(), self.caption.clone());
         p.gps = self.gps;
         p.strip_frame = self.strip_frame;
         p
+    }
+
+    /// These settings with the chosen groups of `other`'s (see PASTE_GROUPS; `on[i]` for group i). Everything
+    /// else, including the rating, keywords and lens profile, stays as it is. Used by Paste and Sync.
+    pub fn with_parts_of(&self, other: &Params, on: &[bool]) -> Params {
+        let (Ok(serde_json::Value::Object(mut me)), Ok(serde_json::Value::Object(them))) = (serde_json::to_value(self), serde_json::to_value(other)) else { return self.clone() };
+        for (g, _) in PASTE_GROUPS.iter().enumerate().filter(|(i, _)| on.get(*i).copied().unwrap_or(false)) {
+            for k in PASTE_GROUPS[g].1 {
+                match them.get(*k) {
+                    Some(v) => { me.insert(k.to_string(), v.clone()); }
+                    None => { me.remove(*k); }
+                }
+            }
+        }
+        serde_json::from_value(serde_json::Value::Object(me)).unwrap_or_else(|_| self.clone())
     }
 
     /// Part-way from `from` to `to` (0 = from, 1 = to, up to 2 to exaggerate): every number is mixed, including
@@ -358,6 +437,7 @@ impl Params {
         let mut p: Params = serde_json::from_value(mix(&a, &b, t as f64)).unwrap_or_else(|_| to.clone());
         // Ratings and the like are never part of a look.
         (p.rating, p.flag, p.label, p.gps) = (from.rating, from.flag, from.label, from.gps);
+        (p.keywords, p.title, p.caption) = (from.keywords.clone(), from.title.clone(), from.caption.clone());
         (p.cam_curve, p.process) = (from.cam_curve.clone(), from.process);
         p
     }
@@ -404,7 +484,7 @@ impl Params {
 
     /// True when the photo has edits, ignoring its rating, flag, label and snapshots.
     pub fn is_edited(&self) -> bool {
-        Params { rating: 0, flag: 0, label: 0, snapshots: vec![], cam_curve: vec![], process: 2, keywords: vec![], gps: None, strip_frame: false, ..self.clone() } != Params::default()
+        Params { rating: 0, flag: 0, label: 0, snapshots: vec![], cam_curve: vec![], process: 2, keywords: vec![], title: String::new(), caption: String::new(), gps: None, strip_frame: false, ..self.clone() } != Params::default()
     }
 
     /// Turn a quarter clockwise (or back), carrying the crop, spots, filters and brush strokes along.
@@ -598,9 +678,23 @@ fn heal(img: &mut Rgb32FImage, p: &Params, full: (usize, usize), off: (f32, f32)
     let (fw, fh, ox, oy) = frame_of(p, full.0, full.1);
     let (ox, oy) = (ox + off.0, oy + off.1);
     let src = img.clone();
+    let to_px = |s: &Spot| -> (Vec<[f32; 2]>, f32) { (s.points().map(|q| [q[0] * fw - ox, q[1] * fh - oy]).collect(), (s.r * fw.max(fh)).max(1.5)) };
+    let avoid: Vec<(Vec<[f32; 2]>, f32)> = p.spots.iter().filter(|s| s.avoid).map(to_px).collect();
     for s in &p.spots {
-        let r = (s.r * fw.max(fh)).max(1.5);
-        let pts: Vec<[f32; 2]> = s.points().map(|q| [q[0] * fw - ox, q[1] * fh - oy]).collect();
+        if s.avoid {
+            continue;
+        }
+        let (pts, r) = to_px(s);
+        if s.red_eye {
+            red_eye(img, pts[0], r);
+            continue;
+        }
+        if s.fill {
+            // Seeded by where the spot is, so the same fill comes back on every render.
+            let seed = (s.x * 9_973.0 + s.y * 7_919.0).to_bits() ^ s.variant.wrapping_mul(0x9E37_79B9);
+            crate::fill::fill_avoiding(img, &pts, r, seed, &avoid);
+            continue;
+        }
         let (tx, ty, sx, sy) = (pts[0][0], pts[0][1], s.sx * fw - ox, s.sy * fh - oy);
         let (sin, cos) = s.angle.to_radians().sin_cos();
         let source = |x: f32, y: f32| {
@@ -653,6 +747,33 @@ fn heal(img: &mut Rgb32FImage, p: &Params, full: (usize, usize), off: (f32, f32)
                 *px = [0, 1, 2].map(|k| px[k] + ((v[k] + fix[near][k]).max(0.0) - px[k]) * a);
             }
         });
+    }
+}
+
+/// Red eye: inside the circle at `c` (radius `r`, pixels), pixels much redder than they are green or blue (a
+/// flash reflected off the retina) lose the extra red and are darkened, fading out towards the edge.
+fn red_eye(img: &mut Rgb32FImage, c: [f32; 2], r: f32) {
+    let (w, h) = (img.width() as i64, img.height() as i64);
+    let (x0, x1) = (((c[0] - r).floor() as i64).max(0), ((c[0] + r).ceil() as i64).min(w - 1));
+    let (y0, y1) = (((c[1] - r).floor() as i64).max(0), ((c[1] + r).ceil() as i64).min(h - 1));
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let d = ((x as f32 - c[0]).powi(2) + (y as f32 - c[1]).powi(2)).sqrt();
+            let edge = 1.0 - smooth(0.7 * r, r, d);
+            if edge <= 0.0 {
+                continue;
+            }
+            let px = img.get_pixel_mut(x as u32, y as u32);
+            let [rr, g, b] = px.0;
+            let gb = g.max(b);
+            // How red: 0 when red is at most 1.6× the other two (skin is about 1.3×), 1 at 2.4× and beyond.
+            let red = if rr > 1e-4 { smooth(1.6, 2.4, rr / gb.max(1e-5)) } else { 0.0 } * edge;
+            if red <= 0.0 {
+                continue;
+            }
+            let fixed = [(g + b) / 2.0, g, b].map(|v| v * 0.55);
+            px.0 = [0, 1, 2].map(|k| px.0[k] + (fixed[k] - px.0[k]) * red);
+        }
     }
 }
 
@@ -812,6 +933,55 @@ const BAND_SPAN: [(f32, f32); 8] = {
     }
     s
 };
+
+/// Grey value of linear colour `c` for the black & white mix: its brightness, made lighter or darker by the
+/// mix of its colour band (±100 = about ±1 stop for a fully saturated colour, less for muted ones).
+pub fn bw_grey(c: [f32; 3], mix: &[f32; 8]) -> f32 {
+    let y = luma(c).max(0.0);
+    if mix.iter().all(|v| *v == 0.0) || y <= 0.0 {
+        return y;
+    }
+    let (h, s, _) = rgb_to_hsv(c.map(|v| linear_to_srgb(v.max(0.0))));
+    let (a, b, t) = band_pair(h);
+    let m = mix[a] * (1.0 - t) + mix[b] * t;
+    y * 2f32.powf(m / 100.0 * s.min(1.0))
+}
+
+/// Toning for black & white, set through colour grading: (name, shadows [hue, sat], highlights [hue, sat], balance).
+pub const TONERS: [(&str, [f32; 2], [f32; 2], f32); 6] = [
+    ("None", [0.0, 0.0], [0.0, 0.0], 0.0),
+    ("Sepia", [32.0, 48.0], [42.0, 30.0], 0.0),
+    ("Selenium", [300.0, 14.0], [30.0, 6.0], -20.0),
+    ("Gold", [220.0, 6.0], [48.0, 26.0], 20.0),
+    ("Cyanotype", [205.0, 55.0], [200.0, 30.0], 0.0),
+    ("Platinum", [28.0, 18.0], [40.0, 14.0], 10.0),
+];
+
+/// The classic colour filters for black-and-white film, as grey-mixer settings.
+pub const BW_FILTERS: [(&str, [f32; 8]); 6] = [
+    ("None", [0.0; 8]),
+    ("Red", [60.0, 40.0, 10.0, -40.0, -50.0, -60.0, -20.0, 30.0]),
+    ("Orange", [40.0, 40.0, 20.0, -20.0, -35.0, -45.0, -15.0, 15.0]),
+    ("Yellow", [15.0, 20.0, 25.0, 0.0, -15.0, -25.0, -10.0, 0.0]),
+    ("Green", [-25.0, -10.0, 15.0, 40.0, 20.0, -10.0, -20.0, -20.0]),
+    ("Blue", [-40.0, -30.0, -20.0, -10.0, 30.0, 50.0, 25.0, 0.0]),
+];
+
+/// Which toner the colour grading is set to now, if it is exactly one of them.
+pub fn toner_of(p: &Params) -> Option<usize> {
+    (0..TONERS.len()).find(|&i| {
+        let mut q = p.clone();
+        apply_toner(&mut q, i);
+        q.grade == p.grade && q.g_bal == p.g_bal
+    })
+}
+
+/// Set colour grading to toner `i` (shadows and highlights only; midtones and global are cleared).
+pub fn apply_toner(p: &mut Params, i: usize) {
+    let (_, sh, hi, bal) = TONERS[i];
+    p.grade = [[sh[0], sh[1], 0.0], [0.0; 3], [hi[0], hi[1], 0.0], [0.0; 3]];
+    p.g_bal = bal;
+}
 
 /// Rotate a colour around the grey axis by `deg` degrees (Rodrigues).
 pub fn hue_rotate(c: [f32; 3], deg: f32) -> [f32; 3] {
@@ -1378,17 +1548,29 @@ pub fn mask_weights(m: &Mask, p: &Params, shown: &Rgb32FImage, full: (u32, u32),
                 });
             }
             Shape::Brush { dabs } => {
-                let dabs: Vec<_> = dabs.iter().map(|d| { let c = to_px([d[0], d[1]]); (c[0], c[1], (d[2] * long).max(1.0), d[3] > 0.0) }).collect();
+                // An Auto mask dab (|d[3]| = 2) only covers colours close to the one at its centre.
+                let shown_px = px3(shown);
+                let at = |x: f32, y: f32| shown_px[(y.clamp(0.0, (h - 1) as f32) as usize) * w + x.clamp(0.0, (w - 1) as f32) as usize];
+                let dabs: Vec<_> = dabs.iter().map(|d| {
+                    let c = to_px([d[0], d[1]]);
+                    let auto = (d[3].abs() > 1.5).then(|| at(c[0], c[1]));
+                    (c[0], c[1], (d[2] * long).max(1.0), d[3] > 0.0, auto)
+                }).collect();
                 v.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
                     let yf = y as f32;
-                    for &(tx, ty, r, add) in &dabs {
+                    for &(tx, ty, r, add, auto) in &dabs {
                         let dy2 = (yf - ty).powi(2);
                         if dy2 >= r * r {
                             continue;
                         }
                         let (xa, xb) = ((tx - r).floor().max(0.0) as usize, ((tx + r).ceil().max(0.0) as usize).min(w));
                         for (x, o) in row.iter_mut().enumerate().take(xb).skip(xa) {
-                            let a = 1.0 - smooth(0.4 * r, r, ((x as f32 - tx).powi(2) + dy2).sqrt());
+                            let mut a = 1.0 - smooth(0.4 * r, r, ((x as f32 - tx).powi(2) + dy2).sqrt());
+                            if let Some(c0) = auto {
+                                let c = shown_px[y * w + x];
+                                let d = ((c[0] - c0[0]).powi(2) + (c[1] - c0[1]).powi(2) + (c[2] - c0[2]).powi(2)).sqrt();
+                                a *= 1.0 - smooth(0.05, 0.14, d);
+                            }
                             *o = if add { o.max(a) } else { *o * (1.0 - a) };
                         }
                     }
@@ -1473,13 +1655,19 @@ fn finish(mut img: Rgb32FImage, p: &Params, scale: f32, full: (u32, u32), off: (
     let (cx, cy) = (big_w / 2.0, big_h / 2.0);
     let r2max = cx * cx + cy * cy;
     let cal_on = p.cal.iter().flatten().any(|v| *v != 0.0);
-    let cam = (!p.neg.enabled && p.cam_curve.len() >= 2).then_some(p.cam_curve.as_slice());
+    let dcp = (!p.neg.enabled && !p.dcp.is_empty()).then(|| crate::dcp::load(&p.dcp)).flatten();
+    let dcp_tone = p.dcp_tone && dcp.as_ref().is_some_and(|d| d.has_tone());
+    // The profile's own tone curve, when asked for, takes the place of the camera curve.
+    let cam = (!p.neg.enabled && !dcp_tone && p.cam_curve.len() >= 2).then_some(p.cam_curve.as_slice());
     img.par_chunks_mut(w * 3).enumerate().for_each(|(y, row)| {
         for (x, px) in px3_mut(row).iter_mut().enumerate() {
             let (gx, gy) = ((x + x0) as f32, (y + y0) as f32);
             // The camera's curve first: it was measured on the RAW as shot, before any of these settings.
             let k = cam.map_or(1.0, |cc| cam_gain(cc, luma(*px)));
             let mut c = [px[0] * gains[0] * k, px[1] * gains[1] * k, px[2] * gains[2] * k];
+            if let Some(d) = &dcp {
+                c = d.apply(c, dcp_tone);
+            }
             if cal_on {
                 c = mul(&cal, c);
             }
@@ -1490,6 +1678,9 @@ fn finish(mut img: Rgb32FImage, p: &Params, scale: f32, full: (u32, u32), off: (
             if p.cal_sh != 0.0 {
                 let s = (1.0 - smooth(0.0, 0.18, luma(c))) * p.cal_sh / 100.0 * 0.02;
                 c[1] += s;
+            }
+            if p.bw {
+                c = [bw_grey(c, &p.bw_mix); 3];
             }
             // Negative channels are colours outside sRGB (kept for wide-gamut exports); negative light isn't.
             *px = if luma(c) < 0.0 { [0.0; 3] } else { c };
@@ -1865,16 +2056,121 @@ pub fn auto_tone(src: &Rgb32FImage, p: &Params) -> Params {
         return q;
     }
     ys.sort_by(f32::total_cmp);
-    let med = ys[ys.len() / 2].max(1e-5);
-    q.exposure = (0.18 / med).log2().clamp(-4.0, 4.0);
+    let at = |f: f32| ys[((ys.len() - 1) as f32 * f) as usize].max(1e-5);
+    let med = at(0.5);
+    let k = (0.18 / med).clamp(1.0 / 16.0, 16.0);
+    q.exposure = k.log2();
+    // Then the rest of Lightroom's Auto, gently: pull in bright highlights, open deep shadows, and set contrast
+    // from how many stops the photo spans (about 7 between the 5th and 95th percentile reads as normal).
+    let (lo, hi, top) = (at(0.05) * k, at(0.95) * k, at(0.995) * k);
+    q.highlights = -((top - 0.85) * 120.0).clamp(0.0, 60.0);
+    q.shadows = ((0.012 - lo) * 2500.0).clamp(0.0, 40.0);
+    let spread = (hi / lo).log2();
+    q.contrast = ((7.0 - spread) * 6.0).clamp(-20.0, 25.0);
     q.whites = 10.0;
     q.blacks = -8.0;
+    if !q.bw && !q.neg.enabled {
+        q.vibrance = q.vibrance.max(12.0);
+    }
     q
+}
+
+/// Automatic white balance: the colour the photo's neutral areas have as shot (a shades-of-grey estimate over the
+/// mid-tones, leaving out clipped and very dark pixels and leaning on the less colourful ones), turned into
+/// Temp and Tint. `src` is the source as loaded, before any settings.
+pub fn auto_wb(src: &Rgb32FImage) -> (f32, f32) {
+    let px: Vec<[f32; 3]> = px3(src).iter().step_by(5).copied().filter(|c| {
+        let (mx, y) = (c[0].max(c[1]).max(c[2]), luma(*c));
+        mx < 0.95 && y > 0.01
+    }).collect();
+    if px.len() < 64 {
+        return (5500.0, 0.0);
+    }
+    // Shades of grey (Minkowski p = 4) with each pixel weighted towards the neutral ones.
+    let mut acc = [0f64; 3];
+    for c in &px {
+        let (_, s, _) = rgb_to_hsv(c.map(|v| linear_to_srgb(v.max(0.0))));
+        let w = (1.0 - s).max(0.05).powi(2) as f64;
+        for k in 0..3 {
+            acc[k] += w * (c[k].max(0.0) as f64).powi(4);
+        }
+    }
+    let grey = acc.map(|v| v.powf(0.25) as f32);
+    solve_wb(grey)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn black_and_white_mix_lightens_and_darkens_bands() {
+        let red = [0.5f32, 0.05, 0.03];
+        let plain = bw_grey(red, &[0.0; 8]);
+        assert!((plain - luma(red)).abs() < 1e-6);
+        let mut m = [0.0; 8];
+        m[0] = 80.0;
+        assert!(bw_grey(red, &m) > plain * 1.3, "red filter lightens red");
+        m[0] = -80.0;
+        assert!(bw_grey(red, &m) < plain * 0.8);
+        // Grey has no colour band to move.
+        assert!((bw_grey([0.2; 3], &m) - 0.2).abs() < 1e-5);
+        // The render comes out grey.
+        let src = Rgb32FImage::from_fn(8, 8, |x, _| image::Rgb(if x < 4 { red } else { [0.05, 0.1, 0.5] }));
+        let out = render(&src, &Params { bw: true, sh_amt: 0.0, ..Default::default() }, 1.0);
+        assert!(out.pixels().all(|p| (p.0[0] - p.0[1]).abs() < 1e-3 && (p.0[1] - p.0[2]).abs() < 1e-3));
+        // A toner then colours it.
+        let mut p = Params { bw: true, sh_amt: 0.0, ..Default::default() };
+        apply_toner(&mut p, 1);
+        let t = render(&src, &p, 1.0);
+        assert!(t.pixels().any(|p| p.0[0] > p.0[2] + 0.005), "sepia is warm");
+    }
+
+    #[test]
+    fn auto_white_balance_neutralises_a_cast() {
+        // A grey scene under warm light: more red, less blue.
+        let src = Rgb32FImage::from_fn(64, 64, |x, y| { let v = 0.05 + (x + y) as f32 / 128.0 * 0.5; image::Rgb([v * 1.25, v, v * 0.7]) });
+        let (t, tint) = auto_wb(&src);
+        let g = wb_gains(t, tint);
+        let c = [1.25 * g[0], g[1], 0.7 * g[2]];
+        let m = (c[0] + c[1] + c[2]) / 3.0;
+        assert!(c.iter().all(|v| (v / m - 1.0).abs() < 0.06), "{t} {tint} → {c:?}");
+        assert!(t < 5500.0, "warm light needs a cooler setting: {t}");
+    }
+
+    #[test]
+    fn red_eye_takes_out_red_and_leaves_the_rest() {
+        let mut img = Rgb32FImage::from_fn(40, 40, |x, y| {
+            let d = ((x as f32 - 20.0).powi(2) + (y as f32 - 20.0).powi(2)).sqrt();
+            image::Rgb(if d < 5.0 { [0.6, 0.08, 0.06] } else { [0.4, 0.3, 0.25] })
+        });
+        red_eye(&mut img, [20.0, 20.0], 8.0);
+        let c = img.get_pixel(20, 20).0;
+        assert!(c[0] < 0.1, "pupil no longer red: {c:?}");
+        assert_eq!(img.get_pixel(20, 15).0, [0.4, 0.3, 0.25].map(|v: f32| v), "skin (not much redder than it is green) is left alone");
+        assert_eq!(img.get_pixel(2, 2).0, [0.4, 0.3, 0.25]);
+    }
+
+    #[test]
+    fn paste_groups_copy_only_what_is_chosen() {
+        let me = Params { exposure: 1.0, crop: [0.1; 4], keywords: vec!["mine".into()], rating: 4, ..Default::default() };
+        let other = Params { exposure: -1.0, temp: 4000.0, crop: [0.2; 4], saturation: 30.0, keywords: vec!["theirs".into()], rating: 1, ..Default::default() };
+        let usual = me.with_parts_of(&other, &paste_defaults());
+        assert_eq!((usual.exposure, usual.temp, usual.saturation), (-1.0, 4000.0, 30.0));
+        assert_eq!((usual.crop, usual.rating, usual.keywords.clone()), ([0.1; 4], 4, vec!["mine".to_string()]), "crop, rating and keywords stay");
+        // Only white balance.
+        let mut on = vec![false; PASTE_GROUPS.len()];
+        on[0] = true;
+        let wb = me.with_parts_of(&other, &on);
+        assert_eq!((wb.temp, wb.exposure), (4000.0, 1.0));
+        // Crop when asked.
+        let crop_i = PASTE_GROUPS.iter().position(|g| g.0 == "Crop").unwrap();
+        on[crop_i] = true;
+        assert_eq!(me.with_parts_of(&other, &on).crop, [0.2; 4]);
+        // The usual groups are what paste did before: the look without geometry or the conversion.
+        let old = me.with_look_of(&other);
+        assert_eq!(serde_json::to_value(&old).unwrap(), serde_json::to_value(&usual).unwrap());
+    }
 
     #[test]
     fn target_picks_region_and_band() {
@@ -2371,7 +2667,7 @@ mod edge_fuzz {
         let mut q = p.clone(); q.rot90 = 3; q.flip_h = true; variants.push(("rot90", q));
         let mut q = p.clone(); q.border = Border { width: 100.0, white: true, aspect: 0.8, caption: "ferrotype".into() }; variants.push(("border", q));
         let mut q = p.clone(); q.neg.enabled = true; variants.push(("negative", q));
-        let mut q = p.clone(); q.spots = vec![Spot { x: 0.5, y: 0.5, r: 0.5, sx: 0.9, sy: 0.1, path: vec![[0.1, 0.1], [0.9, 0.9]], clone: false, angle: 30.0 }]; variants.push(("spots", q));
+        let mut q = p.clone(); q.spots = vec![Spot { x: 0.5, y: 0.5, r: 0.5, sx: 0.9, sy: 0.1, path: vec![[0.1, 0.1], [0.9, 0.9]], clone: false, angle: 30.0, ..Default::default() }]; variants.push(("spots", q));
         let mut q = p.clone(); q.masks = vec![Mask { parts: vec![MaskPart { shape: Shape::Radial { c: [0.5, 0.5], rx: 0.0, ry: 0.0, angle: 0.0, feather: 100.0 }, op: MaskOp::Add, invert: false }, MaskPart { shape: Shape::Linear { a: [0.5, 0.5], b: [0.5, 0.5] }, op: MaskOp::Add, invert: false }, MaskPart { shape: Shape::Brush { dabs: vec![[0.5, 0.5, 0.0, 1.0]] }, op: MaskOp::Add, invert: false }, MaskPart { shape: Shape::Luminance { lo: 0.5, hi: 0.5, soft: 0.0 }, op: MaskOp::Intersect, invert: true }], opacity: 100.0, feather: 100.0, ..Default::default() }]; variants.push(("masks", q));
         let mut q = p.clone(); q.curves = [vec![[0.5, 0.5]], vec![[0.0, 1.0], [1.0, 0.0]], vec![[0.3, 0.3], [0.3, 0.6]], vec![]]; variants.push(("curves", q));
         let mut q = p.clone(); q.exposure = 5.0; q.temp = 50000.0; q.tint = 150.0; variants.push(("extreme wb", q));

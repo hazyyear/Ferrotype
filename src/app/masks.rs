@@ -21,6 +21,8 @@ pub(super) struct MaskUi {
     pub pick: bool,
     pub size: f32,
     pub erase: bool,
+    /// Auto mask: brush strokes stay on colours like the one under the brush's centre, so they stop at edges.
+    pub auto: bool,
     tab: usize,
     curve_chan: usize,
     curve_grab: Option<usize>,
@@ -30,7 +32,7 @@ pub(super) struct MaskUi {
 
 impl Default for MaskUi {
     fn default() -> Self {
-        MaskUi { sel: 0, draw: Draw::Linear, op: MaskOp::Add, overlay: true, pick: false, size: 4.0, erase: false, tab: 0, curve_chan: 0, curve_grab: None, drag: None }
+        MaskUi { sel: 0, draw: Draw::Linear, op: MaskOp::Add, overlay: true, pick: false, size: 4.0, erase: false, auto: false, tab: 0, curve_chan: 0, curve_grab: None, drag: None }
     }
 }
 
@@ -188,6 +190,7 @@ pub(super) fn masks_panel(ui: &mut Ui, st: &mut MaskUi, p: &mut Params) -> bool 
     if st.draw == Draw::Brush {
         slider(ui, "Brush size", &mut st.size, 0.5, 20.0, 4.0, None);
         switch_row(ui, "Erase", &mut st.erase);
+        switch_row(ui, "Auto mask", &mut st.auto).on_hover_text("Keeps the stroke to colours like the one under the centre of the brush, so it stops at edges such as a skyline");
     }
     group(ui, "Mask", None);
     slider(ui, "Opacity", &mut m.opacity, 0.0, 100.0, 100.0, None);
@@ -365,7 +368,7 @@ impl App {
         {
             ensure(self);
             let f = frame_at(self, pos);
-            let (op, erase) = (self.mask_ui.op, self.mask_ui.erase);
+            let (op, erase, auto) = (self.mask_ui.op, self.mask_ui.erase, self.mask_ui.auto);
             let m = &mut self.params.masks[self.mask_ui.sel];
             let op = if m.parts.is_empty() { MaskOp::Add } else { op };
             if !matches!(m.parts.last(), Some(MaskPart { shape: Shape::Brush { .. }, op: o, .. }) if *o == op) {
@@ -373,7 +376,8 @@ impl App {
             }
             if let Some(MaskPart { shape: Shape::Brush { dabs }, .. }) = m.parts.last_mut() {
                 // A dab every third of a radius along the stroke keeps it smooth however fast the mouse moves.
-                let sign = if erase { -1.0 } else { 1.0 };
+                // ±1 paints or erases; ±2 does the same with Auto mask (see develop::mask_weights).
+                let sign = if erase { -1.0 } else { 1.0 } * if auto { 2.0 } else { 1.0 };
                 let step = rad * fw.max(fh) * 0.33;
                 match dabs.last().copied().filter(|_| !resp.drag_started() && !resp.clicked()) {
                     Some(d) => {
