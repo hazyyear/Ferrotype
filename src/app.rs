@@ -834,8 +834,9 @@ fn fmt_grade(g: f32) -> String {
     if g - whole as f32 >= 0.25 { format!("{whole}\u{bd}") } else { whole.to_string() }
 }
 
-fn kind_label(k: Kind) -> &'static str {
-    match k { Kind::Color => "C-41 colour negative", Kind::Cine => "ECN-2 motion picture", Kind::Bw => "Black & white", Kind::Slide => "E-6 slide, no inversion" }
+/// The line under a stock's name: what it is, how it is developed, and whether it is still made.
+fn kind_label(s: &negative::Stock) -> String {
+    format!("{}{}", negative::process(s), if negative::discontinued(s) { ", discontinued" } else { "" })
 }
 
 /// Human label + value for the most significant change between two settings (history list).
@@ -6612,7 +6613,7 @@ impl App {
                         ui.spacing_mut().item_spacing.y = 2.0;
                         ui.label(RichText::new(format!("{} {}", st.brand, st.name)).family(semi()).size(15.0).color(if on { TEXT } else { TEXT2 }));
                         let iso = stock_iso(st);
-                        let what = if iso.is_empty() { kind_label(st.kind).to_string() } else { format!("ISO {iso} · {}", kind_label(st.kind)) };
+                        let what = if iso.is_empty() { kind_label(st) } else { format!("ISO {iso} · {}", kind_label(st)) };
                         ui.label(RichText::new(if on { what } else { format!("Not converted · {what}") }).size(12.0).color(TEXT2));
                     });
                 });
