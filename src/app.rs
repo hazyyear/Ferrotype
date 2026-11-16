@@ -592,19 +592,6 @@ fn user_preset_dir() -> Option<PathBuf> {
     Some(crate::keys::dirs_config()?.join("presets"))
 }
 
-fn builtin_presets() -> Vec<(String, Params)> {
-    let d = Params::default();
-    vec![
-        ("Ferro Natural".into(), d.clone()),
-        ("Punchy".into(), Params { contrast: 25.0, vibrance: 25.0, clarity: 15.0, blacks: -10.0, ..d.clone() }),
-        ("Soft film".into(), Params { contrast: -15.0, highlights: -30.0, shadows: 20.0, blacks: 15.0, saturation: -10.0, gr_amt: 20.0, c_sh: 15.0, ..d.clone() }),
-        ("Warm matte".into(), Params { temp: 6300.0, blacks: 25.0, c_sh: 20.0, c_hi: -10.0, vibrance: -5.0, grade: [[35.0, 20.0, 0.0], [0.0; 3], [45.0, 15.0, 0.0], [0.0; 3]], ..d.clone() }),
-        ("Teal & orange".into(), Params { grade: [[195.0, 30.0, 0.0], [0.0; 3], [35.0, 25.0, 0.0], [0.0; 3]], contrast: 15.0, vibrance: 10.0, ..d.clone() }),
-        ("B&W classic".into(), Params { saturation: -100.0, contrast: 30.0, clarity: 20.0, gr_amt: 15.0, ..d.clone() }),
-        ("B&W high key".into(), Params { saturation: -100.0, exposure: 0.6, highlights: -40.0, whites: 20.0, contrast: -10.0, ..d }),
-    ]
-}
-
 /// The preview as shown: the photo rendered, the mask overlay and clipping marks, the border, the paper proof.
 /// Runs on the render thread; `key` and `generation` are filled in by the caller.
 fn render_preview(src: &Rgb32FImage, full_w: u32, shown: &Params, overlay: Option<usize>, clip_view: bool, proof: usize, printer: Option<Arc<crate::colour::Proof>>) -> RenderOut {
@@ -888,7 +875,7 @@ fn neutral_through(gains: [f32; 3]) -> Color32 {
 impl App {
     fn new() -> Self {
         let (tx, rx) = mpsc::channel();
-        let mut presets = builtin_presets();
+        let mut presets = crate::presets::builtin();
         if let Some(dir) = user_preset_dir() {
             let mut user: Vec<(String, Params)> = std::fs::read_dir(dir).into_iter().flatten().flatten().filter_map(|e| {
                 let p = e.path();
@@ -5444,7 +5431,7 @@ impl App {
             ui.label(caps("Presets"));
         });
         let mut apply = None;
-        for (i, (name, _)) in self.presets.iter().enumerate() {
+        let mut row = |ui: &mut Ui, i: usize| {
             let on = self.last_preset == Some(i);
             let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::click());
             if on || resp.hovered() {
@@ -5457,10 +5444,22 @@ impl App {
                     ui.painter().rect_filled(th, 4.0, CARD);
                 }
             }
-            ui.painter().text(pos2(th.right() + 10.0, r.center().y), Align2::LEFT_CENTER, name, FontId::proportional(13.0), if on { INK } else { TEXT });
+            ui.painter().text(pos2(th.right() + 10.0, r.center().y), Align2::LEFT_CENTER, &self.presets[i].0, FontId::proportional(13.0), if on { INK } else { TEXT });
             if resp.clicked() {
                 apply = Some(i);
             }
+        };
+        // The built-in looks in their groups, then your own. Basic and your own start open.
+        let mut first = 0;
+        let yours = ("Yours", self.presets.len().saturating_sub(crate::presets::GROUPS.iter().map(|g| g.1).sum()));
+        for (g, (title, n)) in crate::presets::GROUPS.into_iter().chain([yours]).enumerate() {
+            let range = first..(first + n).min(self.presets.len());
+            first = range.end;
+            if range.is_empty() {
+                continue;
+            }
+            let open = g == 0 || title == "Yours";
+            disclose_from(ui, &format!("{title} ({})", range.len()), &format!("presets{g}"), open, |ui| range.for_each(|i| row(ui, i)));
         }
         // Film stocks you saved in Negative live in the same list: picking one converts this frame with it.
         let mut film = None;
