@@ -4379,26 +4379,10 @@ impl App {
 
     /// Eyedropper for the film base: average a small patch of the (un-inverted) scan.
     fn pick_base(&mut self, u: f32, v: f32) {
-        let Some(photo) = &self.photo else { return };
-        let geo = develop::geometry(&photo.preview, &self.params);
-        let (w, h) = geo.dimensions();
-        // The view may include a border: map the click from the framed canvas back onto the photo.
-        let (cw, ch, ox, oy, _) = develop::border_layout(w, h, &self.params.border);
-        let (cx, cy) = ((u * cw as f32) as i64 - ox as i64, (v * ch as f32) as i64 - oy as i64);
-        let mut acc = [0f32; 3];
-        let mut n = 0.0;
-        for y in (cy - 3).max(0)..(cy + 4).min(h as i64) {
-            for x in (cx - 3).max(0)..(cx + 4).min(w as i64) {
-                let p = geo.get_pixel(x as u32, y as u32).0;
-                (0..3).for_each(|c| acc[c] += p[c]);
-                n += 1.0;
-            }
-        }
-        if n > 0.0 {
-            self.params.neg.base = Some(acc.map(|a| (a / n).max(1e-4)));
-            self.params.neg.levels = None;
-            self.picking_base = false;
-        }
+        let Some(c) = self.scan_patch(u, v) else { return };
+        self.params.neg.base = Some(c);
+        self.params.neg.levels = None;
+        self.picking_base = false;
     }
 
     fn histogram_block(&mut self, ui: &mut Ui) {
