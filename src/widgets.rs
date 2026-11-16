@@ -244,7 +244,8 @@ pub fn chip(ui: &mut Ui, text: &str, on: bool) -> egui::Response {
 pub fn tile(ui: &mut Ui, text: &str, on: bool, width: f32) -> egui::Response {
     ui.add(egui::Button::new(RichText::new(text).size(12.0).color(if on { INK } else { TEXT2 }))
         .fill(if on { BONE } else { Color32::TRANSPARENT })
-        .stroke(Stroke::new(1.0, if on { BONE } else { BORDER }))
+        // Off tiles use the button outline, not the hairline: a hairline reads as disabled.
+        .stroke(Stroke::new(1.0, if on { BONE } else { BTN_BORDER }))
         .min_size(vec2(width, 30.0)))
 }
 

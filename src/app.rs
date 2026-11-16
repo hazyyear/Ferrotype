@@ -3726,6 +3726,13 @@ impl App {
                 if tab(ui, name, self.module == m).clicked() {
                     self.module = m;
                     self.tool = Tool::None;
+                    // The editing views open the frame picked in Library or Cull, like the D key does.
+                    if matches!(m, Module::Develop | Module::Negative | Module::Scan)
+                        && let Some(f) = self.lib_sel.clone()
+                        && self.current.as_ref() != Some(&f)
+                    {
+                        self.select(ui.ctx(), f);
+                    }
                     self.convert_if_negative();
                 }
             }
@@ -3752,7 +3759,7 @@ impl App {
                     self.open_import();
                 }
                 if !develop {
-                    ui.add(egui::TextEdit::singleline(&mut self.lib_query).hint_text("Search keywords, camera, lens, iso>1600…").desired_width(260.0).margin(vec2(10.0, 6.0)))
+                    ui.add(egui::TextEdit::singleline(&mut self.lib_query).hint_text("Search keywords, camera, iso>1600").desired_width(260.0).margin(vec2(10.0, 6.0)))
                         .on_hover_text("Words match the name, keywords, camera, lens, date, roll and film notes. Put a minus in front to leave a word out (-word). You can also use iso>1600, focal<35, f<2.8, stars>=3, date:2026-05 and \"two words\".");
                     self.ensure_search();
                 } else {
@@ -5027,7 +5034,7 @@ impl App {
             let q = if self.current.as_deref() == Some(f) { self.params.clone() } else { read_params(f).unwrap_or_default() };
             self.info_text = (Some(f.to_path_buf()), q.title, q.caption);
         }
-        ui.add_space(10.0);
+        ui.add_space(12.0);
         ui.label(caps("Title and caption"));
         let t = ui.add(egui::TextEdit::singleline(&mut self.info_text.1).hint_text("Title").desired_width(f32::INFINITY));
         let c = ui.add(egui::TextEdit::multiline(&mut self.info_text.2).hint_text("Caption").desired_rows(2).desired_width(f32::INFINITY));
@@ -5058,13 +5065,14 @@ impl App {
             }
         });
         let mut remove = None;
-        ui.horizontal_wrapped(|ui| {
+        // Only take a row for chips when there are some; an empty row left a gap under the heading.
+        if !kws.is_empty() { ui.horizontal_wrapped(|ui| {
             for k in &kws {
                 if chip(ui, &format!("{k}  ×"), false).on_hover_text("Remove").clicked() {
                     remove = Some(k.clone());
                 }
             }
-        });
+        }); }
         let resp = ui.add(egui::TextEdit::singleline(&mut self.kw_text).hint_text("Add keywords, for example street, Lisbon").desired_width(f32::INFINITY));
         let add = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         let mut change: Option<(Vec<String>, Option<String>)> = None;
@@ -5257,16 +5265,25 @@ impl App {
                 add(ui).changed()
             }).inner
         };
-        // Hints are examples, not values: dim and italic, so an empty field never reads as filled in.
+        // Hints are examples, not values: "e.g.", dim and italic, so an empty field never reads as filled in.
         fn text<'a>(v: &'a mut String, hint: &'a str) -> impl FnMut(&mut Ui) -> egui::Response + 'a {
-            move |ui: &mut Ui| ui.add(egui::TextEdit::singleline(v).hint_text(RichText::new(hint).italics().color(TEXT3.gamma_multiply(0.8))).desired_width(f32::INFINITY))
+            move |ui: &mut Ui| ui.add(egui::TextEdit::singleline(v).hint_text(RichText::new(hint).italics().color(TEXT3)).desired_width(f32::INFINITY))
         }
-        changed |= row(ui, "Roll", &mut text(&mut r.roll, "12"));
-        changed |= row(ui, "Camera", &mut text(&mut r.camera, "Nikon FM2"));
-        changed |= row(ui, "Lens", &mut text(&mut r.lens, "50mm f/1.8"));
+        // Number fields show a word while empty ("not noted"); draw that word dim like a hint.
+        fn number(ui: &mut Ui, empty: bool, add: impl FnOnce(&mut Ui) -> egui::Response) -> egui::Response {
+            ui.scope(|ui| {
+                if empty {
+                    ui.visuals_mut().override_text_color = Some(TEXT3);
+                }
+                add(ui)
+            }).inner
+        }
+        changed |= row(ui, "Roll", &mut text(&mut r.roll, "e.g. 12"));
+        changed |= row(ui, "Camera", &mut text(&mut r.camera, "e.g. Nikon FM2"));
+        changed |= row(ui, "Lens", &mut text(&mut r.lens, "e.g. 50mm f/1.8"));
         // Film: one of the known stocks (so the conversion can use it), or any name.
         let known = negative::STOCKS.iter().find(|s| s.id == r.stock);
-        let shown = known.map_or_else(|| if r.stock.is_empty() { "Not noted".to_string() } else { r.stock.clone() }, |s| format!("{} {}", s.brand, s.name));
+        let shown = known.map_or_else(|| if r.stock.is_empty() { RichText::new("Not noted").italics().color(TEXT3) } else { RichText::new(r.stock.clone()) }, |s| RichText::new(format!("{} {}", s.brand, s.name)));
         changed |= row(ui, "Film", &mut |ui: &mut Ui| {
             let mut resp = egui::ComboBox::from_id_salt("roll_stock").selected_text(shown.clone()).width(ui.available_width()).height(320.0).show_ui(ui, |ui| {
                 let mut c = false;
@@ -5294,19 +5311,21 @@ impl App {
         if known.is_none() {
             changed |= row(ui, "", &mut text(&mut r.stock, "or type a film name"));
         }
-        changed |= row(ui, "Box speed", &mut |ui: &mut Ui| ui.add(egui::DragValue::new(&mut r.iso).range(0.0..=25600.0).speed(5.0).custom_formatter(|v, _| if v <= 0.0 { "Not noted".into() } else { format!("{v:.0} ISO") }).custom_parser(|t| t.trim().trim_end_matches(|c: char| c.is_alphabetic() || c == ' ').trim().parse().ok())));
+        let iso_empty = r.iso <= 0.0;
+        changed |= row(ui, "Box speed", &mut |ui: &mut Ui| number(ui, iso_empty, |ui| ui.add(egui::DragValue::new(&mut r.iso).range(0.0..=25600.0).speed(5.0).custom_formatter(|v, _| if v <= 0.0 { "Not noted".into() } else { format!("{v:.0} ISO") }).custom_parser(|t| t.trim().trim_end_matches(|c: char| c.is_alphabetic() || c == ' ').trim().parse().ok()))));
+        let ei_empty = r.ei <= 0.0;
         changed |= row(ui, "Shot at", &mut |ui: &mut Ui| {
-            let resp = ui.add(egui::DragValue::new(&mut r.ei).range(0.0..=25600.0).speed(5.0).custom_formatter(|v, _| if v <= 0.0 { "box speed".into() } else { format!("{v:.0} EI") }));
+            let resp = number(ui, ei_empty, |ui| ui.add(egui::DragValue::new(&mut r.ei).range(0.0..=25600.0).speed(5.0).custom_formatter(|v, _| if v <= 0.0 { "box speed".into() } else { format!("{v:.0} EI") })));
             let p = r.push_label();
             if !p.is_empty() {
                 ui.label(RichText::new(p).size(11.5).color(TEXT2));
             }
             resp
         });
-        changed |= row(ui, "Developer", &mut text(&mut r.developer, "D-76 1+1, 9:45"));
+        changed |= row(ui, "Developer", &mut text(&mut r.developer, "e.g. D-76 1+1"));
         changed |= row(ui, "Date", &mut text(&mut r.date, "YYYY-MM-DD"));
         ui.add_space(2.0);
-        changed |= ui.add(egui::TextEdit::multiline(&mut r.notes).hint_text(RichText::new("Notes for the roll").italics().color(TEXT3.gamma_multiply(0.8))).desired_rows(2).desired_width(f32::INFINITY)).changed();
+        changed |= ui.add(egui::TextEdit::multiline(&mut r.notes).hint_text(RichText::new("Notes for the roll").italics().color(TEXT3)).desired_rows(2).desired_width(f32::INFINITY)).changed();
         // This frame's settings, when one is selected.
         if let Some(f) = self.lib_sel.clone() {
             let key = crate::roll::frame_key(&f);
@@ -5314,9 +5333,10 @@ impl App {
             ui.add_space(10.0);
             ui.label(caps("This frame"));
             let mut fc = false;
-            fc |= row(ui, "Aperture", &mut |ui: &mut Ui| ui.add(egui::DragValue::new(&mut fr.aperture).range(0.0..=64.0).speed(0.1).custom_formatter(|v, _| if v <= 0.0 { "—".into() } else { format!("f/{v:.1}") })));
-            fc |= row(ui, "Shutter", &mut text(&mut fr.shutter, "1/125"));
-            fc |= row(ui, "Focal length", &mut |ui: &mut Ui| ui.add(egui::DragValue::new(&mut fr.focal).range(0.0..=2000.0).speed(0.5).custom_formatter(|v, _| if v <= 0.0 { "roll's lens".into() } else { format!("{v:.0} mm") })));
+            let (ap_empty, fl_empty) = (fr.aperture <= 0.0, fr.focal <= 0.0);
+            fc |= row(ui, "Aperture", &mut |ui: &mut Ui| number(ui, ap_empty, |ui| ui.add(egui::DragValue::new(&mut fr.aperture).range(0.0..=64.0).speed(0.1).custom_formatter(|v, _| if v <= 0.0 { "Not noted".into() } else { format!("f/{v:.1}") }))));
+            fc |= row(ui, "Shutter", &mut text(&mut fr.shutter, "e.g. 1/125"));
+            fc |= row(ui, "Focal length", &mut |ui: &mut Ui| number(ui, fl_empty, |ui| ui.add(egui::DragValue::new(&mut fr.focal).range(0.0..=2000.0).speed(0.5).custom_formatter(|v, _| if v <= 0.0 { "roll's lens".into() } else { format!("{v:.0} mm") }))));
             fc |= row(ui, "Note", &mut text(&mut fr.note, ""));
             if fc {
                 if fr.is_empty() {
@@ -5445,7 +5465,8 @@ impl App {
             };
             self.preset_name.clear();
         }
-        if ui.add(egui::Button::new(RichText::new("Import Lightroom presets…").size(12.0).color(TEXT2)).fill(Color32::TRANSPARENT).stroke(Stroke::NONE)).clicked()
+        // Outlined and full width, so its edge lines up with the preset name field above.
+        if ui.add(egui::Button::new(RichText::new("Import Lightroom presets…").size(12.0).color(TEXT2)).min_size(vec2(ui.available_width(), 28.0))).clicked()
             && let Some(files) = rfd::FileDialog::new().add_filter("Lightroom preset", &["xmp"]).pick_files()
         {
             let (mut n, mut failed) = (0, 0);
@@ -5510,7 +5531,11 @@ impl App {
         });
         let mut jump = None;
         egui::ScrollArea::vertical().id_salt("hist").auto_shrink([false, false]).show(ui, |ui| {
-            for i in (0..self.history.len()).rev() {
+            if self.current.is_none() {
+                ui.label(RichText::new("Changes show here once a frame is open.").size(11.0).color(TEXT3));
+            }
+            let rows = if self.current.is_some() { self.history.len() } else { 0 };
+            for i in (0..rows).rev() {
                 let (label, val) = if i == 0 { ("Opened".to_string(), String::new()) } else { describe_change(&self.history[i - 1], &self.history[i]) };
                 let fg = if i == self.hist_pos { INK } else if i > self.hist_pos { TEXT3 } else { TEXT2 };
                 let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::click());
@@ -6353,27 +6378,29 @@ impl App {
 
     fn develop_footer(&mut self, ui: &mut Ui) {
         // Everything that moves settings between frames in one place, Reset last and quiet: it throws work away.
+        // One button style for the whole footer (outlined, like Paste previous and Sync settings below).
+        let btn = |t: &str| egui::Button::new(t).min_size(vec2(0.0, 28.0));
         ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 2.0;
-            if ghost(ui, "Copy", false).on_hover_text("Copy these settings (Ctrl/Cmd+C)").clicked() {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            if ui.add(btn("Copy")).on_hover_text("Copy these settings (Ctrl/Cmd+C)").clicked() {
                 self.copied = Some(self.params.clone());
             }
-            if ui.add_enabled(self.copied.is_some(), egui::Button::new(RichText::new("Paste").color(TEXT2)).fill(Color32::TRANSPARENT).stroke(Stroke::NONE))
-                .on_hover_text("Paste the copied settings (Ctrl/Cmd+V), the groups chosen under Paste…").clicked() {
+            if ui.add_enabled(self.copied.is_some(), btn("Paste"))
+                .on_hover_text("Paste the copied settings (Ctrl/Cmd+V), the groups chosen under Paste some…").clicked() {
                 self.params = self.params.with_parts_of(self.copied.as_ref().unwrap(), &self.paste_groups);
             }
-            if ui.add_enabled(self.copied.is_some(), egui::Button::new(RichText::new("Paste some…").color(TEXT2)).fill(Color32::TRANSPARENT).stroke(Stroke::NONE))
+            if ui.add_enabled(self.copied.is_some(), btn("Paste some…"))
                 .on_hover_text("Choose which settings to paste (Ctrl/Cmd+Shift+V)").clicked() {
                 self.paste_dlg = Some(false);
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ghost(ui, "Reset", false).on_hover_text("Clear this photo's Develop settings (undo brings them back)").clicked() {
+                if ui.add(btn("Reset")).on_hover_text("Clear this photo's Develop settings (undo brings them back)").clicked() {
                     // The conversion and the profile it was measured with stay together.
                     self.params = Params { neg: self.params.neg.clone(), profile: self.params.profile.clone(), ..Params::default() };
                 }
             });
         });
-        ui.add_space(4.0);
+        ui.add_space(6.0);
         ui.columns(2, |c| {
             if c[0].add_enabled(self.prev_params.is_some(), egui::Button::new("Paste previous").min_size(vec2(c[0].available_width(), 32.0))).on_hover_text("Apply the settings of the frame you edited before this one").clicked() {
                 let prev = self.prev_params.clone().unwrap();
@@ -6412,6 +6439,7 @@ impl App {
                 // Your own profiles first.
                 ui.add_space(8.0);
                 ui.label(caps("My film"));
+                ui.add_space(4.0);
                 let mut apply = None;
                 let mut remove = None;
                 let mut share = None;
@@ -6441,7 +6469,7 @@ impl App {
                     });
                 }
                 ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut self.my_stock_name).hint_text("Name").desired_width(ui.available_width() - 150.0));
+                    ui.add(egui::TextEdit::singleline(&mut self.my_stock_name).hint_text("Name").desired_width(ui.available_width() - 150.0).margin(vec2(8.0, 5.0)));
                     let can = !self.my_stock_name.trim().is_empty() && self.params.neg.enabled;
                     if ui.add_enabled(can, egui::Button::new("Save")).on_hover_text("Save this photo's stock and adjustments as your own profile").on_disabled_hover_text("Convert a negative first, then name the profile").clicked() {
                         match negative::CustomStock::new(&self.my_stock_name, &self.params.neg).install() {
@@ -6463,6 +6491,8 @@ impl App {
                         self.my_stocks = negative::custom_stocks();
                     }
                 });
+                // Room before the stock list, so the save row doesn't run into its first heading.
+                ui.add_space(14.0);
                 if let Some(k) = apply {
                     self.params.neg = self.my_stocks[k].1.apply(&self.params.neg);
                 }
@@ -7335,10 +7365,12 @@ impl eframe::App for App {
                 egui::Panel::left("left").exact_size(260.0).resizable(false)
                     .frame(if neg { side(PANEL) } else { pad(PANEL, 12, 16) })
                     .show(ui, |ui| if neg { self.negative_left(ui) } else { self.develop_left(ui) });
+                // With no frame open the controls would edit nothing, so they are shown dimmed.
+                let open = self.current.is_some();
                 egui::Panel::right("right").exact_size(RIGHT_W).resizable(false).frame(side(PANEL)).show(ui, |ui| {
-                    egui::Panel::bottom("right_footer").frame(pad(PANEL, 16, 10)).show(ui, |ui| if neg { self.negative_footer(ui) } else { self.develop_footer(ui) });
+                    egui::Panel::bottom("right_footer").frame(pad(PANEL, 16, 10)).show(ui, |ui| ui.add_enabled_ui(open, |ui| if neg { self.negative_footer(ui) } else { self.develop_footer(ui) }));
                     egui::Panel::top("hist").frame(pad(PANEL, 16, 12)).show(ui, |ui| self.histogram_block(ui));
-                    egui::CentralPanel::default().frame(egui::Frame::new()).show(ui, |ui| if neg { self.negative_right(ui) } else { self.develop_right(ui) });
+                    egui::CentralPanel::default().frame(egui::Frame::new()).show(ui, |ui| ui.add_enabled_ui(open, |ui| if neg { self.negative_right(ui) } else { self.develop_right(ui) }));
                 });
                 if !neg && self.curve_big {
                     self.curve_window(&ctx);
