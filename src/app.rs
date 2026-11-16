@@ -3774,7 +3774,7 @@ impl App {
                     self.open_import();
                 }
                 // Search is in every tab; typing outside Library and Cull takes you to the Library's results.
-                let q = ui.add(egui::TextEdit::singleline(&mut self.lib_query).hint_text("Search keywords, camera, iso>1600").desired_width(220.0).margin(vec2(10.0, 6.0)))
+                let q = ui.add(egui::TextEdit::singleline(&mut self.lib_query).hint_text("Search keywords, camera, iso>1600").desired_width(250.0).margin(vec2(10.0, 6.0)))
                     .on_hover_text("Words match the name, keywords, camera, lens, date, roll and film notes. Put a minus in front to leave a word out (-word). You can also use iso>1600, focal<35, f<2.8, stars>=3, date:2026-05 and \"two words\".");
                 if q.changed() && !browse {
                     self.module = Module::Library;
@@ -6521,7 +6521,7 @@ impl App {
                     });
                 }
                 ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut self.my_stock_name).hint_text("Name").desired_width(ui.available_width() - 190.0).margin(vec2(8.0, 5.0)));
+                    ui.add(egui::TextEdit::singleline(&mut self.my_stock_name).hint_text("Name this profile").desired_width(ui.available_width() - 64.0).margin(vec2(8.0, 5.0)));
                     let can = !self.my_stock_name.trim().is_empty() && self.params.neg.enabled;
                     if ui.add_enabled(can, egui::Button::new("Save")).on_hover_text("Save this photo's stock and adjustments as your own profile").on_disabled_hover_text("Convert a negative first, then name the profile").clicked() {
                         match negative::CustomStock::new(&self.my_stock_name, &self.params.neg).install() {
@@ -6533,7 +6533,10 @@ impl App {
                             Err(e) => self.status = format!("Could not save: {e}"),
                         }
                     }
-                    if ui.button("Import profile…").on_hover_text("Add a .ferrostock film profile someone shared").clicked()
+                });
+                // Its own row, so the name field keeps its width.
+                ui.horizontal(|ui| {
+                    if small_action(ui, "Import profile…", false).on_hover_text("Add a .ferrostock film profile someone shared").clicked()
                         && let Some(f) = rfd::FileDialog::new().add_filter("Film stock profile", &[negative::CUSTOM_EXT]).pick_file()
                     {
                         self.status = match negative::CustomStock::from_file(&f).and_then(|c| c.install().map(|_| c.name)) {
