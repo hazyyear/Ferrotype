@@ -349,7 +349,7 @@ impl Default for Params {
 /// (made for one camera model).
 pub const PASTE_GROUPS: [(&str, &[&str], bool); 19] = [
     ("White balance", &["temp", "tint"], true),
-    ("Tone", &["exposure", "contrast", "highlights", "shadows", "whites", "blacks"], true),
+    ("Tone", &["exposure", "contrast", "highlights", "shadows", "whites", "blacks", "agx"], true),
     ("Presence", &["texture", "clarity", "dehaze", "vibrance", "saturation"], true),
     ("Tone curve", &["c_hi", "c_li", "c_da", "c_sh", "curves", "curve_lum"], true),
     ("Colour mixer and B&W", &["hsl", "bw", "bw_mix"], true),
@@ -365,7 +365,7 @@ pub const PASTE_GROUPS: [(&str, &[&str], bool); 19] = [
     ("Transform", &["t_vert", "t_hor", "t_rot", "t_scale", "flip_h"], false),
     ("Crop", &["crop"], false),
     ("Heal spots and red eye", &["spots"], false),
-    ("Negative conversion", &["neg"], false),
+    ("Negative conversion", &["neg", "ir_clean"], false),
     ("Camera profile (DCP)", &["dcp", "dcp_tone"], false),
 ];
 
@@ -381,6 +381,7 @@ impl Params {
         let mut p = other.clone();
         (p.t_vert, p.t_hor, p.t_rot, p.t_scale, p.flip_h, p.crop) = (self.t_vert, self.t_hor, self.t_rot, self.t_scale, self.flip_h, self.crop);
         p.neg = self.neg.clone();
+        p.ir_clean = self.ir_clean; // belongs to the scan, like the conversion
         p.spots = self.spots.clone();
         (p.rating, p.flag, p.label, p.rot90) = (self.rating, self.flag, self.label, self.rot90);
         p.snapshots = self.snapshots.clone();
@@ -751,6 +752,30 @@ fn heal(img: &mut Rgb32FImage, p: &Params, full: (usize, usize), off: (f32, f32)
             }
         });
     }
+}
+
+/// The (geometry-corrected) source for `win`, healed. Heal, clone and fill read around each spot (its source, the
+/// texture a fill searches), so a window is healed with a margin that holds all of that, then cut back:
+/// otherwise a source just off screen at 1:1 zoom would read the window's edge.
+fn heal_window(src: &Rgb32FImage, p: &Params, win: Option<Window>, (full_w, full_h): (u32, u32)) -> Rgb32FImage {
+    let Some([x0, y0, ww, wh]) = win.filter(|_| !p.spots.is_empty()) else {
+        let mut base = geometry_window(src, p, win);
+        heal(&mut base, p, (full_w as usize, full_h as usize), (0.0, 0.0));
+        return base;
+    };
+    let (fw, fh, _, _) = frame_of(p, full_w as usize, full_h as usize);
+    let long = fw.max(fh);
+    let m = p.spots.iter().filter(|s| !s.avoid).map(|s| {
+        let r = (s.r * long).max(1.5);
+        let reach = if s.fill { r * 4.0 + 8.0 } else { ((s.sx - s.x) * fw).hypot((s.sy - s.y) * fh) + r * 1.2 };
+        reach + s.path.iter().map(|q| ((q[0] - s.x) * fw).hypot((q[1] - s.y) * fh)).fold(0.0, f32::max)
+    }).fold(0.0, f32::max).ceil() as u32 + 2;
+    let (px0, py0) = (x0.saturating_sub(m), y0.saturating_sub(m));
+    let (px1, py1) = ((x0 + ww + m).min(full_w), (y0 + wh + m).min(full_h));
+    let mut base = geometry_window(src, p, Some([px0, py0, px1 - px0, py1 - py0]));
+    heal(&mut base, p, (full_w as usize, full_h as usize), (px0 as f32, py0 as f32));
+    let (cw, ch) = (ww.min(base.width().saturating_sub(x0 - px0)), wh.min(base.height().saturating_sub(y0 - py0)));
+    image::imageops::crop_imm(&base, x0 - px0, y0 - py0, cw.max(1), ch.max(1)).to_image()
 }
 
 /// Red eye: inside the circle at `c` (radius `r`, pixels), pixels much redder than they are green or blue (a
@@ -1530,8 +1555,8 @@ pub fn render_window(src: &Rgb32FImage, p: &Params, scale: f32, win: Option<Wind
     };
     let (full_w, full_h) = output_size(src.width(), src.height(), p);
     let (x0, y0) = win.map_or((0, 0), |v| (v[0] as usize, v[1] as usize));
-    let mut base = geometry_window(src, p, win);
-    heal(&mut base, p, (full_w as usize, full_h as usize), (x0 as f32, y0 as f32)); // before inversion: dust on a scan is healed on the negative
+    // before inversion: dust on a scan is healed on the negative
+    let mut base = heal_window(src, p, win, (full_w, full_h));
     if p.neg.enabled {
         negative::convert(&mut base, &p.neg);
     }
@@ -2241,6 +2266,21 @@ mod tests {
     }
 
     #[test]
+    fn every_setting_is_in_a_paste_group_or_kept() {
+        // A setting in no group is copied by presets (`with_look_of`) but silently dropped by Paste and Sync.
+        // The photo's own (what `with_look_of` keeps) is the only other place a setting may live.
+        const OWN: &[&str] = &["rating", "flag", "label", "rot90", "snapshots", "lens", "lens_focal", "lens_f", "lens_crop", "lens_dist", "lens_vig", "profile", "cam_curve", "process", "keywords", "title", "caption", "gps", "strip_frame"];
+        let serde_json::Value::Object(all) = serde_json::to_value(Params::default()).unwrap() else { panic!() };
+        for k in all.keys() {
+            let grouped = PASTE_GROUPS.iter().any(|g| g.1.contains(&k.as_str()));
+            assert!(grouped || OWN.contains(&k.as_str()), "{k} is in no paste group");
+        }
+        let them = Params { agx: true, ir_clean: 40.0, ..Default::default() };
+        let pasted = Params::default().with_parts_of(&them, &vec![true; PASTE_GROUPS.len()]);
+        assert!(pasted.agx && pasted.ir_clean == 40.0);
+    }
+
+    #[test]
     fn target_picks_region_and_band() {
         let dark = target_at([20, 20, 20]);
         assert_eq!(dark.tone[0], 1.0);
@@ -2420,6 +2460,22 @@ mod tests {
         for (x, y) in [(5, 5), (15, 12), (25, 25)] {
             let (a, b) = (full.get_pixel(40 + x, 20 + y).0, part.get_pixel(x, y).0);
             assert!((0..3).all(|k| (a[k] - b[k]).abs() < 0.03), "{a:?} vs {b:?}");
+        }
+    }
+
+    #[test]
+    fn window_heals_from_a_source_off_screen() {
+        // Clone a spot on the light right half from the dark left half; the 1:1 window shows only the right half.
+        let img = Rgb32FImage::from_fn(200, 100, |x, _| image::Rgb([if x < 100 { 0.2 } else { 0.8 }; 3]));
+        let s = Spot { x: 0.75, y: 0.5, r: 0.05, sx: 0.15, sy: 0.5, clone: true, ..Default::default() };
+        let fill = Spot { x: 0.9, y: 0.5, r: 0.03, fill: true, ..Default::default() };
+        let p = Params { spots: vec![s, fill], sh_amt: 0.0, nr_col: 0.0, ..Default::default() };
+        let full = render(&img, &p, 1.0);
+        let part = render_window(&img, &p, 1.0, Some([100, 0, 100, 100]));
+        assert_eq!(part.dimensions(), (100, 100));
+        for (x, y) in [(150, 50), (180, 50), (120, 10)] {
+            let (a, b) = (full.get_pixel(x, y).0, part.get_pixel(x - 100, y).0);
+            assert!((0..3).all(|k| (a[k] - b[k]).abs() < 0.03), "({x},{y}) {a:?} vs {b:?}");
         }
     }
 
