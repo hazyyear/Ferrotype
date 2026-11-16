@@ -154,7 +154,15 @@ pub fn capture(session: &mut Session, job: &Job, preview: bool, out: &Path, tmp:
         let mut used = 1;
         for k in 1..passes {
             let more = Job { infrared: false, passes: 1, ..job.clone() };
-            let (w2, h2, s2, px2, _) = grab(session, &more, false, tmp, settle, cancel, &|t| say(format!("Pass {} of {passes}: {t}", k + 1)), &|f| progress((k as f32 + f) / passes as f32))?;
+            let (w2, h2, s2, px2, _) = match grab(session, &more, false, tmp, settle, cancel, &|t| say(format!("Pass {} of {passes}: {t}", k + 1)), &|f| progress((k as f32 + f) / passes as f32)) {
+                Ok(p) => p,
+                // Stop still throws the frame away; a failed extra pass keeps the passes already done.
+                Err(e) if cancel.load(std::sync::atomic::Ordering::Relaxed) => return Err(e),
+                Err(e) => {
+                    say(format!("Pass {} failed ({e}): kept {used} pass{}", k + 1, if used == 1 { "" } else { "es" }));
+                    break;
+                }
+            };
             let px2 = if s2 == colours { px2 } else { px2.chunks_exact(s2).flat_map(|c| c[..colours.min(s2)].to_vec()).collect() };
             if sum.add(w2, h2, colours.min(s2), &px2) {
                 used += 1;

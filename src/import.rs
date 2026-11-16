@@ -244,10 +244,13 @@ pub fn run(jobs: &[Job], o: &ImportOpts, progress: &dyn Fn(usize, usize)) -> (Ve
                     && let Ok(rel) = j.to.strip_prefix(&o.dest)
                 {
                     let b = PathBuf::from(&o.backup).join(rel);
-                    if !b.exists()
-                        && let Err(e) = copy_checked(&j.from, &b)
-                    {
-                        errs.push(format!("backup: {e}"));
+                    if !b.exists() {
+                        if let Err(e) = copy_checked(&j.from, &b) {
+                            errs.push(format!("backup: {e}"));
+                        }
+                    } else if !same_file(&b, &j.from) {
+                        // Names are only made unique in the main folder: never let a backup quietly miss a photo.
+                        errs.push(format!("backup: {} already holds a different file, so {} has no backup copy", b.display(), j.to.display()));
                     }
                 }
                 hist.insert(j.key.clone());
