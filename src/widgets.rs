@@ -316,8 +316,13 @@ pub fn section(ui: &mut Ui, title: &str, open: &mut bool, changed: bool, body: i
 
 /// Optional part of a dialog or panel: a title row with "+"/"−" on the right, as in `section`, but inline.
 pub fn disclose(ui: &mut Ui, title: &str, id: &str, body: impl FnOnce(&mut Ui)) {
+    disclose_from(ui, title, id, false, body)
+}
+
+/// `disclose`, open or closed to begin with (until the first click, which is remembered).
+pub fn disclose_from(ui: &mut Ui, title: &str, id: &str, open_at_first: bool, body: impl FnOnce(&mut Ui)) {
     let id = ui.make_persistent_id(("disclose", id));
-    let mut open = ui.data_mut(|d| *d.get_persisted_mut_or(id, false));
+    let mut open = ui.data_mut(|d| *d.get_persisted_mut_or(id, open_at_first));
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::click());
     if resp.clicked() {
         open = !open;

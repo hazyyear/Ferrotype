@@ -33,6 +33,7 @@ mod sharp;
 mod fill;
 mod dcp;
 mod import;
+mod presets;
 
 use develop::Params;
 use image::{DynamicImage, Rgb32FImage, codecs::jpeg::JpegEncoder};

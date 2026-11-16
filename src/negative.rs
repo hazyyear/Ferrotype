@@ -16,99 +16,152 @@ pub struct Stock {
     pub brand: &'static str,
     pub name: &'static str,
     pub kind: Kind,
+    /// Box speed. 0 = none to give: a generic profile, a film sold in several speeds (Kodachrome) or one rated
+    /// over a range (LomoChrome 100-400).
+    pub iso: u16,
     pub contrast: f32, // print gamma multiplier
     pub sat: f32,
     pub warm: f32, // + warmer (red up, blue down)
     pub green: f32, // + greener
 }
 
-const fn s(id: &'static str, brand: &'static str, name: &'static str, kind: Kind, contrast: f32, sat: f32, warm: f32, green: f32) -> Stock {
-    Stock { id, brand, name, kind, contrast, sat, warm, green }
+#[allow(clippy::too_many_arguments)]
+const fn s(id: &'static str, brand: &'static str, name: &'static str, kind: Kind, iso: u16, contrast: f32, sat: f32, warm: f32, green: f32) -> Stock {
+    Stock { id, brand, name, kind, iso, contrast, sat, warm, green }
 }
 
 use Kind::*;
 // shortcut: profiles are hand-tuned looks from published descriptions, not measured characteristic curves;
 // replace with data from scans of calibration targets when available.
+// Names, speeds and processes follow the makers' datasheets. Ids are saved in sidecars, roll notes and
+// .ferrostock files: never rename or remove one. Keep each brand's stocks together (the list is headed by brand).
+// `warm` is a look left after the conversion has neutralised the film base and each channel's range, not the
+// film's colour balance: the tungsten stocks get a slightly cool one, as they look in mixed and street light.
 pub const STOCKS: &[Stock] = &[
-    s("generic_c41", "Generic", "Generic C-41", Color, 1.0, 1.0, 0.0, 0.0),
-    s("generic_ecn2", "Generic", "Generic ECN-2", Cine, 0.95, 0.95, -0.01, 0.0),
-    s("generic_bw", "Generic", "Generic B&W", Bw, 1.0, 0.0, 0.0, 0.0),
-    s("generic_e6", "Generic", "Slide film (E-6, no inversion)", Slide, 1.0, 1.0, 0.0, 0.0),
-    s("kodachrome", "Kodak", "Kodachrome (no inversion)", Slide, 1.0, 1.0, 0.0, 0.0),
-    s("portra160", "Kodak", "Portra 160", Color, 0.9, 0.85, 0.02, 0.0),
-    s("portra400", "Kodak", "Portra 400", Color, 0.93, 0.9, 0.03, 0.0),
-    s("portra800", "Kodak", "Portra 800", Color, 1.0, 1.0, 0.04, 0.0),
-    s("ektar100", "Kodak", "Ektar 100", Color, 1.12, 1.35, 0.01, -0.005),
-    s("gold200", "Kodak", "Gold 200", Color, 1.02, 1.1, 0.05, -0.005),
-    s("colorplus200", "Kodak", "ColorPlus 200", Color, 1.0, 1.05, 0.045, 0.0),
-    s("ultramax400", "Kodak", "UltraMax 400", Color, 1.06, 1.2, 0.035, 0.0),
-    s("proimage100", "Kodak", "Pro Image 100", Color, 1.0, 1.05, 0.03, 0.005),
-    s("vision3_50d", "Kodak", "Vision3 50D", Cine, 0.92, 0.95, 0.0, 0.0),
-    s("vision3_250d", "Kodak", "Vision3 250D", Cine, 0.92, 0.95, 0.005, 0.0),
-    s("vision3_200t", "Kodak", "Vision3 200T", Cine, 0.92, 0.95, -0.03, 0.0),
-    s("vision3_500t", "Kodak", "Vision3 500T", Cine, 0.95, 0.95, -0.035, 0.0),
-    s("trix400", "Kodak", "Tri-X 400", Bw, 1.2, 0.0, 0.0, 0.0),
-    s("tmax100", "Kodak", "T-Max 100", Bw, 1.08, 0.0, 0.0, 0.0),
-    s("tmax400", "Kodak", "T-Max 400", Bw, 1.1, 0.0, 0.0, 0.0),
-    s("tmax3200", "Kodak", "T-Max P3200", Bw, 1.25, 0.0, 0.0, 0.0),
-    s("doublex", "Kodak", "Double-X 5222", Bw, 1.18, 0.0, 0.0, 0.0),
-    s("aerocolor", "Kodak", "Aerocolor (Santa Color 100)", Color, 1.08, 1.15, 0.01, 0.005),
-    s("pro400h", "Fujifilm", "Pro 400H", Color, 0.92, 0.85, -0.01, 0.015),
-    s("superia400", "Fujifilm", "Superia X-TRA 400", Color, 1.04, 1.1, -0.015, 0.012),
-    s("fuji200", "Fujifilm", "Fujicolor 200 / C200", Color, 1.0, 1.05, -0.01, 0.008),
-    s("fuji400", "Fujifilm", "Fujicolor 400", Color, 1.02, 1.08, -0.008, 0.01),
-    s("acros", "Fujifilm", "Acros II 100", Bw, 1.1, 0.0, 0.0, 0.0),
-    s("neopan400", "Fujifilm", "Neopan 400", Bw, 1.12, 0.0, 0.0, 0.0),
-    s("cs50d", "CineStill", "50D", Cine, 0.95, 1.0, 0.01, 0.0),
-    s("cs400d", "CineStill", "400D", Cine, 1.0, 1.05, 0.02, 0.0),
-    s("cs800t", "CineStill", "800T", Cine, 1.05, 1.1, -0.04, 0.0),
-    s("hp5", "Ilford", "HP5 Plus", Bw, 1.06, 0.0, 0.0, 0.0),
-    s("fp4", "Ilford", "FP4 Plus", Bw, 1.08, 0.0, 0.0, 0.0),
-    s("delta100", "Ilford", "Delta 100", Bw, 1.08, 0.0, 0.0, 0.0),
-    s("delta400", "Ilford", "Delta 400", Bw, 1.1, 0.0, 0.0, 0.0),
-    s("delta3200", "Ilford", "Delta 3200", Bw, 1.3, 0.0, 0.0, 0.0),
-    s("panf50", "Ilford", "Pan F Plus 50", Bw, 1.15, 0.0, 0.0, 0.0),
-    s("sfx200", "Ilford", "SFX 200", Bw, 1.12, 0.0, 0.0, 0.0),
-    s("xp2", "Ilford", "XP2 Super (C-41)", Bw, 1.02, 0.0, 0.0, 0.0),
-    s("phoenix200", "Harman", "Phoenix 200", Color, 1.15, 1.4, 0.03, -0.015),
-    s("kentmere100", "Harman", "Kentmere Pan 100", Bw, 1.1, 0.0, 0.0, 0.0),
-    s("kentmere400", "Harman", "Kentmere Pan 400", Bw, 1.12, 0.0, 0.0, 0.0),
-    s("lomo100", "Lomography", "Color 100", Color, 1.08, 1.2, 0.02, 0.0),
-    s("lomo400", "Lomography", "Color 400", Color, 1.1, 1.25, 0.025, 0.0),
-    s("lomo800", "Lomography", "Color 800", Color, 1.1, 1.3, 0.03, 0.0),
-    s("lomo_purple", "Lomography", "LomoChrome Purple", Color, 1.05, 1.2, 0.0, -0.06),
-    s("lomo_metropolis", "Lomography", "LomoChrome Metropolis", Color, 1.15, 0.45, 0.01, 0.0),
-    s("lomo_turquoise", "Lomography", "LomoChrome Turquoise", Color, 1.05, 1.15, -0.07, 0.02),
-    s("foma100", "Foma", "Fomapan 100", Bw, 1.12, 0.0, 0.0, 0.0),
-    s("foma200", "Foma", "Fomapan 200", Bw, 1.12, 0.0, 0.0, 0.0),
-    s("foma400", "Foma", "Fomapan 400", Bw, 1.15, 0.0, 0.0, 0.0),
-    s("apx100", "Agfa", "APX 100", Bw, 1.1, 0.0, 0.0, 0.0),
-    s("apx400", "Agfa", "APX 400", Bw, 1.12, 0.0, 0.0, 0.0),
-    s("rpx25", "Rollei", "RPX 25", Bw, 1.15, 0.0, 0.0, 0.0),
-    s("rpx100", "Rollei", "RPX 100", Bw, 1.1, 0.0, 0.0, 0.0),
-    s("rpx400", "Rollei", "RPX 400", Bw, 1.12, 0.0, 0.0, 0.0),
-    s("retro80s", "Rollei", "Retro 80S", Bw, 1.2, 0.0, 0.0, 0.0),
-    s("reflx_lab", "Reflx Lab", "Reflx Lab 800 (ECN-2)", Cine, 1.0, 1.05, -0.02, 0.0),
-    s("velvia50", "Fujifilm", "Velvia 50 (E-6)", Slide, 1.0, 1.0, 0.0, 0.0),
-    s("provia100f", "Fujifilm", "Provia 100F (E-6)", Slide, 1.0, 1.0, 0.0, 0.0),
-    s("ektachrome", "Kodak", "Ektachrome E100 (E-6)", Slide, 1.0, 1.0, 0.0, 0.0),
+    s("generic_c41", "Generic", "Generic C-41", Color, 0, 1.0, 1.0, 0.0, 0.0),
+    s("generic_ecn2", "Generic", "Generic ECN-2", Cine, 0, 0.95, 0.95, -0.01, 0.0),
+    s("generic_bw", "Generic", "Generic B&W", Bw, 0, 1.0, 0.0, 0.0, 0.0),
+    s("generic_e6", "Generic", "Slide film (E-6, no inversion)", Slide, 0, 1.0, 1.0, 0.0, 0.0),
+    s("portra160", "Kodak", "Portra 160", Color, 160, 0.9, 0.85, 0.02, 0.0),
+    s("portra400", "Kodak", "Portra 400", Color, 400, 0.93, 0.9, 0.03, 0.0),
+    s("portra800", "Kodak", "Portra 800", Color, 800, 1.0, 1.0, 0.04, 0.0),
+    s("ektar100", "Kodak", "Ektar 100", Color, 100, 1.12, 1.35, 0.01, -0.005),
+    s("gold200", "Kodak", "Gold 200", Color, 200, 1.02, 1.1, 0.05, -0.005),
+    s("colorplus200", "Kodak", "ColorPlus 200", Color, 200, 1.0, 1.05, 0.045, 0.0),
+    s("ultramax400", "Kodak", "UltraMax 400", Color, 400, 1.06, 1.2, 0.035, 0.0),
+    s("proimage100", "Kodak", "Pro Image 100", Color, 100, 1.0, 1.05, 0.03, 0.005),
+    s("kodacolor100", "Kodak", "Kodacolor 100", Color, 100, 1.0, 1.05, 0.035, 0.0),
+    s("kodacolor200", "Kodak", "Kodacolor 200", Color, 200, 1.0, 1.05, 0.045, 0.0),
+    // Aerial film: no orange mask, rated ISO A 125 by Kodak and sold for cameras as ISO 100.
+    s("aerocolor", "Kodak", "Aerocolor IV (Santa Color)", Color, 100, 1.08, 1.15, 0.01, 0.005),
+    s("vision3_50d", "Kodak", "Vision3 50D", Cine, 50, 0.92, 0.95, 0.0, 0.0),
+    s("vision3_250d", "Kodak", "Vision3 250D", Cine, 250, 0.92, 0.95, 0.005, 0.0),
+    s("vision3_200t", "Kodak", "Vision3 200T", Cine, 200, 0.92, 0.95, -0.03, 0.0),
+    s("vision3_500t", "Kodak", "Vision3 500T", Cine, 500, 0.95, 0.95, -0.035, 0.0),
+    s("trix400", "Kodak", "Tri-X 400", Bw, 400, 1.2, 0.0, 0.0, 0.0),
+    s("tmax100", "Kodak", "T-Max 100", Bw, 100, 1.08, 0.0, 0.0, 0.0),
+    s("tmax400", "Kodak", "T-Max 400", Bw, 400, 1.1, 0.0, 0.0, 0.0),
+    // P3200 and Delta 3200 are about ISO 1000 films made to be pushed: the speed here is the one on the box.
+    s("tmax3200", "Kodak", "T-Max P3200", Bw, 3200, 1.25, 0.0, 0.0, 0.0),
+    // 5222 is the film code, not a speed: EI 250 in daylight, 200 in tungsten light.
+    s("doublex", "Kodak", "Double-X 5222", Bw, 250, 1.18, 0.0, 0.0, 0.0),
+    s("ektachrome", "Kodak", "Ektachrome E100 (E-6)", Slide, 100, 1.0, 1.0, 0.0, 0.0),
+    s("kodachrome", "Kodak", "Kodachrome (no inversion)", Slide, 0, 1.0, 1.0, 0.0, 0.0),
+    s("pro400h", "Fujifilm", "Pro 400H", Color, 400, 0.92, 0.85, -0.01, 0.015),
+    s("superia400", "Fujifilm", "Superia X-TRA 400", Color, 400, 1.04, 1.1, -0.015, 0.012),
+    s("fuji200", "Fujifilm", "Fujicolor C200", Color, 200, 1.0, 1.05, -0.01, 0.008),
+    // The current Fujifilm 200 and 400 are made in the USA by Kodak and look like its consumer films.
+    s("fujifilm200", "Fujifilm", "Fujifilm 200", Color, 200, 1.02, 1.1, 0.045, -0.005),
+    s("fuji400", "Fujifilm", "Fujifilm 400", Color, 400, 1.05, 1.15, 0.03, 0.0),
+    s("acros", "Fujifilm", "Acros II 100", Bw, 100, 1.1, 0.0, 0.0, 0.0),
+    s("neopan400", "Fujifilm", "Neopan 400", Bw, 400, 1.12, 0.0, 0.0, 0.0),
+    s("velvia50", "Fujifilm", "Velvia 50 (E-6)", Slide, 50, 1.0, 1.0, 0.0, 0.0),
+    s("velvia100", "Fujifilm", "Velvia 100 (E-6)", Slide, 100, 1.0, 1.0, 0.0, 0.0),
+    s("provia100f", "Fujifilm", "Provia 100F (E-6)", Slide, 100, 1.0, 1.0, 0.0, 0.0),
+    s("cs50d", "CineStill", "50D", Cine, 50, 0.95, 1.0, 0.01, 0.0),
+    s("cs400d", "CineStill", "400D", Cine, 400, 1.0, 1.05, 0.02, 0.0),
+    s("cs800t", "CineStill", "800T", Cine, 800, 1.05, 1.1, -0.04, 0.0),
+    s("cs_bwxx", "CineStill", "BwXX", Bw, 250, 1.18, 0.0, 0.0, 0.0),
+    s("hp5", "Ilford", "HP5 Plus", Bw, 400, 1.06, 0.0, 0.0, 0.0),
+    s("fp4", "Ilford", "FP4 Plus", Bw, 125, 1.08, 0.0, 0.0, 0.0),
+    s("delta100", "Ilford", "Delta 100", Bw, 100, 1.08, 0.0, 0.0, 0.0),
+    s("delta400", "Ilford", "Delta 400", Bw, 400, 1.1, 0.0, 0.0, 0.0),
+    s("delta3200", "Ilford", "Delta 3200", Bw, 3200, 1.3, 0.0, 0.0, 0.0),
+    s("panf50", "Ilford", "Pan F Plus 50", Bw, 50, 1.15, 0.0, 0.0, 0.0),
+    s("ortho80", "Ilford", "Ortho Plus 80", Bw, 80, 1.12, 0.0, 0.0, 0.0),
+    s("sfx200", "Ilford", "SFX 200", Bw, 200, 1.12, 0.0, 0.0, 0.0),
+    s("xp2", "Ilford", "XP2 Super (C-41)", Bw, 400, 1.02, 0.0, 0.0, 0.0),
+    s("phoenix200", "Harman", "Phoenix 200", Color, 200, 1.15, 1.4, 0.03, -0.015),
+    s("phoenix2", "Harman", "Phoenix II 200", Color, 200, 1.06, 1.2, 0.02, -0.005),
+    s("kentmere100", "Harman", "Kentmere Pan 100", Bw, 100, 1.1, 0.0, 0.0, 0.0),
+    s("kentmere200", "Harman", "Kentmere Pan 200", Bw, 200, 1.1, 0.0, 0.0, 0.0),
+    s("kentmere400", "Harman", "Kentmere Pan 400", Bw, 400, 1.12, 0.0, 0.0, 0.0),
+    s("lomo100", "Lomography", "Color 100", Color, 100, 1.08, 1.2, 0.02, 0.0),
+    s("lomo400", "Lomography", "Color 400", Color, 400, 1.1, 1.25, 0.025, 0.0),
+    s("lomo800", "Lomography", "Color 800", Color, 800, 1.1, 1.3, 0.03, 0.0),
+    s("lomo_purple", "Lomography", "LomoChrome Purple 100-400", Color, 0, 1.05, 1.2, 0.0, -0.06),
+    s("lomo_metropolis", "Lomography", "LomoChrome Metropolis 100-400", Color, 0, 1.15, 0.45, 0.01, 0.0),
+    s("lomo_turquoise", "Lomography", "LomoChrome Turquoise 100-400", Color, 0, 1.05, 1.15, -0.07, 0.02),
+    s("foma100", "Foma", "Fomapan 100", Bw, 100, 1.12, 0.0, 0.0, 0.0),
+    s("foma200", "Foma", "Fomapan 200", Bw, 200, 1.12, 0.0, 0.0, 0.0),
+    s("foma400", "Foma", "Fomapan 400", Bw, 400, 1.15, 0.0, 0.0, 0.0),
+    // The APX sold today (AgfaPhoto, "new emulsion"); the Agfa originals ended in 2005.
+    s("apx100", "AgfaPhoto", "APX 100", Bw, 100, 1.1, 0.0, 0.0, 0.0),
+    s("apx400", "AgfaPhoto", "APX 400", Bw, 400, 1.12, 0.0, 0.0, 0.0),
+    s("rpx25", "Rollei", "RPX 25", Bw, 25, 1.15, 0.0, 0.0, 0.0),
+    s("rpx100", "Rollei", "RPX 100", Bw, 100, 1.1, 0.0, 0.0, 0.0),
+    s("rpx400", "Rollei", "RPX 400", Bw, 400, 1.12, 0.0, 0.0, 0.0),
+    s("retro80s", "Rollei", "Retro 80S", Bw, 80, 1.2, 0.0, 0.0, 0.0),
+    s("adox_chs100", "ADOX", "CHS 100 II", Bw, 100, 1.1, 0.0, 0.0, 0.0),
+    s("adox_hr50", "ADOX", "HR-50", Bw, 50, 1.18, 0.0, 0.0, 0.0),
+    // NC500 is the product name: the film is ISO 400.
+    s("orwo_nc500", "ORWO", "Wolfen NC500", Color, 400, 0.98, 0.8, 0.0, 0.015),
+    s("orwo_un54", "ORWO", "Wolfen UN54", Bw, 100, 1.08, 0.0, 0.0, 0.0),
+    s("reflx_lab", "Reflx Lab", "800 Tungsten", Cine, 800, 1.0, 1.05, -0.02, 0.0),
 ];
 
 pub fn stock(id: &str) -> &'static Stock {
     STOCKS.iter().find(|s| s.id == id).unwrap_or(&STOCKS[0])
 }
 
-/// Film speed from the stock name ("Portra 400" → 400), if it has one.
+/// Box speed of a stock, if it has one.
 pub fn iso(s: &Stock) -> Option<f32> {
-    s.name.split([' ', '/']).find_map(|w| w.trim_end_matches(|c: char| c.is_ascii_alphabetic()).parse().ok())
+    (s.iso > 0).then_some(s.iso as f32)
 }
 
-/// Typical grain (amount, size) and halation for a stock. Faster film: more and bigger grain.
-/// CineStill and Reflx Lab have no anti-halation layer (remjet removed), so highlights glow red.
-/// shortcut: rule-of-thumb values from film speed and type, not measured from scans.
+/// No longer made. New old stock and frozen rolls are still shot, so they stay in the list.
+pub fn discontinued(s: &Stock) -> bool {
+    matches!(s.id, "kodachrome" | "pro400h" | "superia400" | "fuji200" | "neopan400")
+}
+
+/// Sold with the remjet backing already washed off, so it can go through C-41: no anti-halation layer is left.
+fn remjet_removed(s: &Stock) -> bool {
+    s.kind == Kind::Cine && (s.brand == "CineStill" || s.brand == "Reflx Lab")
+}
+
+/// What kind of film a stock is and how it is developed, for the line under its name.
+pub fn process(s: &Stock) -> &'static str {
+    match s.kind {
+        // Clear or purplish film instead of orange: the conversion measures the base, so it copes, but such
+        // a frame is not picked out as a negative by `orange_mask`.
+        Kind::Color if matches!(s.id, "aerocolor" | "phoenix200" | "phoenix2") => "C-41 colour negative, no orange mask",
+        Kind::Color => "C-41 colour negative",
+        Kind::Cine if remjet_removed(s) => "Motion picture film for C-41",
+        Kind::Cine => "ECN-2 motion picture",
+        Kind::Bw if s.id == "xp2" => "Black & white, C-41 process",
+        Kind::Bw => "Black & white",
+        Kind::Slide if s.id == "kodachrome" => "K-14 slide, no inversion",
+        Kind::Slide => "E-6 slide, no inversion",
+    }
+}
+
 /// Grain amount, grain size, halation, and how much grain is left in the highlights (0–100) for a stock.
+/// Faster film: more and bigger grain. Halation is the red glow of colour film: strong where the remjet has
+/// been removed (CineStill, Reflx Lab), moderate on Harman Phoenix, whose anti-halation is weak, and slight on
+/// everything else, including Aerocolor, which has an anti-halation undercoat.
 /// Prints from negatives have clean highlights (dense negative, little grain reaches the paper); slides and
 /// B&W keep a little more.
+/// shortcut: rule-of-thumb values from film speed and type, not measured from scans.
 pub fn character(s: &Stock) -> (f32, f32, f32, f32) {
     let stops = (iso(s).unwrap_or(200.0) / 100.0).log2();
     let bw = if s.kind == Kind::Bw { 6.0 } else { 0.0 };
@@ -116,7 +169,9 @@ pub fn character(s: &Stock) -> (f32, f32, f32, f32) {
     let size = (20.0 + 8.0 * stops).clamp(10.0, 60.0);
     let halation = match s.kind {
         Kind::Bw => 0.0,
-        Kind::Cine if s.brand == "CineStill" || s.brand == "Reflx Lab" => 55.0,
+        _ if remjet_removed(s) => 55.0,
+        _ if s.id == "phoenix200" => 30.0,
+        _ if s.id == "phoenix2" => 22.0,
         _ => 12.0,
     };
     let highlights = match s.kind {
@@ -516,6 +571,77 @@ mod tests {
         let (g160, ..) = character(stock("portra160"));
         let (g800, _, h, _) = character(stock("cs800t"));
         assert!(g800 > g160 && h > 40.0 && iso(stock("cs800t")) == Some(800.0));
+    }
+
+    /// Every stock's box speed, pinned. 0 = none shown (generic profiles, Kodachrome, LomoChrome 100-400).
+    /// These were the 61 ids of the first releases plus the ones added since: a missing id breaks saved edits.
+    #[test]
+    fn every_stock_has_its_box_speed() {
+        let want: &[(&str, u16)] = &[
+            ("generic_c41", 0), ("generic_ecn2", 0), ("generic_bw", 0), ("generic_e6", 0), ("kodachrome", 0),
+            ("portra160", 160), ("portra400", 400), ("portra800", 800), ("ektar100", 100), ("gold200", 200),
+            ("colorplus200", 200), ("ultramax400", 400), ("proimage100", 100), ("vision3_50d", 50), ("vision3_250d", 250),
+            ("vision3_200t", 200), ("vision3_500t", 500), ("trix400", 400), ("tmax100", 100), ("tmax400", 400),
+            ("tmax3200", 3200), ("doublex", 250), ("aerocolor", 100), ("pro400h", 400), ("superia400", 400),
+            ("fuji200", 200), ("fuji400", 400), ("acros", 100), ("neopan400", 400), ("cs50d", 50), ("cs400d", 400),
+            ("cs800t", 800), ("hp5", 400), ("fp4", 125), ("delta100", 100), ("delta400", 400), ("delta3200", 3200),
+            ("panf50", 50), ("sfx200", 200), ("xp2", 400), ("phoenix200", 200), ("kentmere100", 100), ("kentmere400", 400),
+            ("lomo100", 100), ("lomo400", 400), ("lomo800", 800), ("lomo_purple", 0), ("lomo_metropolis", 0),
+            ("lomo_turquoise", 0), ("foma100", 100), ("foma200", 200), ("foma400", 400), ("apx100", 100), ("apx400", 400),
+            ("rpx25", 25), ("rpx100", 100), ("rpx400", 400), ("retro80s", 80), ("reflx_lab", 800), ("velvia50", 50),
+            ("provia100f", 100), ("ektachrome", 100),
+            // Added later.
+            ("kodacolor100", 100), ("kodacolor200", 200), ("fujifilm200", 200), ("velvia100", 100), ("cs_bwxx", 250),
+            ("ortho80", 80), ("phoenix2", 200), ("kentmere200", 200), ("adox_chs100", 100), ("adox_hr50", 50),
+            ("orwo_nc500", 400), ("orwo_un54", 100),
+        ];
+        for (id, speed) in want {
+            let st = STOCKS.iter().find(|s| s.id == *id).unwrap_or_else(|| panic!("stock id {id} is gone"));
+            assert_eq!(st.iso, *speed, "{id}");
+            assert_eq!(iso(st), (*speed > 0).then_some(*speed as f32), "{id}");
+        }
+        assert_eq!(STOCKS.len(), want.len(), "a new stock needs its speed pinned here");
+        // A number standing alone in the name is the declared speed. Double-X 5222 is the one film code.
+        for st in STOCKS.iter().filter(|s| s.id != "doublex") {
+            let in_name = st.name.split(" (").next().unwrap_or("").split(' ').find_map(|w| w.trim_end_matches(|c: char| c.is_ascii_alphabetic()).parse::<u16>().ok());
+            assert!(in_name.is_none() || in_name == Some(st.iso), "{}: {} vs {:?}", st.id, st.iso, in_name);
+        }
+    }
+
+    #[test]
+    fn stock_types_and_glow_follow_the_film() {
+        // Black-and-white film converts to grey, whatever it is developed in; slides are left alone.
+        for st in STOCKS {
+            let (grain, size, glow, _) = character(st);
+            assert!((5.0..=60.0).contains(&grain) && (10.0..=60.0).contains(&size), "{}", st.id);
+            assert_eq!(st.kind == Kind::Bw, st.sat == 0.0, "{}", st.id);
+            assert_eq!(glow == 0.0, st.kind == Kind::Bw, "{}", st.id);
+            assert!(!process(st).is_empty());
+        }
+        let glow = |id: &str| character(stock(id)).2;
+        // Remjet removed: strong glow. Phoenix: weak anti-halation. Vision3 and Aerocolor: protected.
+        assert!(glow("cs800t") > 40.0 && glow("cs50d") > 40.0 && glow("reflx_lab") > 40.0);
+        assert!(glow("phoenix200") > glow("phoenix2") && glow("phoenix2") > glow("portra400"));
+        assert_eq!(glow("vision3_500t"), glow("portra400"));
+        assert_eq!(glow("aerocolor"), glow("portra400"));
+        assert!(process(stock("xp2")).contains("C-41") && stock("xp2").kind == Kind::Bw);
+        assert!(process(stock("aerocolor")).contains("no orange mask") && process(stock("kodachrome")).contains("K-14"));
+        assert!(process(stock("cs800t")).contains("C-41") && process(stock("vision3_500t")).contains("ECN-2"));
+        assert!(discontinued(stock("pro400h")) && discontinued(stock("kodachrome")) && !discontinued(stock("portra400")));
+        // Double-X was read as ISO 5222 once: its grain is that of a 250 film now.
+        assert!(character(stock("doublex")).0 < character(stock("tmax3200")).0);
+        assert!(character(stock("hp5")).0 > character(stock("fp4")).0);
+    }
+
+    #[test]
+    fn each_brand_is_listed_in_one_run() {
+        let mut seen: Vec<&str> = vec![];
+        for st in STOCKS {
+            if seen.last() != Some(&st.brand) {
+                assert!(!seen.contains(&st.brand), "{} appears twice in the list", st.brand);
+                seen.push(st.brand);
+            }
+        }
     }
 
     #[test]
