@@ -608,7 +608,7 @@ impl App {
     pub(super) fn scanner_right(&mut self, ui: &mut Ui) {
         let d = &mut self.scan.direct;
         if !d.ready() {
-            let t = if d.looking { "Looking for scanners…" } else { "Pick a scanner to see its frames." };
+            let t = if d.looking { "Looking for scanners…" } else if d.devices.as_ref().is_some_and(|l| l.is_empty()) { "No scanner to show yet. Plug one in and press Search again." } else { "Pick a scanner to see its frames." };
             ui.label(RichText::new(t).color(TEXT3));
             return;
         }

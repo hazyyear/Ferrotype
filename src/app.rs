@@ -386,7 +386,9 @@ pub struct App {
     thumb_size: f32,
     lib_sel: Option<PathBuf>,
     lib_query: String,
-    lib_filter: [bool; 5], // RAW, JPEG, TIFF, Other, Edited only
+    lib_filter: [bool; 4], // RAW, JPEG, TIFF, Other
+    /// Library status filter: 0 all, 1 edited, 2 film scans, 3 rejects.
+    lib_status: usize,
     /// Library: show bursts and duplicates as one thumbnail. `bursts` are the groups found for `bursts_key`
     /// (folder generation, photo count), `burst_open` the groups shown expanded (by their first photo).
     stack_bursts: bool,
@@ -507,6 +509,8 @@ pub struct App {
     export_dialog: Option<bool>,
     keymap: Keymap,
     keys_open: bool,
+    /// Roll notes opened for editing outside Roll sheet (they show as one summary line otherwise).
+    roll_open: bool,
     keys_query: String,
     settings_open: bool,
     /// Screen profile and printer proofing settings, and the loaded printer profile.
@@ -898,14 +902,14 @@ impl App {
         Self {
             module: Module::Library, shown_module: Module::Library, folder: None, files: vec![], thumbs: Default::default(), thumb_used: Default::default(), thumb_want: Default::default(), thumb_pending: Default::default(), thumb_ready: Default::default(), frame: 0, thumb_gen: Default::default(), load_gen: Default::default(), open_error: None, meta: Default::default(), lib_rating: 0,
             subdirs: vec![], tex_scale: 1.0, thumb_size: 190.0, lib_sel: None, lib_query: String::new(),
-            lib_filter: [true, true, true, true, false], stack_bursts: false, bursts: vec![], burst_of: Default::default(), burst_open: Default::default(), bursts_key: None, current: None, photo: None, loading: false, params: Params::default(), prev_params: None,
+            lib_filter: [true; 4], lib_status: 0, stack_bursts: false, bursts: vec![], burst_of: Default::default(), burst_open: Default::default(), bursts_key: None, current: None, photo: None, loading: false, params: Params::default(), prev_params: None,
             rendered: None, render_busy: false, photo_gen: 0, tex: None, before_tex: None, last_rgb: None, hover_rgb: None, shown_w: 0.0, bins: [[0.0; 128]; 3], scope: 0, scopes: Default::default(), scope_tex: None, scope_dirty: false, scope_tall: false, darkroom: 0, clip_view: false,
             history: vec![Params::default()], hist_pos: 0, copied: None, view: View::After, holding_before: false, picking_base: false, picking_greys: false,
             status: String::new(), presets, preset_tex: vec![], last_preset: None, preset_mix: None, preset_amt: 100.0, preset_name: String::new(), stock_query: String::new(), my_stocks: negative::custom_stocks(), my_stock_name: String::new(), proof: 0,
             stock_tab: 0, mixer_tab: 0, open: [true, false, false, false, false, false, false, false, false, false, false, false, false, false], tool: Tool::None,
             zoom: None, curve_chan: 0, curve_grab: None, curve_big: false, samples: vec![], target_mode: 0, target_hit: None, rename_dlg: None, paste_groups: develop::paste_defaults(), paste_dlg: None, import_dlg: None, import_busy: false, geo_dlg: None, mask_ui: MaskUi::default(), chart: ChartUi::new(), profiles: crate::calib::saved(), dcps: (None, vec![]),
             crop_grab: None, crop_aspect: 0, crop_guide: 0, crop_custom: [5.0, 7.0], crop_portrait: false, straighten: false, straighten_line: None, guided: false, guides: vec![], spot_size: 2.0, heal_mode: 0, spot_sel: None, heal_drag: None, view_map: [1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0], photo_wh: [1.0, 1.0],
-            export: ExportOpts::load(), editors: crate::editors::all(), edit_watch: vec![], edit_watch_at: 0.0, export_dialog: None, export_sel: vec![], export_sets: [false; 3], export_presets: crate::ExportPreset::load_all(), export_preset_name: String::new(), rights: crate::output::Rights::load(), info_text: (None, String::new(), String::new()), keymap: Keymap::load(), keys_open: false, keys_query: String::new(), settings_open: false, colour: crate::colour::Settings::load(), printer: None, binding: None, picking_wb: false,
+            export: ExportOpts::load(), editors: crate::editors::all(), edit_watch: vec![], edit_watch_at: 0.0, export_dialog: None, export_sel: vec![], export_sets: [false; 3], export_presets: crate::ExportPreset::load_all(), export_preset_name: String::new(), rights: crate::output::Rights::load(), info_text: (None, String::new(), String::new()), keymap: Keymap::load(), roll_open: false, keys_open: false, keys_query: String::new(), settings_open: false, colour: crate::colour::Settings::load(), printer: None, binding: None, picking_wb: false,
             thumb_due: false, lens_query: String::new(), lib_multi: vec![], pano_busy: false, pano_warp: false,
             watch: false, watch_open: true, watch_apply: false, watch_at: 0.0, watch_sizes: Default::default(), wipe: 0.5, wipe_tex: None,
             cull: Default::default(), scan: ScanUi::default(), ai_busy: false, tx, rx, roll: Default::default(), roll_dir: None,
@@ -2293,21 +2297,6 @@ impl App {
                         });
                     });
                 });
-                ui.horizontal(|ui| {
-                    let r = ui.add(egui::TextEdit::singleline(&mut self.export_preset_name).hint_text("Name these settings, for example Lab prints").desired_width(ui.available_width() - 64.0));
-                    let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    let name = self.export_preset_name.trim().to_string();
-                    if (ui.add_enabled(!name.is_empty(), egui::Button::new("Save")).clicked() || enter) && !name.is_empty() {
-                        let pr = crate::ExportPreset::of(&name, &self.export);
-                        match self.export_presets.iter_mut().find(|x| x.name.eq_ignore_ascii_case(&name)) {
-                            Some(x) => *x = pr,
-                            None => self.export_presets.push(pr),
-                        }
-                        self.export_presets.sort_by_key(|x| x.name.to_lowercase());
-                        self.status = match crate::ExportPreset::save_all(&self.export_presets) { Ok(()) => format!("Saved the export preset {name}"), Err(e) => format!("Could not save presets: {e}") };
-                        self.export_preset_name.clear();
-                    }
-                });
                 let o = &mut self.export;
                 ui.label(caps("Format"));
                 let exts = ["jpg", "tif", "png"];
@@ -2393,7 +2382,7 @@ impl App {
                         }
                     });
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("HDR (gain map)").size(12.0).color(LABEL));
+                        ui.label(RichText::new("HDR (gain map)").size(12.0).color(LABEL)).on_hover_text("Adds a gain map to the JPEG. HDR screens (recent phones, Macs, Chrome) show brighter highlights; every other viewer shows the normal picture");
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| switch(ui, &mut o.hdr));
                     });
                     if o.hdr {
@@ -2475,6 +2464,23 @@ impl App {
                 });
                 });
                 ui.label(RichText::new("Prints hold only the picture and your copyright unless you add the details above. GPS is left out unless you switch it on, and serial numbers are never included.").size(11.5).color(TEXT2));
+                ui.add_space(4.0);
+                // Save as a preset at the end, once the settings are chosen.
+                ui.horizontal(|ui| {
+                    let r = ui.add(egui::TextEdit::singleline(&mut self.export_preset_name).hint_text("Save as preset, for example Lab prints").desired_width(ui.available_width() - 64.0));
+                    let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let name = self.export_preset_name.trim().to_string();
+                    if (ui.add_enabled(!name.is_empty(), egui::Button::new("Save")).clicked() || enter) && !name.is_empty() {
+                        let pr = crate::ExportPreset::of(&name, &self.export);
+                        match self.export_presets.iter_mut().find(|x| x.name.eq_ignore_ascii_case(&name)) {
+                            Some(x) => *x = pr,
+                            None => self.export_presets.push(pr),
+                        }
+                        self.export_presets.sort_by_key(|x| x.name.to_lowercase());
+                        self.status = match crate::ExportPreset::save_all(&self.export_presets) { Ok(()) => format!("Saved the export preset {name}"), Err(e) => format!("Could not save presets: {e}") };
+                        self.export_preset_name.clear();
+                    }
+                });
                 ui.add_space(4.0);
                 let sets = self.export_sets.iter().any(|b| *b);
                 go = primary(ui, if sets { "Print sets to folder…" } else if all { "Print to folder…" } else { "Print to file…" }, true).clicked();
@@ -3726,6 +3732,13 @@ impl App {
                 if tab(ui, name, self.module == m).clicked() {
                     self.module = m;
                     self.tool = Tool::None;
+                    // The editing views open the frame picked in Library or Cull, like the D key does.
+                    if matches!(m, Module::Develop | Module::Negative | Module::Scan)
+                        && let Some(f) = self.lib_sel.clone()
+                        && self.current.as_ref() != Some(&f)
+                    {
+                        self.select(ui.ctx(), f);
+                    }
                     self.convert_if_negative();
                 }
             }
@@ -3738,8 +3751,17 @@ impl App {
                 if ui.add(egui::Button::new(RichText::new("Settings").size(13.0).color(TEXT2)).min_size(vec2(0.0, 28.0))).on_hover_text(format!("Screen colour\nRendering: {}", crate::gpu::status())).clicked() {
                     self.settings_open = true;
                 }
-                let develop = !matches!(self.module, Module::Library | Module::Cull);
-                if develop && primary(ui, "Print", self.photo.is_some()).on_hover_text("Print this frame to a file (JPEG, TIFF or PNG). It doesn't send anything to a printer").clicked() {
+                // Every tab keeps the same slots (Print, Open roll, Import, search), so nothing moves when you switch.
+                let browse = matches!(self.module, Module::Library | Module::Cull);
+                if browse {
+                    // Library and Cull print the selection, or every frame shown (never rejects).
+                    let n = self.print_frames().len();
+                    let label = if n == 1 { "Print 1…".to_string() } else { format!("Print {n}…") };
+                    if primary(ui, &label, n > 0).on_hover_text("Print the selected frames, or every frame shown, to files (JPEG, TIFF or PNG). Rejects are left out").clicked() {
+                        self.export_sel.clear();
+                        self.export_dialog = Some(true);
+                    }
+                } else if primary(ui, "Print", self.photo.is_some()).on_hover_text("Print this frame to a file (JPEG, TIFF or PNG). It doesn't send anything to a printer").on_disabled_hover_text("Open a frame first").clicked() {
                     self.export_dialog = Some(false);
                 }
                 // In every view, so a new roll is always one click away.
@@ -3751,14 +3773,18 @@ impl App {
                 if ui.add_enabled(!self.import_busy, egui::Button::new(if self.import_busy { "Importing…" } else { "Import…" }).min_size(vec2(0.0, 28.0))).on_hover_text("Copy photos from a memory card or camera into dated folders").clicked() {
                     self.open_import();
                 }
-                if !develop {
-                    ui.add(egui::TextEdit::singleline(&mut self.lib_query).hint_text("Search keywords, camera, lens, iso>1600…").desired_width(260.0).margin(vec2(10.0, 6.0)))
-                        .on_hover_text("Words match the name, keywords, camera, lens, date, roll and film notes. Put a minus in front to leave a word out (-word). You can also use iso>1600, focal<35, f<2.8, stars>=3, date:2026-05 and \"two words\".");
-                    self.ensure_search();
-                } else {
+                // Search is in every tab; typing outside Library and Cull takes you to the Library's results.
+                let q = ui.add(egui::TextEdit::singleline(&mut self.lib_query).hint_text("Search keywords, camera, iso>1600").desired_width(250.0).margin(vec2(10.0, 6.0)))
+                    .on_hover_text("Words match the name, keywords, camera, lens, date, roll and film notes. Put a minus in front to leave a word out (-word). You can also use iso>1600, focal<35, f<2.8, stars>=3, date:2026-05 and \"two words\".");
+                if q.changed() && !browse {
+                    self.module = Module::Library;
+                    self.tool = Tool::None;
+                }
+                self.ensure_search();
+                if !browse {
                     let name = self.current.as_ref().and_then(|c| c.file_name()).map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
                     let line = [name, self.status.clone()].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ");
-                    ui.label(RichText::new(line).monospace().color(TEXT3).size(11.0));
+                    ui.add(egui::Label::new(RichText::new(line).monospace().color(TEXT3).size(11.0)).truncate());
                 }
             });
         });
@@ -3796,6 +3822,16 @@ impl App {
                     }
                     if darkroom > 0 && ghost(ui, "Done", false).on_hover_text("Close the darkroom view (Esc)").clicked() {
                         self.darkroom = 0;
+                    }
+                });
+                // Also in the panel's Balance step; here it sits with the other click-on-the-photo tools.
+                let greys_ok = self.params.neg.enabled && self.photo.is_some() && darkroom == 0;
+                ui.add_enabled_ui(greys_ok, |ui| {
+                    let label = if self.picking_greys { "Cancel greys" } else { "Pick greys" };
+                    if ghost(ui, label, self.picking_greys).on_hover_text("Click a dark grey and a light grey on the photo to take out colour casts").on_disabled_hover_text("Turn on Convert negative first").clicked() {
+                        self.picking_greys = !self.picking_greys;
+                        self.picking_base = false;
+                        self.view = View::After;
                     }
                 });
             }
@@ -4412,7 +4448,7 @@ impl App {
         Ok(name)
     }
 
-    /// What "Print all" prints: the selection, else what Library shows. Rejects are never printed.
+    /// What Print prints in Library and Cull: the selection, else what Library shows. Rejects are never printed.
     fn print_frames(&self) -> Vec<PathBuf> {
         if !self.export_sel.is_empty() {
             return self.export_sel.clone();
@@ -4433,7 +4469,8 @@ impl App {
                 Some(e) => crate::library::matches(e, &q),
                 None => f.file_name().unwrap_or_default().to_string_lossy().to_lowercase().contains(q.trim()),
             };
-            self.lib_filter[kind] && (!self.lib_filter[4] || m.edited) && rating_ok && found
+            let status_ok = match self.lib_status { 1 => m.edited, 2 => m.neg, 3 => m.flag < 0, _ => true };
+            self.lib_filter[kind] && status_ok && rating_ok && found
         }).cloned().collect();
         if self.stack_bursts && !self.bursts.is_empty() {
             let shown: std::collections::HashSet<PathBuf> = v.iter().cloned().collect();
@@ -4511,13 +4548,25 @@ impl App {
         }
         self.collections_panel(ui);
         ui.add_space(18.0);
-        ui.label(caps("Show rated"));
+        // Every filter in one place: type, rating and status.
+        ui.label(caps("Show"));
+        ui.horizontal_wrapped(|ui| {
+            for (i, n) in ["RAW", "JPEG", "TIFF", "Other"].into_iter().enumerate() {
+                if filter_chip(ui, n, self.lib_filter[i]).clicked() {
+                    self.lib_filter[i] = !self.lib_filter[i];
+                }
+            }
+        });
+        ui.add_space(8.0);
         segmented(ui, &mut self.lib_rating, &["All", "1+ stars", "3+ stars", "Picks"]);
-        ui.add_space(18.0);
-        ui.label(caps("Status"));
-        list_row(ui, "Edited", &self.meta.values().filter(|m| m.edited).count().to_string(), false);
-        list_row(ui, "Film scans", &self.meta.values().filter(|m| m.neg).count().to_string(), false);
-        list_row(ui, "Rejects", &self.meta.values().filter(|m| m.flag < 0).count().to_string(), false);
+        ui.add_space(8.0);
+        // One status at a time; click the chosen one again to show everything.
+        let counts = [self.files.len(), self.meta.values().filter(|m| m.edited).count(), self.meta.values().filter(|m| m.neg).count(), self.meta.values().filter(|m| m.flag < 0).count()];
+        for (k, name) in ["Any status", "Edited", "Film scans", "Rejects"].into_iter().enumerate() {
+            if list_row(ui, name, &counts[k].to_string(), self.lib_status == k).clicked() {
+                self.lib_status = if self.lib_status == k { 0 } else { k };
+            }
+        }
         ui.add_space(18.0);
         ui.label(caps("Watch folder"));
         let toggle = |ui: &mut Ui, label: &str, v: &mut bool, tip: &str| {
@@ -4551,29 +4600,14 @@ impl App {
 
     fn library_toolbar(&mut self, ui: &mut Ui) {
         ui.horizontal_centered(|ui| {
-            ui.label(caps("Show"));
-            ui.add_space(4.0);
-            for (i, n) in ["RAW", "JPEG", "TIFF", "Other"].into_iter().enumerate() {
-                if filter_chip(ui, n, self.lib_filter[i]).clicked() {
-                    self.lib_filter[i] = !self.lib_filter[i];
-                }
-            }
-            ui.add_space(10.0);
-            if filter_chip(ui, "Edited only", self.lib_filter[4]).clicked() {
-                self.lib_filter[4] = !self.lib_filter[4];
-            }
-            ui.add_space(10.0);
+            // Filters live in the left column; the toolbar holds how the grid looks and what to make from it.
             if filter_chip(ui, "Stack bursts", self.stack_bursts).on_hover_text("Show bursts and duplicate shots as one thumbnail with a count. Right-click one to open its stack").clicked() {
                 self.stack_bursts = !self.stack_bursts;
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.add_enabled(!self.files.is_empty(), egui::Button::new("Print all…")).on_hover_text("Print the selected frames, or every frame shown, to files").clicked() {
-                    self.export_sel.clear();
-                    self.export_dialog = Some(true);
-                }
                 let has = !self.files.is_empty();
                 ui.add_enabled_ui(has, |ui| {
-                    ui.menu_button("Tools", |ui| {
+                    ui.menu_button("Share & tag", |ui| {
                         if ui.button("Contact sheet…").on_hover_text("One image of every photo shown, numbered, like a darkroom contact print").clicked() {
                             self.make_contact_sheet();
                             ui.close();
@@ -5011,7 +5045,7 @@ impl App {
             let q = if self.current.as_deref() == Some(f) { self.params.clone() } else { read_params(f).unwrap_or_default() };
             self.info_text = (Some(f.to_path_buf()), q.title, q.caption);
         }
-        ui.add_space(10.0);
+        ui.add_space(12.0);
         ui.label(caps("Title and caption"));
         let t = ui.add(egui::TextEdit::singleline(&mut self.info_text.1).hint_text("Title").desired_width(f32::INFINITY));
         let c = ui.add(egui::TextEdit::multiline(&mut self.info_text.2).hint_text("Caption").desired_rows(2).desired_width(f32::INFINITY));
@@ -5042,13 +5076,14 @@ impl App {
             }
         });
         let mut remove = None;
-        ui.horizontal_wrapped(|ui| {
+        // Only take a row for chips when there are some; an empty row left a gap under the heading.
+        if !kws.is_empty() { ui.horizontal_wrapped(|ui| {
             for k in &kws {
                 if chip(ui, &format!("{k}  ×"), false).on_hover_text("Remove").clicked() {
                     remove = Some(k.clone());
                 }
             }
-        });
+        }); }
         let resp = ui.add(egui::TextEdit::singleline(&mut self.kw_text).hint_text("Add keywords, for example street, Lisbon").desired_width(f32::INFINITY));
         let add = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         let mut change: Option<(Vec<String>, Option<String>)> = None;
@@ -5201,19 +5236,41 @@ impl App {
     }
 
     /// Roll notes for the open folder, and the selected frame's own notes. Saved as they are typed.
+    /// Roll notes as one summary line with Edit; the full form opens in place. Roll sheet always shows it open.
     fn roll_panel(&mut self, ui: &mut Ui) {
+        self.roll_panel_ex(ui, false);
+    }
+
+    fn roll_panel_ex(&mut self, ui: &mut Ui, always_open: bool) {
         if self.folder.is_none() {
             return;
         }
         ui.add_space(20.0);
+        let open = always_open || self.roll_open;
         ui.horizontal(|ui| {
             ui.label(caps("Roll notes"));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(RichText::new("for this folder").size(11.0).color(TEXT3));
+                if always_open {
+                    ui.label(RichText::new("for this folder").size(11.0).color(TEXT3));
+                } else if small_action(ui, if open { "Done" } else { "Edit" }, false).on_hover_text("Camera, film and development for this folder, and this frame's settings").clicked() {
+                    self.roll_open = !open;
+                }
             });
         });
         ui.add_space(4.0);
-        self.roll_fields(ui);
+        if open {
+            self.roll_fields(ui);
+        } else {
+            self.roll_loaded();
+            let line = self.roll.summary();
+            let camera = self.roll.camera.trim().to_string();
+            let line = [line, camera].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ");
+            if line.is_empty() {
+                ui.label(RichText::new("No notes yet").size(12.0).color(TEXT3));
+            } else {
+                ui.label(RichText::new(line).size(12.0).color(TEXT2));
+            }
+        }
     }
 
     /// The roll notes of the open folder, read when the folder changes.
@@ -5241,16 +5298,25 @@ impl App {
                 add(ui).changed()
             }).inner
         };
-        // Hints are examples, not values: dim and italic, so an empty field never reads as filled in.
+        // Hints are examples, not values: "e.g.", dim and italic, so an empty field never reads as filled in.
         fn text<'a>(v: &'a mut String, hint: &'a str) -> impl FnMut(&mut Ui) -> egui::Response + 'a {
-            move |ui: &mut Ui| ui.add(egui::TextEdit::singleline(v).hint_text(RichText::new(hint).italics().color(TEXT3.gamma_multiply(0.8))).desired_width(f32::INFINITY))
+            move |ui: &mut Ui| ui.add(egui::TextEdit::singleline(v).hint_text(RichText::new(hint).italics().color(TEXT3)).desired_width(f32::INFINITY))
         }
-        changed |= row(ui, "Roll", &mut text(&mut r.roll, "12"));
-        changed |= row(ui, "Camera", &mut text(&mut r.camera, "Nikon FM2"));
-        changed |= row(ui, "Lens", &mut text(&mut r.lens, "50mm f/1.8"));
+        // Number fields show a word while empty ("not noted"); draw that word dim like a hint.
+        fn number(ui: &mut Ui, empty: bool, add: impl FnOnce(&mut Ui) -> egui::Response) -> egui::Response {
+            ui.scope(|ui| {
+                if empty {
+                    ui.visuals_mut().override_text_color = Some(TEXT3);
+                }
+                add(ui)
+            }).inner
+        }
+        changed |= row(ui, "Roll", &mut text(&mut r.roll, "e.g. 12"));
+        changed |= row(ui, "Camera", &mut text(&mut r.camera, "e.g. Nikon FM2"));
+        changed |= row(ui, "Lens", &mut text(&mut r.lens, "e.g. 50mm f/1.8"));
         // Film: one of the known stocks (so the conversion can use it), or any name.
         let known = negative::STOCKS.iter().find(|s| s.id == r.stock);
-        let shown = known.map_or_else(|| if r.stock.is_empty() { "Not noted".to_string() } else { r.stock.clone() }, |s| format!("{} {}", s.brand, s.name));
+        let shown = known.map_or_else(|| if r.stock.is_empty() { RichText::new("Not noted").italics().color(TEXT3) } else { RichText::new(r.stock.clone()) }, |s| RichText::new(format!("{} {}", s.brand, s.name)));
         changed |= row(ui, "Film", &mut |ui: &mut Ui| {
             let mut resp = egui::ComboBox::from_id_salt("roll_stock").selected_text(shown.clone()).width(ui.available_width()).height(320.0).show_ui(ui, |ui| {
                 let mut c = false;
@@ -5278,19 +5344,21 @@ impl App {
         if known.is_none() {
             changed |= row(ui, "", &mut text(&mut r.stock, "or type a film name"));
         }
-        changed |= row(ui, "Box speed", &mut |ui: &mut Ui| ui.add(egui::DragValue::new(&mut r.iso).range(0.0..=25600.0).speed(5.0).custom_formatter(|v, _| if v <= 0.0 { "Not noted".into() } else { format!("{v:.0} ISO") }).custom_parser(|t| t.trim().trim_end_matches(|c: char| c.is_alphabetic() || c == ' ').trim().parse().ok())));
+        let iso_empty = r.iso <= 0.0;
+        changed |= row(ui, "Box speed", &mut |ui: &mut Ui| number(ui, iso_empty, |ui| ui.add(egui::DragValue::new(&mut r.iso).range(0.0..=25600.0).speed(5.0).custom_formatter(|v, _| if v <= 0.0 { "Not noted".into() } else { format!("{v:.0} ISO") }).custom_parser(|t| t.trim().trim_end_matches(|c: char| c.is_alphabetic() || c == ' ').trim().parse().ok()))));
+        let ei_empty = r.ei <= 0.0;
         changed |= row(ui, "Shot at", &mut |ui: &mut Ui| {
-            let resp = ui.add(egui::DragValue::new(&mut r.ei).range(0.0..=25600.0).speed(5.0).custom_formatter(|v, _| if v <= 0.0 { "box speed".into() } else { format!("{v:.0} EI") }));
+            let resp = number(ui, ei_empty, |ui| ui.add(egui::DragValue::new(&mut r.ei).range(0.0..=25600.0).speed(5.0).custom_formatter(|v, _| if v <= 0.0 { "box speed".into() } else { format!("{v:.0} EI") })));
             let p = r.push_label();
             if !p.is_empty() {
                 ui.label(RichText::new(p).size(11.5).color(TEXT2));
             }
             resp
         });
-        changed |= row(ui, "Developer", &mut text(&mut r.developer, "D-76 1+1, 9:45"));
+        changed |= row(ui, "Developer", &mut text(&mut r.developer, "e.g. D-76 1+1"));
         changed |= row(ui, "Date", &mut text(&mut r.date, "YYYY-MM-DD"));
         ui.add_space(2.0);
-        changed |= ui.add(egui::TextEdit::multiline(&mut r.notes).hint_text(RichText::new("Notes for the roll").italics().color(TEXT3.gamma_multiply(0.8))).desired_rows(2).desired_width(f32::INFINITY)).changed();
+        changed |= ui.add(egui::TextEdit::multiline(&mut r.notes).hint_text(RichText::new("Notes for the roll").italics().color(TEXT3)).desired_rows(2).desired_width(f32::INFINITY)).changed();
         // This frame's settings, when one is selected.
         if let Some(f) = self.lib_sel.clone() {
             let key = crate::roll::frame_key(&f);
@@ -5298,9 +5366,10 @@ impl App {
             ui.add_space(10.0);
             ui.label(caps("This frame"));
             let mut fc = false;
-            fc |= row(ui, "Aperture", &mut |ui: &mut Ui| ui.add(egui::DragValue::new(&mut fr.aperture).range(0.0..=64.0).speed(0.1).custom_formatter(|v, _| if v <= 0.0 { "—".into() } else { format!("f/{v:.1}") })));
-            fc |= row(ui, "Shutter", &mut text(&mut fr.shutter, "1/125"));
-            fc |= row(ui, "Focal length", &mut |ui: &mut Ui| ui.add(egui::DragValue::new(&mut fr.focal).range(0.0..=2000.0).speed(0.5).custom_formatter(|v, _| if v <= 0.0 { "roll's lens".into() } else { format!("{v:.0} mm") })));
+            let (ap_empty, fl_empty) = (fr.aperture <= 0.0, fr.focal <= 0.0);
+            fc |= row(ui, "Aperture", &mut |ui: &mut Ui| number(ui, ap_empty, |ui| ui.add(egui::DragValue::new(&mut fr.aperture).range(0.0..=64.0).speed(0.1).custom_formatter(|v, _| if v <= 0.0 { "Not noted".into() } else { format!("f/{v:.1}") }))));
+            fc |= row(ui, "Shutter", &mut text(&mut fr.shutter, "e.g. 1/125"));
+            fc |= row(ui, "Focal length", &mut |ui: &mut Ui| number(ui, fl_empty, |ui| ui.add(egui::DragValue::new(&mut fr.focal).range(0.0..=2000.0).speed(0.5).custom_formatter(|v, _| if v <= 0.0 { "roll's lens".into() } else { format!("{v:.0} mm") }))));
             fc |= row(ui, "Note", &mut text(&mut fr.note, ""));
             if fc {
                 if fr.is_empty() {
@@ -5429,7 +5498,8 @@ impl App {
             };
             self.preset_name.clear();
         }
-        if ui.add(egui::Button::new(RichText::new("Import Lightroom presets…").size(12.0).color(TEXT2)).fill(Color32::TRANSPARENT).stroke(Stroke::NONE)).clicked()
+        // Outlined and full width, so its edge lines up with the preset name field above.
+        if ui.add(egui::Button::new(RichText::new("Import Lightroom presets…").size(12.0).color(TEXT2)).min_size(vec2(ui.available_width(), 28.0))).clicked()
             && let Some(files) = rfd::FileDialog::new().add_filter("Lightroom preset", &["xmp"]).pick_files()
         {
             let (mut n, mut failed) = (0, 0);
@@ -5483,18 +5553,23 @@ impl App {
         ui.horizontal(|ui| {
             ui.label(caps("History"));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 2.0;
-                if ui.add_enabled(self.hist_pos + 1 < self.history.len(), egui::Button::new(RichText::new("Redo").size(11.0)).fill(Color32::TRANSPARENT).stroke(Stroke::NONE)).clicked() {
+                // Same small outlined buttons as Snapshots' + New.
+                ui.spacing_mut().item_spacing.x = 6.0;
+                if ui.add_enabled(self.hist_pos + 1 < self.history.len(), egui::Button::new(RichText::new("Redo").size(11.0).color(TEXT2)).fill(Color32::TRANSPARENT).stroke(Stroke::new(1.0, BTN_BORDER)).corner_radius(3).min_size(vec2(0.0, 22.0))).clicked() {
                     self.undo(1);
                 }
-                if ui.add_enabled(self.hist_pos > 0, egui::Button::new(RichText::new("Undo").size(11.0)).fill(Color32::TRANSPARENT).stroke(Stroke::NONE)).clicked() {
+                if ui.add_enabled(self.hist_pos > 0, egui::Button::new(RichText::new("Undo").size(11.0).color(TEXT2)).fill(Color32::TRANSPARENT).stroke(Stroke::new(1.0, BTN_BORDER)).corner_radius(3).min_size(vec2(0.0, 22.0))).clicked() {
                     self.undo(-1);
                 }
             });
         });
         let mut jump = None;
         egui::ScrollArea::vertical().id_salt("hist").auto_shrink([false, false]).show(ui, |ui| {
-            for i in (0..self.history.len()).rev() {
+            if self.current.is_none() {
+                ui.label(RichText::new("Changes show here once a frame is open.").size(11.0).color(TEXT3));
+            }
+            let rows = if self.current.is_some() { self.history.len() } else { 0 };
+            for i in (0..rows).rev() {
                 let (label, val) = if i == 0 { ("Opened".to_string(), String::new()) } else { describe_change(&self.history[i - 1], &self.history[i]) };
                 let fg = if i == self.hist_pos { INK } else if i > self.hist_pos { TEXT3 } else { TEXT2 };
                 let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::click());
@@ -5626,21 +5701,12 @@ impl App {
             section(ui, "Basic", o_basic, changed(&["temp","tint","exposure","contrast","highlights","shadows","whites","blacks","texture","clarity","dehaze","vibrance","saturation","bw","agx"]), |ui| {
                 // Where Lightroom users look for black and white: the same switch as in the mixer below.
                 ui.horizontal(|ui| {
-                    ui.label(caps("Treatment"));
+                    ui.label(RichText::new("Treatment").size(12.0).color(LABEL));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         // Listed right to left, so it reads Colour, B&W on screen.
                         let mut t = (!p.bw) as usize;
                         segmented(ui, &mut t, &["B&W", "Colour"]);
                         p.bw = t == 0;
-                    });
-                });
-                // Standard is the Lightroom-like look; AgX keeps bright colours' hue and rolls highlights off gently.
-                ui.horizontal(|ui| {
-                    ui.label(caps("Tone mapper")).on_hover_text("AgX rolls bright highlights off to white and keeps bright colours from shifting hue (neon, sunsets, stage light). It looks flatter, so add Contrast to taste");
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let mut t = (!p.agx) as usize;
-                        segmented(ui, &mut t, &["AgX", "Standard"]);
-                        p.agx = t == 0;
                     });
                 });
                 // The eyedropper sits with "As shot" in the group's header, as Lightroom's does: an action, not a field.
@@ -5672,6 +5738,17 @@ impl App {
                 slider(ui, "Shadows", &mut p.shadows, -100.0, 100.0, 0.0, Some(&grey_ramp(0.005, 0.25)));
                 slider(ui, "Whites", &mut p.whites, -100.0, 100.0, 0.0, Some(&grey_ramp(0.4, 1.0)));
                 slider(ui, "Blacks", &mut p.blacks, -100.0, 100.0, 0.0, Some(&tone_g.clone()));
+                // Standard is the Lightroom-like look; Gentle (AgX) keeps bright colours' hue and rolls highlights off softly.
+                // A setting row in plain words, not a caps heading: it sits with the tone sliders it changes.
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Bright tones").size(12.0).color(LABEL))
+                        .on_hover_text("Gentle uses the AgX tone mapper: bright highlights roll off to white and bright colours keep their hue (neon, sunsets, stage light). It looks flatter, so add Contrast to taste");
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let mut t = (!p.agx) as usize;
+                        segmented(ui, &mut t, &["Gentle", "Standard"]);
+                        p.agx = t == 0;
+                    });
+                });
                 group(ui, "Presence", None);
                 slider(ui, "Texture", &mut p.texture, -100.0, 100.0, 0.0, None);
                 slider(ui, "Clarity", &mut p.clarity, -100.0, 100.0, 0.0, None);
@@ -6337,27 +6414,29 @@ impl App {
 
     fn develop_footer(&mut self, ui: &mut Ui) {
         // Everything that moves settings between frames in one place, Reset last and quiet: it throws work away.
+        // One button style for the whole footer (outlined, like Paste previous and Sync settings below).
+        let btn = |t: &str| egui::Button::new(t).min_size(vec2(0.0, 28.0));
         ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 2.0;
-            if ghost(ui, "Copy", false).on_hover_text("Copy these settings (Ctrl/Cmd+C)").clicked() {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            if ui.add(btn("Copy")).on_hover_text("Copy these settings (Ctrl/Cmd+C)").clicked() {
                 self.copied = Some(self.params.clone());
             }
-            if ui.add_enabled(self.copied.is_some(), egui::Button::new(RichText::new("Paste").color(TEXT2)).fill(Color32::TRANSPARENT).stroke(Stroke::NONE))
-                .on_hover_text("Paste the copied settings (Ctrl/Cmd+V), the groups chosen under Paste…").clicked() {
+            if ui.add_enabled(self.copied.is_some(), btn("Paste"))
+                .on_hover_text("Paste the copied settings (Ctrl/Cmd+V), the groups chosen under Paste some…").clicked() {
                 self.params = self.params.with_parts_of(self.copied.as_ref().unwrap(), &self.paste_groups);
             }
-            if ui.add_enabled(self.copied.is_some(), egui::Button::new(RichText::new("Paste some…").color(TEXT2)).fill(Color32::TRANSPARENT).stroke(Stroke::NONE))
+            if ui.add_enabled(self.copied.is_some(), btn("Paste some…"))
                 .on_hover_text("Choose which settings to paste (Ctrl/Cmd+Shift+V)").clicked() {
                 self.paste_dlg = Some(false);
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ghost(ui, "Reset", false).on_hover_text("Clear this photo's Develop settings (undo brings them back)").clicked() {
+                if ui.add(btn("Reset")).on_hover_text("Clear this photo's Develop settings (undo brings them back)").clicked() {
                     // The conversion and the profile it was measured with stay together.
                     self.params = Params { neg: self.params.neg.clone(), profile: self.params.profile.clone(), ..Params::default() };
                 }
             });
         });
-        ui.add_space(4.0);
+        ui.add_space(6.0);
         ui.columns(2, |c| {
             if c[0].add_enabled(self.prev_params.is_some(), egui::Button::new("Paste previous").min_size(vec2(c[0].available_width(), 32.0))).on_hover_text("Apply the settings of the frame you edited before this one").clicked() {
                 let prev = self.prev_params.clone().unwrap();
@@ -6396,6 +6475,7 @@ impl App {
                 // Your own profiles first.
                 ui.add_space(8.0);
                 ui.label(caps("My film"));
+                ui.add_space(4.0);
                 let mut apply = None;
                 let mut remove = None;
                 let mut share = None;
@@ -6425,7 +6505,7 @@ impl App {
                     });
                 }
                 ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut self.my_stock_name).hint_text("Name").desired_width(ui.available_width() - 150.0));
+                    ui.add(egui::TextEdit::singleline(&mut self.my_stock_name).hint_text("Name this profile").desired_width(ui.available_width() - 64.0).margin(vec2(8.0, 5.0)));
                     let can = !self.my_stock_name.trim().is_empty() && self.params.neg.enabled;
                     if ui.add_enabled(can, egui::Button::new("Save")).on_hover_text("Save this photo's stock and adjustments as your own profile").on_disabled_hover_text("Convert a negative first, then name the profile").clicked() {
                         match negative::CustomStock::new(&self.my_stock_name, &self.params.neg).install() {
@@ -6437,7 +6517,10 @@ impl App {
                             Err(e) => self.status = format!("Could not save: {e}"),
                         }
                     }
-                    if ui.button("Import…").on_hover_text("Add a .ferrostock file someone shared").clicked()
+                });
+                // Its own row, so the name field keeps its width.
+                ui.horizontal(|ui| {
+                    if small_action(ui, "Import profile…", false).on_hover_text("Add a .ferrostock film profile someone shared").clicked()
                         && let Some(f) = rfd::FileDialog::new().add_filter("Film stock profile", &[negative::CUSTOM_EXT]).pick_file()
                     {
                         self.status = match negative::CustomStock::from_file(&f).and_then(|c| c.install().map(|_| c.name)) {
@@ -6447,6 +6530,8 @@ impl App {
                         self.my_stocks = negative::custom_stocks();
                     }
                 });
+                // Room before the stock list, so the save row doesn't run into its first heading.
+                ui.add_space(14.0);
                 if let Some(k) = apply {
                     self.params.neg = self.my_stocks[k].1.apply(&self.params.neg);
                 }
@@ -7319,10 +7404,12 @@ impl eframe::App for App {
                 egui::Panel::left("left").exact_size(260.0).resizable(false)
                     .frame(if neg { side(PANEL) } else { pad(PANEL, 12, 16) })
                     .show(ui, |ui| if neg { self.negative_left(ui) } else { self.develop_left(ui) });
+                // With no frame open the controls would edit nothing, so they are shown dimmed.
+                let open = self.current.is_some();
                 egui::Panel::right("right").exact_size(RIGHT_W).resizable(false).frame(side(PANEL)).show(ui, |ui| {
-                    egui::Panel::bottom("right_footer").frame(pad(PANEL, 16, 10)).show(ui, |ui| if neg { self.negative_footer(ui) } else { self.develop_footer(ui) });
+                    egui::Panel::bottom("right_footer").frame(pad(PANEL, 16, 10)).show(ui, |ui| ui.add_enabled_ui(open, |ui| if neg { self.negative_footer(ui) } else { self.develop_footer(ui) }));
                     egui::Panel::top("hist").frame(pad(PANEL, 16, 12)).show(ui, |ui| self.histogram_block(ui));
-                    egui::CentralPanel::default().frame(egui::Frame::new()).show(ui, |ui| if neg { self.negative_right(ui) } else { self.develop_right(ui) });
+                    egui::CentralPanel::default().frame(egui::Frame::new()).show(ui, |ui| ui.add_enabled_ui(open, |ui| if neg { self.negative_right(ui) } else { self.develop_right(ui) }));
                 });
                 if !neg && self.curve_big {
                     self.curve_window(&ctx);

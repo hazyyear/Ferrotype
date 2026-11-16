@@ -830,7 +830,7 @@ fn cli_export(args: &[String]) -> Result<(), String> {
     let jobs: Vec<(PathBuf, PathBuf)> = files.iter().flat_map(|f| {
         if f.is_dir() {
             let top = PathBuf::from(f.file_name().unwrap_or_default());
-            // Like Print all in the app: frames marked rejected stay out of a folder's export.
+            // Like Print in the Library: frames marked rejected stay out of a folder's export.
             photos_under(f).into_iter().filter(|(_, p)| read_params(p).is_none_or(|q| q.flag >= 0)).map(|(rel, p)| (out.join(&top).join(rel), p)).collect()
         } else {
             vec![(out.clone(), f.clone())]
