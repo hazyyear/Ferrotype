@@ -35,6 +35,9 @@ pub struct Params {
     /// as with coloured filters on black-and-white film. Colour grading then tones the greys.
     pub bw: bool,
     pub bw_mix: [f32; 8],
+    /// Tone mapper: false = Standard (Lightroom-like; highlights past white fade to white at the end), true =
+    /// AgX (scene-referred, as in Blender and darktable: bright saturated colours keep their hue and roll off).
+    pub agx: bool,
     // Color grading: [hue 0..360, sat, lum] for shadows, midtones, highlights, global
     pub grade: [[f32; 3]; 4],
     pub g_blend: f32,
@@ -316,7 +319,7 @@ impl Default for Params {
             temp: 5500.0, tint: 0.0, exposure: 0.0, contrast: 0.0, highlights: 0.0, shadows: 0.0, whites: 0.0, blacks: 0.0,
             texture: 0.0, clarity: 0.0, dehaze: 0.0, vibrance: 0.0, saturation: 0.0,
             c_hi: 0.0, c_li: 0.0, c_da: 0.0, c_sh: 0.0,
-            hsl: [[0.0; 3]; 8], bw: false, bw_mix: [0.0; 8],
+            hsl: [[0.0; 3]; 8], bw: false, bw_mix: [0.0; 8], agx: false,
             grade: [[0.0; 3]; 4], g_blend: 50.0, g_bal: 0.0,
             sh_amt: 40.0, sh_rad: 1.0, sh_det: 25.0, sh_mask: 0.0, nr_lum: 0.0, nr_det: 50.0, nr_col: 25.0,
             o_dist: 0.0, o_vig: 0.0, o_fringe: 0.0,
@@ -1447,6 +1450,46 @@ pub fn apply_target(p: &mut Params, t: &Target, mode: usize, amount: f32) {
     }
 }
 
+/// The Standard look past white: from 1 to 2 times white, the colour fades towards a blend of its direction and
+/// its brightness (rawler's hue-keeping clip), so clipped and rebuilt highlights turn white smoothly instead of
+/// one bright hue. Below white nothing changes, and it joins up with no step at white.
+pub fn soft_white(c: [f32; 3]) -> [f32; 3] {
+    let m = c[0].max(c[1]).max(c[2]);
+    if m <= 1.0 {
+        return c;
+    }
+    let e = ((c[0].max(0.0).powi(2) + c[1].max(0.0).powi(2) + c[2].max(0.0).powi(2)) / 3.0).sqrt();
+    let t = (m - 1.0).min(1.0);
+    [0, 1, 2].map(|k| c[k].min(1.0) * (1.0 - t) + (c[k] / m + e) / 2.0 * t)
+}
+
+/// AgX in: rotates and slightly desaturates the primaries before the curve, so very bright colours don't run to
+/// pure red, green, blue, cyan, magenta or yellow (the "Notorious 6"). Rows, applied to linear sRGB.
+const AGX_IN: M3 = [[0.842479062253094, 0.0784335999999992, 0.0792237451477643], [0.0423282422610123, 0.878468636469772, 0.0791661274605434], [0.0423756549057051, 0.0784336, 0.879142973793104]];
+/// AgX out: undoes the rotation after the curve.
+const AGX_OUT: M3 = [[1.19687900512017, -0.0980208811401368, -0.0990297440797205], [-0.0528968517574562, 1.15190312990417, -0.0989611768448433], [-0.0529716355144438, -0.0980434501171241, 1.15107367264116]];
+/// The log range AgX covers, in stops around mid grey 0.18: 12.5 below, 4 above.
+const AGX_MIN_EV: f32 = -12.47393;
+const AGX_MAX_EV: f32 = 4.026069;
+
+/// AgX's S-curve on the log-encoded value (Troy Sobotka's polynomial fit of the default look).
+fn agx_curve(x: f32) -> f32 {
+    let (x2, x4) = (x * x, x * x * x * x);
+    15.5 * x4 * x2 - 40.14 * x4 * x + 31.96 * x4 - 6.868 * x2 * x + 0.4298 * x2 + 0.1191 * x - 0.002_32
+}
+
+/// AgX tone mapping (Troy Sobotka's, as in Blender and darktable): linear scene light in, display-encoded colour
+/// out (like `linear_to_srgb` gives). Primaries in, per-channel log2 encoding around mid grey, the S-curve, then
+/// primaries out. Highlights several stops past white still roll off to white without a hue shift.
+pub fn agx(c: [f32; 3]) -> [f32; 3] {
+    let c = mul(&AGX_IN, c.map(|v| v.max(1e-10)));
+    let c = c.map(|v| {
+        let x = (v.max(1e-10).log2().clamp(AGX_MIN_EV, AGX_MAX_EV) - AGX_MIN_EV) / (AGX_MAX_EV - AGX_MIN_EV);
+        agx_curve(x)
+    });
+    mul(&AGX_OUT, c).map(|v| v.clamp(0.0, 1.0))
+}
+
 /// Parametric tone curve (Highlights, Lights, Darks, Shadows regions) on perceptual luminance.
 pub fn tone_curve(l: f32, p: &Params) -> f32 {
     l + 0.15 * (p.c_sh / 100.0 * bump(l, 0.12, 0.2) + p.c_da / 100.0 * bump(l, 0.35, 0.22) + p.c_li / 100.0 * bump(l, 0.62, 0.22) + p.c_hi / 100.0 * bump(l, 0.88, 0.2))
@@ -1739,6 +1782,7 @@ fn finish(mut img: Rgb32FImage, p: &Params, scale: f32, full: (u32, u32), off: (
             p.vig, vr_round, p.vig_mid, p.vig_fea, p.vig_hi, p.gr_amt, grain_px, p.gr_rough, p.gr_hi,
         ]);
         prm[33..42].copy_from_slice(&[p.blacks, p.whites, p.highlights, p.shadows, p.contrast, p.c_sh, p.c_da, p.c_li, p.c_hi]);
+        prm[90] = flag(p.agx);
         for b in 0..8 {
             prm[48 + b * 3..51 + b * 3].copy_from_slice(&p.hsl[b]);
         }
@@ -1786,8 +1830,8 @@ fn finish(mut img: Rgb32FImage, p: &Params, scale: f32, full: (u32, u32), off: (
                 let k = 1.0 + p.saturation / 100.0 + p.vibrance / 100.0 * (1.0 - sat0).powi(2) + p.dehaze / 400.0;
                 c = c.map(|v| yl + (v - yl) * k);
             }
-            // Display encode, then perceptual colour work.
-            let mut e = c.map(linear_to_srgb);
+            // Display encode (Standard, or AgX), then perceptual colour work.
+            let mut e = if p.agx { agx(c) } else { soft_white(c).map(linear_to_srgb) };
             if let Some(t) = &curves {
                 if p.curve_lum {
                     let l = luma(e);
@@ -2102,6 +2146,30 @@ pub fn auto_wb(src: &Rgb32FImage) -> (f32, f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn soft_white_joins_up_at_white_and_whitens_above() {
+        let c = [1.0, 0.2, 0.1];
+        assert_eq!(soft_white(c), c);
+        let just = soft_white([1.001, 0.2, 0.1]);
+        assert!((just[0] - 1.0).abs() < 0.01 && (just[1] - 0.2).abs() < 0.01, "no step at white: {just:?}");
+        let far = soft_white([3.0, 0.6, 0.3]);
+        assert!(far[1] > 0.6 && far[2] > 0.5, "far past white turns towards white: {far:?}");
+    }
+
+    #[test]
+    fn agx_keeps_grey_neutral_and_rolls_highlights_off() {
+        let mid = agx([0.18; 3]);
+        assert!((mid[0] - mid[1]).abs() < 0.01 && (mid[1] - mid[2]).abs() < 0.01, "grey stays grey: {mid:?}");
+        assert!(mid[0] > 0.35 && mid[0] < 0.55, "mid grey near the middle: {mid:?}");
+        // Brighter in, brighter out, and still short of white four stops up.
+        let (a, b, c) = (agx([0.5; 3])[0], agx([2.0; 3])[0], agx([16.0; 3])[0]);
+        assert!(mid[0] < a && a < b && b < c && c <= 1.0, "{a} {b} {c}");
+        assert!(agx([0.0; 3])[0] < 0.02);
+        // A very bright saturated blue keeps more of its hue than a hard clip: red and green rise only a little.
+        let blue = agx([0.5, 0.8, 8.0]);
+        assert!(blue[2] > blue[1] && blue[1] > blue[0], "{blue:?}");
+    }
 
     #[test]
     fn black_and_white_mix_lightens_and_darkens_bands() {

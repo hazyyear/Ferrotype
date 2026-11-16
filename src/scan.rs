@@ -2,6 +2,7 @@
 //! All work on the uncropped frame (after quarter turns and straightening) and answer in frame fractions.
 use crate::develop::{self, Params, Spot, luma};
 use image::Rgb32FImage;
+use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -280,39 +281,51 @@ fn read_ir(path: &Path) -> Option<Ir> {
     Some(Ir { w, h, data })
 }
 
-/// How sure we are that each pixel is a defect, 0..1, from the infrared channel. `strength` 0..100 sets how
-/// faint a defect still counts. The cyan dye leaks a little into infrared on some scanners, so the part of the
-/// infrared that follows the red channel is taken out first.
-pub fn ir_defects(ir: &Ir, red: Option<&[f32]>, strength: f32) -> Vec<f32> {
+/// How deep the infrared dips at each pixel, 0 (clear film) to 1 (nothing gets through), against the clear film
+/// around it. The cyan dye leaks a little into infrared on some scanners, so the part of the infrared that follows
+/// the red channel is taken out first. That fit is made in density (logs), as openICE does, so thick and thin
+/// parts of the negative are treated alike.
+pub fn ir_dips(ir: &Ir, red: Option<&[f32]>) -> Vec<f32> {
     let (w, h) = (ir.w as usize, ir.h as usize);
     let mut v = ir.data.clone();
     if let Some(red) = red.filter(|r| r.len() == v.len()) {
-        // Least-squares slope of infrared on red over the clear film, removed around the mean.
+        // Least-squares slope of log infrared on log red, removed around the mean.
+        let lr: Vec<f32> = red.iter().map(|&x| x.max(1e-4).ln()).collect();
+        let li: Vec<f32> = v.iter().map(|&x| x.max(1e-4).ln()).collect();
         let n = v.len() as f64;
-        let (mr, mi) = (red.iter().map(|&x| x as f64).sum::<f64>() / n, v.iter().map(|&x| x as f64).sum::<f64>() / n);
+        let (mr, mi) = (lr.iter().map(|&x| x as f64).sum::<f64>() / n, li.iter().map(|&x| x as f64).sum::<f64>() / n);
         let (mut sxy, mut sxx) = (0f64, 0f64);
-        for (r, i) in red.iter().zip(&v).step_by(7) {
+        for (r, i) in lr.iter().zip(&li).step_by(7) {
             sxy += (*r as f64 - mr) * (*i as f64 - mi);
             sxx += (*r as f64 - mr).powi(2);
         }
         let k = if sxx > 0.0 { (sxy / sxx).clamp(0.0, 1.0) as f32 } else { 0.0 };
-        for (i, r) in v.iter_mut().zip(red) {
-            *i -= k * (r - mr as f32);
+        if k > 0.0 {
+            for ((x, r), i) in v.iter_mut().zip(&lr).zip(&li) {
+                *x = (i - k * (r - mr as f32)).exp();
+            }
         }
     }
     // Clear film around a defect: a wide blur of the infrared, with the defect itself mostly left out by
     // taking the brighter of the local level and a level a little wider.
     let near = develop::blur(&v, w, h, 6.0);
     let far = develop::blur(&v, w, h, 18.0);
-    let t = 0.35 + (0.05 - 0.35) * (strength / 100.0).clamp(0.0, 1.0); // how deep a dip counts as a defect
-    let raw: Vec<f32> = v.iter().zip(near.iter().zip(&far)).map(|(&x, (&a, &b))| {
-        let r = a.max(b).max(1e-4);
-        let dip = 1.0 - x / r;
-        develop::smooth(t * 0.5, t, dip)
-    }).collect();
-    // Grow by two pixels: the soft edge of a speck is darker in the picture before it shows in infrared.
-    let mut grown = raw.clone();
-    for y in 0..h {
+    v.iter().zip(near.iter().zip(&far)).map(|(&x, (&a, &b))| (1.0 - x / a.max(b).max(1e-4)).clamp(0.0, 1.0)).collect()
+}
+
+/// How faint a dip still counts as a defect at `strength` 0..100.
+fn dip_threshold(strength: f32) -> f32 {
+    0.35 + (0.05 - 0.35) * (strength / 100.0).clamp(0.0, 1.0)
+}
+
+/// Dips this deep or deeper are dust or hair that blocks the light: painted over. Shallower ones are faint
+/// dust that only dims the film: divided out, which keeps the grain and detail under it.
+const HEAVY_DIP: f32 = 0.5;
+
+/// Grow a mask by two pixels: the soft edge of a speck is darker in the picture before it shows in infrared.
+fn grow(raw: &[f32], w: usize, h: usize) -> Vec<f32> {
+    let mut grown = raw.to_vec();
+    grown.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
         for x in 0..w {
             let mut m = raw[y * w + x];
             if m >= 1.0 {
@@ -326,14 +339,23 @@ pub fn ir_defects(ir: &Ir, red: Option<&[f32]>, strength: f32) -> Vec<f32> {
                     }
                 }
             }
-            grown[y * w + x] = m;
+            row[x] = m;
         }
-    }
+    });
     grown
 }
 
-/// Fill the defects in `img` from the clean film around them: normalised blurs of the clean pixels at growing
-/// sizes, each pixel taking the finest one that has enough clean film nearby.
+/// How sure we are that each pixel is a defect, 0..1, from the infrared channel. `strength` 0..100 sets how
+/// faint a defect still counts.
+#[cfg(test)]
+pub fn ir_defects(ir: &Ir, red: Option<&[f32]>, strength: f32) -> Vec<f32> {
+    let t = dip_threshold(strength);
+    let raw: Vec<f32> = ir_dips(ir, red).iter().map(|&d| develop::smooth(t * 0.5, t, d)).collect();
+    grow(&raw, ir.w as usize, ir.h as usize)
+}
+
+/// Infrared dust and scratch removal (Digital ICE style). Faint dust is divided out by how much infrared it
+/// blocks; dust, hair and scratches that block most of it are painted over from the clean film around them.
 pub fn ir_clean(img: &Rgb32FImage, ir: &Ir, strength: f32) -> Rgb32FImage {
     let (w, h) = (img.width() as usize, img.height() as usize);
     // A resized source: sample the infrared at this size.
@@ -348,7 +370,20 @@ pub fn ir_clean(img: &Rgb32FImage, ir: &Ir, strength: f32) -> Rgb32FImage {
         &resized
     };
     let red: Vec<f32> = img.chunks(3).map(|c| c[0]).collect();
-    fill(img, &ir_defects(ir, Some(&red), strength))
+    let dips = ir_dips(ir, Some(&red));
+    let t = dip_threshold(strength);
+    // Heavy defects (and their soft edges) are filled.
+    let heavy = grow(&dips.iter().map(|&d| develop::smooth(HEAVY_DIP * 0.8, HEAVY_DIP, d)).collect::<Vec<_>>(), w, h);
+    // Faint ones are divided out: the film there let through (1 - dip) of the light.
+    let mut out = img.clone();
+    out.par_chunks_mut(3).zip(dips.par_iter().zip(&heavy)).for_each(|(px, (&d, &hv))| {
+        let on = develop::smooth(t * 0.5, t, d) * (1.0 - hv);
+        if on > 0.0 {
+            let gain = 1.0 + (1.0 / (1.0 - d.min(HEAVY_DIP)) - 1.0) * on;
+            px.iter_mut().for_each(|v| *v *= gain);
+        }
+    });
+    fill(&out, &heavy)
 }
 
 /// Replace `img` where `mask` is 1 (blending where it's in between) with colour from the unmasked surroundings.
@@ -448,7 +483,7 @@ pub fn fill(img: &Rgb32FImage, mask: &[f32]) -> Rgb32FImage {
 
 /// The source for rendering `path` with `p`: infrared cleaning applied when asked for and the scan has infrared.
 pub fn prepare_ir(img: Rgb32FImage, path: &Path, p: &Params) -> Rgb32FImage {
-    if p.ir_clean <= 0.0 {
+    if p.ir_clean <= 0.0 || crate::negative::ir_blocked(&p.neg).is_some() {
         return img;
     }
     match ir_channel(path) {
@@ -557,6 +592,27 @@ mod tests {
         assert_eq!(out.get_pixel(10, 10), img.get_pixel(10, 10), "clean film untouched");
         // Off: nothing changes.
         assert_eq!(prepare_ir(img.clone(), Path::new("/nope.tif"), &Params::default()), img);
+    }
+
+    #[test]
+    fn faint_dust_is_divided_out_keeping_the_grain() {
+        // Grainy film with a faint smudge that lets 75% of the light through, in the picture and in infrared alike.
+        let (w, h) = (120u32, 90u32);
+        let grain = |x: u32, y: u32| 0.02 * (((x * 7919 + y * 104729) % 17) as f32 / 17.0 - 0.5);
+        let smudge = |x: u32, y: u32| (x as i32 - 60).pow(2) + (y as i32 - 45).pow(2) <= 36;
+        let clean = |x: u32, y: u32| 0.3 + 0.4 * x as f32 / w as f32 + grain(x, y);
+        let img = Rgb32FImage::from_fn(w, h, |x, y| { let v = clean(x, y) * if smudge(x, y) { 0.75 } else { 1.0 }; image::Rgb([v, v, v]) });
+        let ir = Ir { w, h, data: (0..w * h).map(|i| if smudge(i % w, i / w) { 0.6 } else { 0.8 }).collect() };
+        let out = ir_clean(&img, &ir, 50.0);
+        for (x, y) in [(60, 45), (58, 44), (62, 47)] {
+            let got = out.get_pixel(x, y).0[0];
+            assert!((got - clean(x, y)).abs() < 0.01, "({x},{y}): {got} vs {}", clean(x, y));
+        }
+        // Black-and-white film blocks infrared: cleaning stays off.
+        let p = Params { ir_clean: 50.0, neg: crate::negative::NegParams { enabled: true, stock: "hp5".into(), ..Default::default() }, ..Default::default() };
+        assert!(crate::negative::ir_blocked(&p.neg).is_some());
+        let xp2 = crate::negative::NegParams { enabled: true, stock: "xp2".into(), ..Default::default() };
+        assert!(crate::negative::ir_blocked(&xp2).is_none(), "XP2 is dye-based");
     }
 
     #[test]

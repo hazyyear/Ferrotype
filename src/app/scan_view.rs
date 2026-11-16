@@ -295,10 +295,13 @@ impl App {
                 scanner::Event::Progress(f) => self.scan.progress = Some(f),
                 // The folder watch (on while scanning) brings the file in and opens it.
                 scanner::Event::Saved(f) => self.status = format!("Scanned {}", f.file_name().unwrap_or_default().to_string_lossy()),
+                scanner::Event::Focus(v) => self.scan.direct.add_focus(v),
                 scanner::Event::Done(r) => {
                     self.scan.scanning = None;
                     self.scan.progress = None;
+                    let focus = self.scan.direct.focus_result();
                     self.status = match r {
+                        Ok(0) if focus => "Focus test done".into(),
                         Ok(0) => "The scanner was closed without scanning".into(),
                         Ok(1) => "1 scan saved".into(),
                         Ok(n) => format!("{n} scans saved"),
@@ -1118,7 +1121,12 @@ impl App {
         let has_ir = s.has_ir.or(self.photo.as_ref().and_then(|p| p.has_ir));
         if has_ir == Some(true) {
             // The scan carries an infrared channel: clean with it (Digital ICE style), no marks needed.
-            slider(ui, "Infrared clean", &mut self.params.ir_clean, 0.0, 100.0, 0.0, None);
+            if let Some(film) = crate::negative::ir_blocked(&self.params.neg) {
+                // Silver and Kodachrome block infrared: the whole picture would read as dust, so it stays off.
+                ui.label(RichText::new(format!("Infrared clean is off for {film}, which blocks infrared. Use Find dust instead.")).size(11.5).color(TEXT2));
+            } else {
+                slider(ui, "Infrared clean", &mut self.params.ir_clean, 0.0, 100.0, 0.0, None);
+            }
             if self.photo.as_ref().is_some_and(|p| p.ir_busy) {
                 ui.horizontal(|ui| {
                     ui.spinner();

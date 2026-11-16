@@ -75,6 +75,13 @@ impl Scanner {
     pub fn resolutions(&self) -> Vec<u32> {
         [300, 600, 1200, 1600, 2400, 3200, 4800, 6400].into_iter().filter(|r| *r <= self.max_dpi.max(300)).collect()
     }
+
+    /// The detail this scanner really resolves, in ppi, where it has been measured: filmscanner.info's lab test of
+    /// the V850 Pro found about 2300 ppi (Epson Scan) to 2600 ppi (SilverFast), and nothing more at 6400. The
+    /// V800 is the same scanner.
+    pub fn real_ppi(&self) -> Option<(u32, u32)> {
+        ["V800", "V850"].iter().any(|m| self.name.contains(m)).then_some((2300, 2600))
+    }
 }
 
 /// Connect, ask the scanner what it is, and let it go again.
@@ -99,6 +106,19 @@ pub struct Job {
     pub oversample: u32,
     pub linear: bool,
     pub infrared: bool,
+    /// Whole passes over the frame, lined up and averaged (on top of `oversample`): more noise taken out of the
+    /// dense parts of a negative. The scanner has no exposure command, so this is what stands in for the
+    /// multi-exposure VueScan and SilverFast offer. The infrared is scanned on the first pass only.
+    pub passes: u32,
+}
+
+/// The largest area the V800/V850 takes an infrared pass for, in millimetres (Epson's limit, 14.9 × 23.9 cm).
+pub const IR_MAX_MM: [f64; 2] = [149.0, 239.0];
+
+/// Whether a frame fits the infrared limit, either way round.
+pub fn ir_fits(rect_mm: [f64; 4]) -> bool {
+    let (a, b) = (rect_mm[2].min(rect_mm[3]), rect_mm[2].max(rect_mm[3]));
+    a <= IR_MAX_MM[0] + 0.5 && b <= IR_MAX_MM[1] + 0.5
 }
 
 impl Job {
@@ -116,9 +136,45 @@ impl Job {
     }
 }
 
+/// One pass as 16-bit samples: width, height, samples per pixel (3, or 4 with infrared), the pixels, and the TIFF
+/// tags to save it with.
+type Pass = (u32, u32, usize, Vec<u16>, crate::scanfile::Info);
+
 /// Scan one job on an open session into `out` (a 16-bit TIFF, RGBI with infrared). Work files go in `tmp`.
 #[allow(clippy::too_many_arguments)]
 pub fn capture(session: &mut Session, job: &Job, preview: bool, out: &Path, tmp: &Path, settle: Duration, cancel: &AtomicBool, say: &dyn Fn(String), progress: &dyn Fn(f32)) -> Result<(), String> {
+    let passes = if preview { 1 } else { job.passes.max(1) };
+    let (w, h, samples, mut px, mut info) = grab(session, job, preview, tmp, settle, cancel, &|t| say(t), &|f| progress(f / passes as f32))?;
+    if passes > 1 {
+        // Average the colour of every pass; the first pass's infrared is kept as it is.
+        let colours = if samples == 4 { 3 } else { samples };
+        let split = |px: &[u16]| -> Vec<u16> { if colours == samples { px.to_vec() } else { px.chunks_exact(samples).flat_map(|c| c[..colours].to_vec()).collect() } };
+        let ir: Vec<u16> = if colours == samples { vec![] } else { px.chunks_exact(samples).map(|c| c[colours]).collect() };
+        let mut sum = super::merge::Sum::new(w, h, colours, &split(&px));
+        let mut used = 1;
+        for k in 1..passes {
+            let more = Job { infrared: false, passes: 1, ..job.clone() };
+            let (w2, h2, s2, px2, _) = grab(session, &more, false, tmp, settle, cancel, &|t| say(format!("Pass {} of {passes}: {t}", k + 1)), &|f| progress((k as f32 + f) / passes as f32))?;
+            let px2 = if s2 == colours { px2 } else { px2.chunks_exact(s2).flat_map(|c| c[..colours.min(s2)].to_vec()).collect() };
+            if sum.add(w2, h2, colours.min(s2), &px2) {
+                used += 1;
+            } else {
+                say(format!("Pass {} didn't match the first and was left out", k + 1));
+            }
+        }
+        px = sum.average();
+        if !ir.is_empty() {
+            with_infrared(&mut px, colours, &ir);
+        }
+        if used > 1 {
+            info.software += &format!(", {used} passes");
+        }
+    }
+    crate::scanfile::write_tiff(out, w, h, samples, 16, &px, None, &info)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn grab(session: &mut Session, job: &Job, preview: bool, tmp: &Path, settle: Duration, cancel: &AtomicBool, say: &dyn Fn(String), progress: &dyn Fn(f32)) -> Result<Pass, String> {
     let model = session.capabilities.scanner_model().map_err(|e| e.to_string())?;
     let (depth, dpi) = if preview { (model.preview_depth, model.preview_dpi) } else { (16, job.dpi) };
     let settings = job.settings(preview, depth, dpi);
@@ -167,7 +223,32 @@ pub fn capture(session: &mut Session, job: &Job, preview: bool, out: &Path, tmp:
         sw += ", linear";
     }
     let info = crate::scanfile::Info { software: sw, make: "EPSON".into(), model: model.name.into(), dpi: dpi as f32, ..Default::default() };
-    crate::scanfile::write_tiff(out, w, h, samples, 16, &px, None, &info)
+    Ok((w, h, samples, px, info))
+}
+
+/// A focus test: scan a small patch from the middle of `job`'s frame (about 8 mm square, no infrared, one pass)
+/// and measure how strong its edges are. Scanned again after moving the holder's height feet, the strongest
+/// result is the height to use.
+pub fn focus_test(location: &str, job: &Job, tmp: &Path, cancel: &AtomicBool, say: &dyn Fn(Event)) -> Result<usize, String> {
+    if location == "demo" {
+        return Err("the demo scanner can't scan".into());
+    }
+    let [x, y, w, h] = job.rect_mm;
+    let side = 8f64.min(w).min(h);
+    let patch = Job { rect_mm: [x + (w - side) / 2.0, y + (h - side) / 2.0, side, side], infrared: false, passes: 1, oversample: 1, ..job.clone() };
+    let mut s = Session::connect(Some(location), Backend::Auto, TIMEOUT).map_err(|e| e.to_string())?;
+    let r = grab(&mut s, &patch, false, tmp, Duration::from_secs(10), cancel, &|t| say(Event::Status(format!("Focus test: {t}"))), &|f| say(Event::Progress(f)));
+    s.close();
+    let _ = std::fs::remove_dir_all(tmp);
+    let (w, h, samples, px, _) = r?;
+    say(Event::Focus(edges_u16(w, h, samples, &px)));
+    Ok(0)
+}
+
+/// `sharp::edges` of 16-bit scan samples (the colour ones).
+pub fn edges_u16(w: u32, h: u32, samples: usize, px: &[u16]) -> f32 {
+    let rgb: Vec<f32> = px.chunks_exact(samples.max(1)).flat_map(|c| [0, 1, 2].map(|k| c[k.min(c.len() - 1)] as f32 / 65535.0)).collect();
+    image::Rgb32FImage::from_raw(w, h, rgb).map_or(0.0, |img| crate::sharp::edges(&img))
 }
 
 /// Put an infrared sample after each pixel's colours, in place: `px` grows from `samples` to `samples + 1`
@@ -198,7 +279,7 @@ pub fn preview(location: &str, source: Source, linear: bool, out: &Path, cancel:
     let mut s = Session::connect(Some(location), Backend::Auto, TIMEOUT).map_err(|e| e.to_string())?;
     let scanner = Scanner::of(&s, location)?;
     let [w, h] = scanner.area(source);
-    let job = Job { source, rect_mm: [0.0, 0.0, w, h], dpi: 0, oversample: 1, linear, infrared: false };
+    let job = Job { source, rect_mm: [0.0, 0.0, w, h], dpi: 0, oversample: 1, linear, infrared: false, passes: 1 };
     let tmp = out.with_extension("work");
     let r = capture(&mut s, &job, true, out, &tmp, Duration::ZERO, cancel, say, progress);
     s.close();
@@ -302,6 +383,22 @@ mod tests {
     use epscan::transport::Transport;
     use std::collections::VecDeque;
 
+    #[test]
+    fn infrared_limit_and_focus_edges() {
+        assert!(ir_fits([0.0, 0.0, 36.0, 24.0]), "35 mm");
+        assert!(ir_fits([0.0, 0.0, 239.0, 149.0]), "either way round");
+        assert!(!ir_fits([0.0, 0.0, 203.0, 254.0]), "8 × 10 sheet film is too big");
+        // A sharp patch has stronger edges than the same patch blurred (what the focus check compares).
+        let (w, h) = (64u32, 64u32);
+        let sharp: Vec<u16> = (0..w * h).flat_map(|i| { let v = if (i % w / 8 + i / w / 8) % 2 == 0 { 50000u16 } else { 10000 }; [v, v, v] }).collect();
+        let soft: Vec<u16> = (0..w * h).flat_map(|i| {
+            let (x, y) = ((i % w) as f32, (i / w) as f32);
+            let v = 30000.0 + 20000.0 * ((x / 8.0 * std::f32::consts::PI).sin() * (y / 8.0 * std::f32::consts::PI).sin());
+            [v as u16; 3]
+        }).collect();
+        assert!(edges_u16(w, h, 3, &sharp) > edges_u16(w, h, 3, &soft) * 1.5);
+    }
+
     /// A V800 as recorded by epscan's author: replies are queued up front.
     struct Sim(VecDeque<u8>);
     impl Transport for Sim {
@@ -336,7 +433,7 @@ mod tests {
     fn frames_scan_into_numbered_16_bit_tiffs() {
         let ext = identity();
         let caps = epscan::Capabilities::parse(&ext).unwrap();
-        let job = Job { source: Source::Transparency, rect_mm: [10.0, 20.0, 12.0, 8.0], dpi: 300, oversample: 1, linear: false, infrared: false };
+        let job = Job { source: Source::Transparency, rect_mm: [10.0, 20.0, 12.0, 8.0], dpi: 300, oversample: 1, linear: false, infrared: false, passes: 1 };
         let mut replies = vec![2, 0x12, 2, 0, b'B', b'8'];
         replies.extend(ext);
         replies.extend(pass(&job, &caps, 0x40));

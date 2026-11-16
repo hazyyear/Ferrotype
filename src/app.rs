@@ -428,6 +428,8 @@ pub struct App {
     view: View,
     holding_before: bool,
     picking_base: bool,
+    /// Picking neutral greys on a negative (Negative's Balance).
+    picking_greys: bool,
     status: String,
     presets: Vec<(String, Params)>,
     preset_tex: Vec<TextureHandle>,
@@ -846,7 +848,7 @@ fn describe_change(a: &Params, b: &Params) -> (String, String) {
         ("vig_round", "Vignette roundness"), ("vig_fea", "Vignette feather"), ("vig_hi", "Vignette highlights"), ("gr_amt", "Grain"), ("gr_size", "Grain size"),
         ("gr_rough", "Grain roughness"), ("cal_sh", "Shadows tint"), ("cal", "Calibration"), ("neg", "Negative"), ("border", "Border"), ("spots", "Heal"), ("masks", "Masks"), ("hal_amt", "Halation"), ("hal_size", "Halation size"), ("hal_thr", "Halation threshold"), ("curves", "Point curve"), ("lut", "LUT"), ("lut_amt", "LUT amount"), ("rating", "Rating"), ("flag", "Flag"),
         ("rot90", "Rotate 90°"), ("profile", "Profile"), ("label", "Label"), ("ai_nr", "AI denoise"), ("ir_clean", "Infrared clean"), ("snapshots", "Snapshot"),
-        ("bw", "Black & white"), ("bw_mix", "B&W mix"), ("dcp", "Camera profile"), ("dcp_tone", "Profile tone curve"), ("title", "Title"), ("caption", "Caption"),
+        ("bw", "Black & white"), ("agx", "Tone mapper"), ("bw_mix", "B&W mix"), ("dcp", "Camera profile"), ("dcp_tone", "Profile tone curve"), ("title", "Title"), ("caption", "Caption"),
     ];
     let changed: Vec<&(&str, &str)> = names.iter().filter(|(k, _)| ja.get(k) != jb.get(k)).collect();
     // A toner sets several grading values at once: name the toner, not "Colour grading +1".
@@ -898,7 +900,7 @@ impl App {
             subdirs: vec![], tex_scale: 1.0, thumb_size: 190.0, lib_sel: None, lib_query: String::new(),
             lib_filter: [true, true, true, true, false], stack_bursts: false, bursts: vec![], burst_of: Default::default(), burst_open: Default::default(), bursts_key: None, current: None, photo: None, loading: false, params: Params::default(), prev_params: None,
             rendered: None, render_busy: false, photo_gen: 0, tex: None, before_tex: None, last_rgb: None, hover_rgb: None, shown_w: 0.0, bins: [[0.0; 128]; 3], scope: 0, scopes: Default::default(), scope_tex: None, scope_dirty: false, scope_tall: false, darkroom: 0, clip_view: false,
-            history: vec![Params::default()], hist_pos: 0, copied: None, view: View::After, holding_before: false, picking_base: false,
+            history: vec![Params::default()], hist_pos: 0, copied: None, view: View::After, holding_before: false, picking_base: false, picking_greys: false,
             status: String::new(), presets, preset_tex: vec![], last_preset: None, preset_mix: None, preset_amt: 100.0, preset_name: String::new(), stock_query: String::new(), my_stocks: negative::custom_stocks(), my_stock_name: String::new(), proof: 0,
             stock_tab: 0, mixer_tab: 0, open: [true, false, false, false, false, false, false, false, false, false, false, false, false, false], tool: Tool::None,
             zoom: None, curve_chan: 0, curve_grab: None, curve_big: false, samples: vec![], target_mode: 0, target_hit: None, rename_dlg: None, paste_groups: develop::paste_defaults(), paste_dlg: None, import_dlg: None, import_busy: false, geo_dlg: None, mask_ui: MaskUi::default(), chart: ChartUi::new(), profiles: crate::calib::saved(), dcps: (None, vec![]),
@@ -1114,6 +1116,7 @@ impl App {
         self.loading = true;
         self.open_error = None;
         self.picking_base = false;
+        self.picking_greys = false;
         self.last_preset = None;
         self.samples.clear();
         self.spot_sel = None;
@@ -1680,7 +1683,8 @@ impl App {
         }
         // Infrared cleaning: off the UI thread, once the slider is let go.
         let held = ctx.input(|i| i.pointer.any_down());
-        let ir_amt = self.params.ir_clean;
+        // Off for film that blocks infrared itself (black-and-white silver, Kodachrome): it would see the picture as dust.
+        let ir_amt = if negative::ir_blocked(&self.params.neg).is_some() { 0.0 } else { self.params.ir_clean };
         if ir_amt > 0.0 && ph.has_ir != Some(false) && !ph.ir_busy && ph.ir_base.as_ref().map(|b| b.0) != Some(ir_amt) && !held {
             ph.ir_busy = true;
             let (img, path, tx, ctx2) = (ph.orig.clone(), cur.clone(), self.tx.clone(), ctx.clone());
@@ -4047,7 +4051,7 @@ impl App {
                 }
                 // Hold on the image to compare with the original (released = back to the edit).
                 let tool = if neg { Tool::None } else { self.tool };
-                let picking = self.picking_base || self.picking_wb;
+                let picking = self.picking_base || self.picking_wb || self.picking_greys;
                 self.holding_before = tool == Tool::None && !picking && self.darkroom_view() == 0 && resp.is_pointer_button_down_on();
                 if tool == Tool::None
                     && !picking
@@ -4109,6 +4113,19 @@ impl App {
                     {
                         let uv = (pos - r.min) / r.size();
                         self.pick_wb(uv.x, uv.y);
+                    }
+                }
+                if self.picking_greys {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                    badge(ui, r, if self.params.neg.greys.len() == 1 { "Now click a lighter or darker grey, or press Esc to keep one" } else { "Click something that should be grey: a road, a wall, a grey card" });
+                    if resp.clicked()
+                        && let Some(pos) = resp.interact_pointer_pos()
+                    {
+                        let uv = (pos - r.min) / r.size();
+                        self.pick_grey(uv.x, uv.y);
+                    }
+                    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        self.picking_greys = false;
                     }
                 }
                 if self.picking_base {
@@ -4207,7 +4224,7 @@ impl App {
     fn darkroom_view(&self) -> u8 {
         let np = &self.params.neg;
         let slide = negative::stock(&np.stock).kind == Kind::Slide;
-        if self.module == Module::Negative && np.enabled && !slide && !self.picking_base && self.photo.is_some() { self.darkroom } else { 0 }
+        if self.module == Module::Negative && np.enabled && !slide && !self.picking_base && !self.picking_greys && self.photo.is_some() { self.darkroom } else { 0 }
     }
 
     /// Labels on the test strip bands or ring-around cells; a click uses that version.
@@ -4282,6 +4299,46 @@ impl App {
                 format!("{} applied", label(i))
             };
         }
+    }
+
+    /// Eyedropper for neutral greys on a negative: the scan's colour there (before inversion). The first pick takes
+    /// out a cast, the second (a lighter or darker grey) also matches each channel's contrast. The frame's base and
+    /// levels are locked, so the greys keep meaning the same thing.
+    fn pick_grey(&mut self, u: f32, v: f32) {
+        let Some(c) = self.scan_patch(u, v) else { return };
+        let np = &mut self.params.neg;
+        if np.levels.is_none()
+            && let Some(ph) = &self.photo
+        {
+            let geo = develop::geometry(&ph.preview, &Params { neg: np.clone(), profile: self.params.profile.clone(), ..Default::default() });
+            let (b, l) = negative::analyse(&geo, np);
+            (np.base, np.levels) = (Some(b), Some(l));
+        }
+        if np.greys.len() >= 2 {
+            np.greys.clear();
+        }
+        np.greys.push(c);
+        if np.greys.len() >= 2 {
+            self.picking_greys = false;
+        }
+    }
+
+    /// The (un-inverted) scan's average colour in a small patch around a click on the view.
+    fn scan_patch(&self, u: f32, v: f32) -> Option<[f32; 3]> {
+        let photo = self.photo.as_ref()?;
+        let geo = develop::geometry(&photo.preview, &self.params);
+        let (w, h) = geo.dimensions();
+        let (cw, ch, ox, oy, _) = develop::border_layout(w, h, &self.params.border);
+        let (cx, cy) = ((u * cw as f32) as i64 - ox as i64, (v * ch as f32) as i64 - oy as i64);
+        let (mut acc, mut n) = ([0f32; 3], 0.0);
+        for y in (cy - 3).max(0)..(cy + 4).min(h as i64) {
+            for x in (cx - 3).max(0)..(cx + 4).min(w as i64) {
+                let p = geo.get_pixel(x as u32, y as u32).0;
+                (0..3).for_each(|c| acc[c] += p[c]);
+                n += 1.0;
+            }
+        }
+        (n > 0.0).then(|| acc.map(|a| (a / n).max(1e-4)))
     }
 
     /// Eyedropper for the film base: average a small patch of the (un-inverted) scan.
@@ -5582,7 +5639,7 @@ impl App {
         let (has_spots, has_masks) = (!p.spots.is_empty(), !p.masks.is_empty() || !p.brushes.is_empty() || !p.grads.is_empty());
         let changed = |keys: &[&str]| keys.iter().any(|k| match *k { "spots" => has_spots, "masks" => has_masks, _ => pj.get(k) != dj.get(k) });
         egui::ScrollArea::vertical().id_salt("develop_right").auto_shrink([false, false]).show(ui, |ui| {
-            section(ui, "Basic", o_basic, changed(&["temp","tint","exposure","contrast","highlights","shadows","whites","blacks","texture","clarity","dehaze","vibrance","saturation","bw"]), |ui| {
+            section(ui, "Basic", o_basic, changed(&["temp","tint","exposure","contrast","highlights","shadows","whites","blacks","texture","clarity","dehaze","vibrance","saturation","bw","agx"]), |ui| {
                 // Where Lightroom users look for black and white: the same switch as in the mixer below.
                 ui.horizontal(|ui| {
                     ui.label(caps("Treatment"));
@@ -5591,6 +5648,15 @@ impl App {
                         let mut t = (!p.bw) as usize;
                         segmented(ui, &mut t, &["B&W", "Colour"]);
                         p.bw = t == 0;
+                    });
+                });
+                // Standard is the Lightroom-like look; AgX keeps bright colours' hue and rolls highlights off gently.
+                ui.horizontal(|ui| {
+                    ui.label(caps("Tone mapper")).on_hover_text("AgX rolls bright highlights off to white and keeps bright colours from shifting hue (neon, sunsets, stage light). It looks flatter, so add Contrast to taste");
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let mut t = (!p.agx) as usize;
+                        segmented(ui, &mut t, &["AgX", "Standard"]);
+                        p.agx = t == 0;
                     });
                 });
                 // The eyedropper sits with "As shot" in the group's header, as Lightroom's does: an action, not a field.
@@ -6543,6 +6609,26 @@ impl App {
                 ui.add_space(6.0);
 
                 ui.label(caps("4 · Balance"));
+                // Neutral greys: RawTherapee's way of calibrating a roll, in density.
+                let mut pick_greys = false;
+                ui.horizontal(|ui| {
+                    let n = np.greys.len();
+                    ui.label(RichText::new(match n { 0 => "No greys picked", 1 => "One grey picked", _ => "Two greys picked" }).size(12.0));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if n > 0 && ghost(ui, "Clear", false).clicked() {
+                            np.greys.clear();
+                        }
+                        pick_greys = ui.add(egui::Button::new(RichText::new(if self.picking_greys { "Cancel" } else if n == 1 { "Add a second" } else { "Pick greys" }).size(11.5)).min_size(vec2(0.0, 26.0)))
+                            .on_hover_text("Click a dark grey and a light grey on the photo. One takes out a colour cast. Two also make shadows and highlights match, which fixes casts that change with brightness").clicked();
+                    });
+                });
+                ui.label(RichText::new(if np.greys.len() >= 2 { "Shadows and highlights are balanced to your greys. Apply to roll to use them on every frame." } else { "Pick a dark and a light grey to balance the whole tonal range." }).size(11.5).color(TEXT2));
+                if pick_greys {
+                    self.picking_greys = !self.picking_greys;
+                    self.picking_base = false;
+                    self.view = View::After;
+                }
+                ui.add_space(4.0);
                 let d = negative::NegParams::default();
                 // Balance shifts one print channel; tracks show that shift on mid grey (×3 so the hue reads).
                 let shift = |ch: usize, sign: f32| move |t: f32| { let mut c = [0.5f32; 3]; c[ch] += sign * t / 100.0 * 0.3; enc(c) };

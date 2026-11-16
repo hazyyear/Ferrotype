@@ -15,6 +15,30 @@ fn rem_e(a: f32, b: f32) -> f32 { let r = a - b * trunc(a / b); return select(r,
 fn pw(x: f32, y: f32) -> f32 { return select(pow(x, y), 0.0, x <= 0.0); }
 fn on(i: u32) -> bool { return P[i] > 0.5; }
 
+// Standard look past white (develop::soft_white).
+fn soft_white(c: vec3f) -> vec3f {
+    let m = max(c.x, max(c.y, c.z));
+    if m <= 1.0 { return c; }
+    let p = max(c, vec3f(0.0));
+    let e = sqrt(dot(p, p) / 3.0);
+    let t = min(m - 1.0, 1.0);
+    return min(c, vec3f(1.0)) * (1.0 - t) + (c / m + vec3f(e)) / 2.0 * t;
+}
+
+// AgX (develop::agx). WGSL matrices are column-major: these columns are the CPU's rows, so we multiply on the left.
+fn agx(c0: vec3f) -> vec3f {
+    let mi = mat3x3f(0.842479062253094, 0.0784335999999992, 0.0792237451477643, 0.0423282422610123, 0.878468636469772, 0.0791661274605434, 0.0423756549057051, 0.0784336, 0.879142973793104);
+    let mo = mat3x3f(1.19687900512017, -0.0980208811401368, -0.0990297440797205, -0.0528968517574562, 1.15190312990417, -0.0989611768448433, -0.0529716355144438, -0.0980434501171241, 1.15107367264116);
+    let lo = -12.47393;
+    let hi = 4.026069;
+    let c = max(c0, vec3f(1e-10)) * mi;
+    let x = (clamp(log2(max(c, vec3f(1e-10))), vec3f(lo), vec3f(hi)) - vec3f(lo)) / (hi - lo);
+    let x2 = x * x;
+    let x4 = x2 * x2;
+    let y = 15.5 * x4 * x2 - 40.14 * x4 * x + 31.96 * x4 - 6.868 * x2 * x + 0.4298 * x2 + 0.1191 * x - vec3f(0.00232);
+    return clamp(y * mo, vec3f(0.0), vec3f(1.0));
+}
+
 // Extended sRGB: mirrored below 0, so colours outside sRGB (a negative channel) survive to a wide-gamut export.
 fn srgb(v: f32) -> f32 {
     let x = min(abs(v), 1.0);
@@ -132,7 +156,8 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         let k = 1.0 + P[16] / 100.0 + P[17] / 100.0 * (1.0 - sat0) * (1.0 - sat0) + P[9] / 400.0;
         c = vec3f(yl) + (c - vec3f(yl)) * k;
     }
-    var e = vec3f(srgb(c.x), srgb(c.y), srgb(c.z));
+    var e: vec3f;
+    if on(90u) { e = agx(c); } else { let s = soft_white(c); e = vec3f(srgb(s.x), srgb(s.y), srgb(s.z)); }
     if on(18u) {
         if on(19u) {
             let l = luma(e);
