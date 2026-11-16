@@ -684,10 +684,13 @@ impl App {
         let has_frame = !d.frames.is_empty();
         ui.horizontal(|ui| {
             ui.label(RichText::new("Feet at").size(12.0).color(TEXT2));
-            egui::ComboBox::from_id_salt("focus_height").width(110.0).selected_text(format!("Position {}", d.focus_height)).show_ui(ui, |ui| {
-                for n in 1..=5 {
-                    pick(ui, &mut d.focus_height, n, format!("Position {n}"));
-                }
+            // Locked while a test runs: its result is filed under the height shown here when it comes back.
+            ui.add_enabled_ui(!busy, |ui| {
+                egui::ComboBox::from_id_salt("focus_height").width(110.0).selected_text(format!("Position {}", d.focus_height)).show_ui(ui, |ui| {
+                    for n in 1..=5 {
+                        pick(ui, &mut d.focus_height, n, format!("Position {n}"));
+                    }
+                });
             });
             ui.add_enabled_ui(has_frame && !busy, |ui| {
                 test = ui.button("Test").on_hover_text("Scans a small patch from the middle of the first chosen frame and measures how sharp it is").on_disabled_hover_text("Choose a frame first").clicked();

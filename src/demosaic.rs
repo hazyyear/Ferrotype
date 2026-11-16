@@ -173,9 +173,21 @@ pub fn reconstruct_highlights(data: &mut [f32], pattern: &[u8], w: usize, h: usi
     }).reduce(|| ([0f64; 3], [0u64; 3]), |a, b| ([0, 1, 2].map(|k| a.0[k] + b.0[k]), [0, 1, 2].map(|k| a.1[k] + b.1[k])));
     // Geometric mean of the ratios, kept to a sane range (one odd edge can't paint a highlight bright green).
     let chroma = [0, 1, 2].map(|k| if cnt[k] > 0 { ((sum[k] / cnt[k] as f64).exp() as f32).clamp(0.25, 4.0) } else { 1.0 });
+    // Where every photosite around is clipped too (the sun, a lamp) there is no colour to rebuild from: the
+    // channel with the most white-balance gain would end up highest and tint it. Those stay neutral, at the
+    // highest white-balanced clip level.
+    let white = wb[0].max(wb[1]).max(wb[2]);
+    let all_clipped = |i: usize| {
+        let (x, y) = ((i % w) as isize, (i / w) as isize);
+        (-1isize..=1).all(|dy| (-1isize..=1).all(|dx| {
+            let (xx, yy) = ((x + dx).clamp(0, w as isize - 1) as usize, (y + dy).clamp(0, h as isize - 1) as usize);
+            clipped[yy * w + xx]
+        }))
+    };
     let fixed: Vec<(usize, f32)> = (0..w * h).into_par_iter().filter(|&i| clipped[i]).map(|i| {
         let k = (pattern[i] as usize).min(2);
-        (i, val(data, i).max(opposed(data, i) * chroma[k]) / wb[k])
+        let v = if all_clipped(i) { white.max(val(data, i)) } else { val(data, i).max(opposed(data, i) * chroma[k]) };
+        (i, v / wb[k])
     }).collect();
     for &(i, v) in &fixed {
         data[i] = v;
@@ -581,6 +593,19 @@ mod tests {
         // Nothing to do on an unclipped photo.
         let (mut low, _) = mosaic(&|_, _| [0.4, 0.5, 0.3], w, h, &bayer);
         assert_eq!(reconstruct_highlights(&mut low, &pat, w, h, [1.0; 3]), 0);
+    }
+
+    #[test]
+    fn fully_blown_white_stays_neutral() {
+        // White light three times over the clip in the middle, grey around; the camera records scene / white balance.
+        let wb = [2.0f32, 1.0, 1.5];
+        let (w, h) = (40, 40);
+        let (mut cfa, pat) = mosaic(&|y, x| if (12..28).contains(&x) && (12..28).contains(&y) { [3.0; 3] } else { [0.3; 3] }, w, h, &bayer);
+        cfa.iter_mut().zip(&pat).for_each(|(v, &k)| *v = (*v / wb[k as usize]).min(1.0));
+        reconstruct_highlights(&mut cfa, &pat, w, h, wb);
+        let at = |x: usize, y: usize| cfa[y * w + x] * wb[pat[y * w + x] as usize];
+        let (r, g, b) = (at(20, 20), at(21, 20), at(21, 21));
+        assert!((r - g).abs() < 0.01 && (g - b).abs() < 0.01, "neutral, got {r} {g} {b}");
     }
 
     const XTRANS: [&str; 6] = ["GGRGGB", "GGBGGR", "BRGRBG", "GGBGGR", "GGRGGB", "RBGBRG"];

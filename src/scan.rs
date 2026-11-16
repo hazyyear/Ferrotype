@@ -345,15 +345,6 @@ fn grow(raw: &[f32], w: usize, h: usize) -> Vec<f32> {
     grown
 }
 
-/// How sure we are that each pixel is a defect, 0..1, from the infrared channel. `strength` 0..100 sets how
-/// faint a defect still counts.
-#[cfg(test)]
-pub fn ir_defects(ir: &Ir, red: Option<&[f32]>, strength: f32) -> Vec<f32> {
-    let t = dip_threshold(strength);
-    let raw: Vec<f32> = ir_dips(ir, red).iter().map(|&d| develop::smooth(t * 0.5, t, d)).collect();
-    grow(&raw, ir.w as usize, ir.h as usize)
-}
-
 /// Infrared dust and scratch removal (Digital ICE style). Faint dust is divided out by how much infrared it
 /// blocks; dust, hair and scratches that block most of it are painted over from the clean film around them.
 pub fn ir_clean(img: &Rgb32FImage, ir: &Ir, strength: f32) -> Rgb32FImage {
@@ -582,10 +573,11 @@ mod tests {
             if speck(x, y) { image::Rgb([0.02, 0.02, 0.02]) } else { image::Rgb([v, v * 0.9, v * 0.8]) }
         });
         let ir = Ir { w, h, data: (0..w * h).map(|i| if speck(i % w, i / w) { 0.1 } else { 0.85 + 0.02 * ((i % 13) as f32 / 13.0) }).collect() };
-        let mask = ir_defects(&ir, None, 50.0);
-        assert!(mask[(40 * w + 40) as usize] > 0.9 && mask[(80 * w + 110) as usize] > 0.9);
-        let n = mask.iter().filter(|&&m| m > 0.5).count();
-        assert!(n < 250 && mask[(20 * w + 80) as usize] == 0.0, "only the specks: {n}");
+        // The specks dip deep enough to be painted over (what `ir_clean` does with them); clear film doesn't dip.
+        let dips = ir_dips(&ir, None);
+        assert!(dips[(40 * w + 40) as usize] > HEAVY_DIP && dips[(80 * w + 110) as usize] > HEAVY_DIP);
+        let n = dips.iter().filter(|&&d| d > dip_threshold(50.0)).count();
+        assert!(n < 250 && dips[(20 * w + 80) as usize] < 0.05, "only the specks: {n}");
         let out = ir_clean(&img, &ir, 50.0);
         let want = 0.3 + 0.3 * 40.0 / w as f32;
         assert!((out.get_pixel(40, 40).0[0] - want).abs() < 0.03, "{:?}", out.get_pixel(40, 40));
