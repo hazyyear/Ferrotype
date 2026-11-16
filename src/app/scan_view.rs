@@ -1038,6 +1038,8 @@ impl App {
         // Nothing to say until a scan is open: the light table itself says what to do.
         let Some(s) = &mut self.scan.strip else { return };
         if s.frames.is_empty() {
+            // Say what this column will hold, so it doesn't read as broken.
+            ui.label(RichText::new("Each frame's steps show here once a strip is open: 1 Frame, 2 Film base, 3 Dust, 4 Convert.").size(12.0).color(TEXT3));
             return;
         }
         let i = s.sel.min(s.frames.len() - 1);
@@ -1312,10 +1314,9 @@ impl App {
             self.scan.focus_checked = true;
             self.toggle_zoom([0.5, 0.5]);
         }
-        let conv = self.params.neg.enabled;
-        if step(ui, conv, "Show as positive", if conv { "Off" } else { "On" }) {
-            self.params.neg.enabled = !conv;
-        }
+        // A setting, not a check: a switch like the others, so the ring stays a to-do mark.
+        ui.add_space(4.0);
+        switch_row(ui, "Show as positive", &mut self.params.neg.enabled).on_hover_text("Convert each new frame as it lands, so you check a positive");
         ui.add_space(8.0);
         self.roll_notes(ui);
     }
@@ -1602,7 +1603,10 @@ impl App {
             n => n,
         };
         ui.label(RichText::new(title).family(display()).size(22.0).color(BONE).extra_letter_spacing(-0.2));
-        self.roll_notes(ui);
+        // Roll sheet is the roll's page, so its notes are always open here.
+        if self.folder.is_some() {
+            self.roll_panel_ex(ui, true);
+        }
     }
 
     fn roll_right(&mut self, ui: &mut Ui) {
@@ -1623,7 +1627,7 @@ impl App {
         }
         let idle = self.scan.busy.is_none();
         ui.add_space(4.0);
-        ui.label(caps("1 · Film base"));
+        ui.label(caps("Film base"));
         ui.label(RichText::new("One film base for every frame, from a scan of the unexposed leader.").size(12.0).color(TEXT2));
         let mut base_file = None;
         if ui.add_enabled(idle, egui::Button::new("Blank-film shot for the roll…").min_size(vec2(ui.available_width(), 28.0))).clicked() {
@@ -1631,7 +1635,7 @@ impl App {
         }
         ui.add_space(4.0);
 
-        ui.label(caps("2 · Balance"));
+        ui.label(caps("Match frames"));
         let one = self.scan.sel.len() == 1;
         let match_roll = ui.add_enabled(idle && one, egui::Button::new("Match roll to selected frame").min_size(vec2(ui.available_width(), 28.0)))
             .on_hover_text("Lock every frame's film base and levels to this frame's, so the whole roll prints alike")
@@ -1640,7 +1644,7 @@ impl App {
             .on_hover_text("Set each converted frame's Density so its brightness matches the roll's middle").clicked();
         ui.add_space(4.0);
 
-        ui.label(caps("3 · Dust"));
+        ui.label(caps("Dust"));
         let was = !self.files.is_empty() && self.files.iter().all(|f| self.scan.info.get(f).is_some_and(|i| i.ir));
         let mut ir_all = was;
         switch_row(ui, "Infrared clean, all frames", &mut ir_all).on_hover_text("For scans saved with their infrared channel (64-bit RGBI TIFF). Others are left as they are.");
@@ -1648,7 +1652,7 @@ impl App {
             .on_hover_text("Marks specks for healing on scans without infrared. Frames that already have heal spots are left alone").clicked();
         ui.add_space(4.0);
 
-        ui.label(caps("4 · File names"));
+        ui.label(caps("File names"));
         let rename = ui.add_enabled(!self.files.is_empty(), egui::Button::new("Rename roll…").min_size(vec2(ui.available_width(), 28.0))).on_hover_text("Name every frame from a pattern, such as roll name and frame number").clicked();
 
         if ir_all != was {
